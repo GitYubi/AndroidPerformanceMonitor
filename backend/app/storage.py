@@ -23,14 +23,15 @@ class SessionWriter:
     def write_sample(self, payload: SamplePayload) -> None:
         cursor = self.connection.execute(
             """
-            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, fps, raw_status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, total_ram_kb, fps, raw_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.ts_ms,
                 payload.cpu_total_pct,
                 payload.pss_kb,
                 payload.rss_kb,
+                payload.total_ram_kb,
                 payload.fps,
                 json.dumps(payload.statuses or {}, ensure_ascii=False),
             ),
@@ -89,8 +90,9 @@ def _calculate_summary(connection: sqlite3.Connection) -> dict[str, Any]:
         "fps": ("fps", "fps"),
     }
     for key, (column, unit) in definitions.items():
+        aggregate = "MIN" if key == "fps" else "MAX"
         row = connection.execute(
-            f"SELECT AVG({column}) AS average, MAX({column}) AS peak, COUNT({column}) AS valid_count FROM sample"
+            f"SELECT AVG({column}) AS average, {aggregate}({column}) AS peak, COUNT({column}) AS valid_count FROM sample"
         ).fetchone()
         summary["metrics"][key] = {
             "average": round(row["average"], 2) if row["average"] is not None else None,
@@ -135,6 +137,7 @@ class SessionStore:
                 cpu_total_pct REAL,
                 pss_kb INTEGER,
                 rss_kb INTEGER,
+                total_ram_kb INTEGER,
                 fps REAL,
                 raw_status TEXT NOT NULL
             );
@@ -206,14 +209,15 @@ class SessionStore:
             return []
         connection = _connect(path)
         try:
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(sample)").fetchall()}
+            total_ram_column = "total_ram_kb" if "total_ram_kb" in columns else "NULL AS total_ram_kb"
             rows = connection.execute(
-                "SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, fps FROM sample ORDER BY id DESC LIMIT ?",
+                f"SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {total_ram_column}, fps FROM sample ORDER BY id DESC LIMIT ?",
                 (max(1, min(limit, 1000)),),
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
         finally:
             connection.close()
-
     def get_processes(self, session_id: str, metric: str, limit: int = 10) -> list[dict[str, Any]]:
         column = {"cpu": "cpu_pct", "pss": "pss_kb", "rss": "rss_kb"}.get(metric)
         if column is None:
@@ -258,7 +262,7 @@ class SessionStore:
     def to_csv(self, session_id: str) -> str:
         rows = self.get_series(session_id, limit=100_000)
         output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "fps"])
+        writer = csv.DictWriter(output, fieldnames=["ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "total_ram_kb", "fps"])
         writer.writeheader()
         writer.writerows(rows)
         return output.getvalue()

@@ -11,6 +11,7 @@ from pathlib import Path
 from .adb import (
     AdbError,
     choose_surface_layer,
+    get_foreground_package,
     list_devices,
     list_surface_layers,
     merge_processes,
@@ -131,6 +132,7 @@ class MonitorManager:
         cpu_total: float | None = None
         pss_kb: int | None = None
         rss_kb: int | None = None
+        total_ram_kb: int | None = None
         fps: float | None = None
         process_sets: list[list[ProcessSample]] = []
 
@@ -150,12 +152,13 @@ class MonitorManager:
                     cpu_total, processes = result  # type: ignore[misc]
                     process_sets.append(processes)
                 elif metric == "memory":
-                    pss_kb, rss_kb, processes = result  # type: ignore[misc]
+                    pss_kb, rss_kb, total_ram_kb, processes = result  # type: ignore[misc]
                     process_sets.append(processes)
                 else:
                     fps = result  # type: ignore[assignment]
                     if fps is None:
                         statuses[metric] = "unavailable"
+                        self._record_error_once(runtime, "fps_no_present_samples", "所选 SurfaceFlinger layer 暂无可计算的 present 时间戳；静态画面不会持续产生新帧，请选择正在变化的应用 layer。")
             except AdbError as exc:
                 statuses[metric] = "unavailable"
                 self._record_error_once(runtime, f"{metric}_adb", str(exc))
@@ -168,6 +171,7 @@ class MonitorManager:
             cpu_total_pct=cpu_total,
             pss_kb=pss_kb,
             rss_kb=rss_kb,
+            total_ram_kb=total_ram_kb,
             fps=fps,
             statuses=statuses,
             processes=merge_processes(*process_sets),
@@ -186,21 +190,28 @@ class MonitorManager:
         total, top_processes = parse_top(top_output)
         return total, merge_processes(top_processes, parse_cpuinfo(cpuinfo_output))
 
-    async def _capture_memory(self, serial: str) -> tuple[int | None, int | None, list[ProcessSample]]:
+    async def _capture_memory(self, serial: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
         output = await run_adb("shell", "dumpsys", "meminfo", serial=serial, timeout_seconds=8)
         return parse_meminfo(output)
-
     async def _capture_fps(self, runtime: RuntimeSession) -> float | None:
-        if runtime.selected_surface_layer is None:
-            layers = await list_surface_layers(runtime.request.serial)
-            runtime.selected_surface_layer = choose_surface_layer(layers)
-            if runtime.selected_surface_layer is None:
-                raise AdbError("未找到可用的 SurfaceFlinger layer")
-            self._record_error_once(
-                runtime,
-                "fps_auto_layer",
-                f"已自动选择 SurfaceFlinger layer：{runtime.selected_surface_layer}",
+        if runtime.request.surface_layer is None:
+            layers, foreground_package = await asyncio.gather(
+                list_surface_layers(runtime.request.serial),
+                get_foreground_package(runtime.request.serial),
             )
+            candidate = choose_surface_layer(layers, foreground_package)
+            if candidate is None:
+                raise AdbError("未找到可用的 SurfaceFlinger layer")
+            if runtime.selected_surface_layer != candidate:
+                previous = runtime.selected_surface_layer
+                runtime.selected_surface_layer = candidate
+                detail = f"自动跟踪前台应用 layer：{candidate}"
+                if previous:
+                    detail += f"（已替换：{previous}）"
+                runtime.writer.add_event("info", "fps_auto_layer_switch", detail)
+        elif runtime.selected_surface_layer is None:
+            runtime.selected_surface_layer = runtime.request.surface_layer
+
         output = await run_adb(
             "shell",
             "dumpsys",
@@ -211,4 +222,3 @@ class MonitorManager:
             timeout_seconds=7,
         )
         return parse_surface_latency(output)
-

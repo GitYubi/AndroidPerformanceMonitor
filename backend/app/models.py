@@ -62,6 +62,7 @@ class SamplePayload:
     cpu_total_pct: float | None = None
     pss_kb: int | None = None
     rss_kb: int | None = None
+    total_ram_kb: int | None = None
     fps: float | None = None
     statuses: dict[str, str] | None = None
     processes: list[ProcessSample] | None = None

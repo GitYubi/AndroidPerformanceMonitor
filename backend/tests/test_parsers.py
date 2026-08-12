@@ -6,7 +6,7 @@ from app.adb import ProcessSample, merge_processes, parse_cpuinfo, parse_meminfo
 def test_parse_top_and_cpuinfo() -> None:
     top_output = """Tasks: 320 total, 1 running\n400%cpu 22%user 0%nice 6%sys 372%idle\n  PID USER     PR  NI  VIRT  RES  SHR S[%CPU] %MEM     TIME+ ARGS\n  123 u0_a45   10 -10 1G 120M 20M S 18%  2.0  00:01.0 com.example.nav\n"""
     total, processes = parse_top(top_output)
-    assert total == 28.0
+    assert total == 7.0
     assert processes[0].process_name == "com.example.nav"
     assert processes[0].cpu_pct == 18.0
     cpuinfo = parse_cpuinfo("  2.8% 222/system_server: 2.1% user + 0.6% kernel")
@@ -15,10 +15,11 @@ def test_parse_top_and_cpuinfo() -> None:
 
 
 def test_parse_meminfo_sections() -> None:
-    output = """Total PSS by process:\n   100,000K: com.example.nav (pid 123 / activities)\n    20,000K: surfaceflinger (pid 456)\nTotal RSS by process:\n   140,000K: com.example.nav (pid 123 / activities)\n    40,000K: surfaceflinger (pid 456)\n"""
-    pss, rss, processes = parse_meminfo(output)
+    output = """Total RAM: 2,000,000K (status normal)\nTotal PSS by process:\n   100,000K: com.example.nav (pid 123 / activities)\n    20,000K: surfaceflinger (pid 456)\nTotal RSS by process:\n   140,000K: com.example.nav (pid 123 / activities)\n    40,000K: surfaceflinger (pid 456)\n"""
+    pss, rss, total_ram, processes = parse_meminfo(output)
     assert pss == 120000
     assert rss == 180000
+    assert total_ram == 2000000
     assert len(processes) == 2
 
 

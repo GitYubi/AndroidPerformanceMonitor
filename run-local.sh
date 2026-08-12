@@ -13,12 +13,12 @@ fi
 if [ ! -d "$BACKEND_DIR/.venv" ]; then
   python3 -m venv "$BACKEND_DIR/.venv"
 fi
-"$BACKEND_DIR/.venv/bin/pip" install --quiet -r "$BACKEND_DIR/requirements.txt"
+# "$BACKEND_DIR/.venv/bin/pip" install --quiet -r "$BACKEND_DIR/requirements.txt"
 
-"$BACKEND_DIR/.venv/bin/uvicorn" app.main:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port 8080 &
+"$BACKEND_DIR/.venv/bin/python" -m uvicorn app.main:app --app-dir "$BACKEND_DIR" --host 127.0.0.1 --port 8080 &
 BACKEND_PID=$!
 trap 'kill "$BACKEND_PID" 2>/dev/null || true' EXIT INT TERM
-
+echo "完成后端开启"
 cd "$ROOT_DIR"
 VITE_BACKEND_URL="http://127.0.0.1:8080" pnpm dev --host 127.0.0.1
-
+echo "完成前端开启"

@@ -131,7 +131,7 @@ def parse_top(output: str) -> tuple[float | None, list[ProcessSample]]:
         capacity = _float(capacity_idle_match.group(1))
         idle = _float(capacity_idle_match.group(2))
         if capacity is not None and idle is not None:
-            total_cpu = max(0.0, capacity - idle)
+            total_cpu = round(max(0.0, capacity - idle) / capacity * 100, 2) if capacity > 0 else None
 
     if total_cpu is None:
         total_match = re.search(r"(?:^|\s)([\d.]+)%\s*cpu\b", output, flags=re.IGNORECASE | re.MULTILINE)
@@ -205,6 +205,8 @@ def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample
 
 def parse_meminfo(output: str) -> tuple[int | None, int | None, list[ProcessSample]]:
     """解析 dumpsys meminfo 的 Total PSS/RSS by process 段落。"""
+    total_ram_match = re.search(r"^\s*Total RAM:\s*([\d,]+)K\b", output, flags=re.IGNORECASE | re.MULTILINE)
+    total_ram_kb = _int(total_ram_match.group(1)) if total_ram_match else None
 
     process_map: dict[tuple[int | None, str], ProcessSample] = {}
     section: str | None = None
@@ -243,7 +245,7 @@ def parse_meminfo(output: str) -> tuple[int | None, int | None, list[ProcessSamp
     processes = list(process_map.values())
     pss_total = sum(item.pss_kb or 0 for item in processes) or None
     rss_total = sum(item.rss_kb or 0 for item in processes) or None
-    return pss_total, rss_total, processes
+    return pss_total, rss_total, total_ram_kb, processes
 
 
 def parse_surface_latency(output: str) -> float | None:
@@ -261,7 +263,7 @@ def parse_surface_latency(output: str) -> float | None:
     if len(rows) < 3:
         return None
     refresh_period = rows[0][0]
-    timestamps = [row[-1] for row in rows[1:] if row[-1] > 0 and row[-1] < 9_000_000_000_000_000_000]
+    timestamps = [(row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) for row in rows[1:] if (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) > 0 and (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) < 9_000_000_000_000_000_000]
     timestamps = sorted(set(timestamps))
     if len(timestamps) < 2:
         return None
@@ -283,11 +285,32 @@ async def list_surface_layers(serial: str) -> list[str]:
     return [line.strip() for line in output.splitlines() if line.strip()]
 
 
-def choose_surface_layer(layers: list[str]) -> str | None:
-    """尽量选择活动应用 layer；用户选择始终优先于该启发式。"""
 
+async def get_foreground_package(serial: str) -> str | None:
+    """Return the package name of the current resumed activity when available."""
+    output = await run_adb("shell", "dumpsys", "activity", "activities", serial=serial, timeout_seconds=5)
+    match = re.search(r"mResumedActivity:.*?\bu\d+\s+([A-Za-z0-9_.]+)/", output)
+    return match.group(1) if match else None
+
+
+def choose_surface_layer(layers: list[str], foreground_package: str | None = None) -> str | None:
+    """Prefer a layer belonging to the foreground app; fall back to a safe heuristic."""
     if not layers:
         return None
-    preferred = [layer for layer in layers if "surfaceview" in layer.lower() or "textureview" in layer.lower()]
-    ordinary = [layer for layer in layers if not any(token in layer.lower() for token in ("background", "statusbar", "navigationbar"))]
-    return (preferred or ordinary or layers)[0]
+
+    def score(layer: str) -> int:
+        value = layer.lower()
+        if any(token in value for token in ("root", "container", "displayarea", "task=", "leaf:", "activityrecord", "wallpaper", "statusbar", "navigationbar", "imecontainer", "windowtoken")):
+            return -100
+        result = 0
+        if foreground_package and foreground_package.lower() in value:
+            result += 200
+        if "surfaceview" in value or "textureview" in value:
+            result += 40
+        if "com." in value:
+            result += 30
+        if "#1" in value:
+            result += 20
+        return result
+
+    return max(layers, key=score)

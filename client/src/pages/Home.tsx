@@ -60,6 +60,7 @@ interface SessionPoint {
   cpu_total_pct: number | null;
   pss_kb: number | null;
   rss_kb: number | null;
+  total_ram_kb: number | null;
   fps: number | null;
 }
 
@@ -101,7 +102,7 @@ interface MonitorEvent {
 
 const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
-  cpu: { label: "CPU 整体占用", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
+  cpu: { label: "CPU 整体占用（逻辑核归一）", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
   memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
   fps: { label: "屏幕显示帧率", unit: "fps", color: "#F4B942", icon: Gauge, apiKey: "fps" },
 };
@@ -130,6 +131,15 @@ function formatValue(value: number | null | undefined, unit = "", fractionDigits
 function displayMetricValue(metric: MetricKey, value: number | null | undefined): string {
   if (metric === "memory" && value !== null && value !== undefined) return `${(value / 1024).toFixed(1)} MiB`;
   return formatValue(value, METRIC_META[metric].unit);
+}
+
+function memoryPercent(value: number | null | undefined, totalRamKb: number | null | undefined): string {
+  if (value === null || value === undefined || !totalRamKb) return "—";
+  return (value / totalRamKb * 100).toFixed(1) + "%";
+}
+
+function formatMemorySummary(item: SummaryMetric, totalRamKb: number | null): string {
+  return [formatValue(item.average === null ? null : item.average / 1024, " MiB"), memoryPercent(item.average, totalRamKb), "/", formatValue(item.peak === null ? null : item.peak / 1024, " MiB"), memoryPercent(item.peak, totalRamKb)].join(" · ");
 }
 
 function metricSummary(session: MonitorSession | null, key: string): SummaryMetric | undefined {
@@ -236,6 +246,7 @@ export default function Home() {
   const chartHeight = enabledMetrics.length === 1 ? 400 : enabledMetrics.length === 2 ? 278 : 202;
   const selectedDevice = devices.find((device) => device.serial === selectedSerial);
   const running = session?.state === "running";
+  const totalRamKb = points.at(-1)?.total_ram_kb ?? null;
 
   const refreshDevices = useCallback(async () => {
     try {
@@ -445,9 +456,9 @@ export default function Home() {
           <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {[
               { label: "CPU 平均 / 峰值", metric: metricSummary(session, "cpu"), icon: Cpu, tone: "text-cyan-200", output: (item: SummaryMetric) => `${formatValue(item.average, "%")} / ${formatValue(item.peak, "%")}` },
-              { label: "PSS 平均 / 峰值", metric: metricSummary(session, "memory_pss"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => `${formatValue(item.average === null ? null : item.average / 1024, " MiB")} / ${formatValue(item.peak === null ? null : item.peak / 1024, " MiB")}` },
-              { label: "RSS 平均 / 峰值", metric: metricSummary(session, "memory_rss"), icon: HardDrive, tone: "text-emerald-200", output: (item: SummaryMetric) => `${formatValue(item.average === null ? null : item.average / 1024, " MiB")} / ${formatValue(item.peak === null ? null : item.peak / 1024, " MiB")}` },
-              { label: "FPS 平均 / 峰值", metric: metricSummary(session, "fps"), icon: Gauge, tone: "text-amber-200", output: (item: SummaryMetric) => `${formatValue(item.average, " fps")} / ${formatValue(item.peak, " fps")}` },
+              { label: "PSS 平均 / 峰值", metric: metricSummary(session, "memory_pss"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => formatMemorySummary(item, totalRamKb) },
+              { label: "RSS 平均 / 峰值", metric: metricSummary(session, "memory_rss"), icon: HardDrive, tone: "text-emerald-200", output: (item: SummaryMetric) => formatValue(item.average === null ? null : item.average / 1024, " MiB") + " / " + formatValue(item.peak === null ? null : item.peak / 1024, " MiB") },
+              { label: "FPS 平均 / 最低", metric: metricSummary(session, "fps"), icon: Gauge, tone: "text-amber-200", output: (item: SummaryMetric) => `${formatValue(item.average, " fps")} / ${formatValue(item.peak, " fps")}` },
             ].map(({ label, metric, icon: Icon, tone, output }) => <article key={label} className="telemetry-panel rounded-md border border-slate-700/70 bg-slate-900/80 p-3.5"><div className="flex items-center justify-between"><p className="text-[11px] text-slate-400">{label}</p><Icon size={14} className={tone} /></div><p className="font-telemetry mt-2.5 text-sm font-medium text-slate-100">{metric ? output(metric) : "— / —"}</p><p className="mt-1 font-telemetry text-[10px] text-slate-500">{metric?.valid_count ? `${metric.valid_count} VALID SAMPLES` : "NOT RECORDED"}</p></article>)}
           </section>
 
