@@ -1,0 +1,293 @@
+"""受控执行 ADB 命令并解析 Android 诊断输出。
+
+所有命令通过 create_subprocess_exec 执行，绝不经由 shell 插值外部输入。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import shutil
+import statistics
+from dataclasses import dataclass
+from typing import Iterable
+
+from .models import ProcessSample
+
+
+class AdbError(RuntimeError):
+    """ADB 调用、权限或命令输出无法使用时抛出的可恢复错误。"""
+
+
+@dataclass(slots=True)
+class AdbDevice:
+    serial: str
+    state: str
+    model: str | None = None
+    product: str | None = None
+    device: str | None = None
+    android_version: str | None = None
+
+
+async def run_adb(
+    *arguments: str,
+    serial: str | None = None,
+    timeout_seconds: float = 6.0,
+) -> str:
+    """运行单个 ADB 命令，并为卡住的设备调用建立硬超时。"""
+
+    adb_path = shutil.which("adb")
+    if not adb_path:
+        raise AdbError("未找到 adb；请安装 Android SDK Platform-Tools 并加入 PATH")
+
+    command = [adb_path]
+    if serial:
+        command.extend(["-s", serial])
+    command.extend(arguments)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except TimeoutError as exc:
+        if "process" in locals() and process.returncode is None:
+            process.kill()
+            await process.communicate()
+        raise AdbError(f"ADB 命令超时（{timeout_seconds:.0f}s）") from exc
+    except OSError as exc:
+        raise AdbError(f"无法启动 ADB：{exc}") from exc
+
+    output = stdout.decode("utf-8", errors="replace")
+    error = stderr.decode("utf-8", errors="replace").strip()
+    if process.returncode != 0:
+        raise AdbError(error or output.strip() or f"ADB 返回 {process.returncode}")
+    return output
+
+
+async def list_devices() -> list[AdbDevice]:
+    """返回 adb devices -l 中的设备，含 offline/unauthorized 状态。"""
+
+    output = await run_adb("devices", "-l", timeout_seconds=5)
+    devices: list[AdbDevice] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or line.startswith("List of devices") or line.startswith("*"):
+            continue
+        tokens = line.split()
+        if len(tokens) < 2:
+            continue
+        properties = dict(token.split(":", 1) for token in tokens[2:] if ":" in token)
+        devices.append(
+            AdbDevice(
+                serial=tokens[0],
+                state=tokens[1],
+                model=properties.get("model"),
+                product=properties.get("product"),
+                device=properties.get("device"),
+            )
+        )
+    return devices
+
+
+async def enrich_device(device: AdbDevice) -> AdbDevice:
+    """读取可选的版本属性；失败时仍返回已发现的设备。"""
+
+    if device.state != "device":
+        return device
+    try:
+        device.android_version = (await run_adb("shell", "getprop", "ro.build.version.release", serial=device.serial)).strip()
+    except AdbError:
+        pass
+    return device
+
+
+def _float(value: str) -> float | None:
+    try:
+        return float(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _int(value: str) -> int | None:
+    try:
+        return int(value.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_top(output: str) -> tuple[float | None, list[ProcessSample]]:
+    """容忍 Toybox/procps 风格 top 输出，提取总 CPU 与进程 CPU。"""
+
+    total_cpu: float | None = None
+    capacity_idle_match = re.search(
+        r"(?:^|\s)([\d.]+)%\s*cpu\b.*?([\d.]+)%\s*idle\b",
+        output,
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    if capacity_idle_match:
+        capacity = _float(capacity_idle_match.group(1))
+        idle = _float(capacity_idle_match.group(2))
+        if capacity is not None and idle is not None:
+            total_cpu = max(0.0, capacity - idle)
+
+    if total_cpu is None:
+        total_match = re.search(r"(?:^|\s)([\d.]+)%\s*cpu\b", output, flags=re.IGNORECASE | re.MULTILINE)
+        if total_match:
+            total_cpu = _float(total_match.group(1))
+
+    if total_cpu is None:
+        linux_match = re.search(
+            r"%?Cpu\(s\):\s*([\d.]+)\s*us,\s*([\d.]+)\s*sy(?:,\s*([\d.]+)\s*ni)?",
+            output,
+            flags=re.IGNORECASE,
+        )
+        if linux_match:
+            total_cpu = sum(_float(value) or 0.0 for value in linux_match.groups())
+
+    processes: list[ProcessSample] = []
+    for line in output.splitlines():
+        if not re.match(r"^\s*\d+\s+", line):
+            continue
+        tokens = line.split()
+        if len(tokens) < 3:
+            continue
+        pid = _int(tokens[0])
+        percentages = [match.group(1) for match in re.finditer(r"(?<![\w.])([\d.]+)%", line)]
+        if pid is None or not percentages:
+            continue
+        cpu_pct = _float(percentages[0])
+        name = tokens[-1]
+        if name in {"top", "<unknown>"}:
+            continue
+        processes.append(ProcessSample(process_name=name, pid=pid, cpu_pct=cpu_pct))
+    return total_cpu, processes
+
+
+def parse_cpuinfo(output: str) -> list[ProcessSample]:
+    """解析 dumpsys cpuinfo 的进程占用行，用于补全 top 的进程视图。"""
+
+    processes: list[ProcessSample] = []
+    pattern = re.compile(r"^\s*([\d.]+)%\s+(\d+)/([^:\s]+)", flags=re.MULTILINE)
+    for cpu_value, pid_value, process_name in pattern.findall(output):
+        cpu = _float(cpu_value)
+        pid = _int(pid_value)
+        if cpu is not None:
+            processes.append(ProcessSample(process_name=process_name, pid=pid, cpu_pct=cpu))
+    return processes
+
+
+def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample]:
+    """按 PID/进程名合并多源采样，保留各指标中较可信的非空值。"""
+
+    merged: dict[tuple[int | None, str], ProcessSample] = {}
+    for collection in collections:
+        for item in collection:
+            key = (item.pid, item.process_name)
+            existing = merged.get(key)
+            if existing is None:
+                merged[key] = ProcessSample(
+                    process_name=item.process_name,
+                    pid=item.pid,
+                    cpu_pct=item.cpu_pct,
+                    pss_kb=item.pss_kb,
+                    rss_kb=item.rss_kb,
+                )
+                continue
+            if item.cpu_pct is not None:
+                existing.cpu_pct = item.cpu_pct if existing.cpu_pct is None else max(existing.cpu_pct, item.cpu_pct)
+            existing.pss_kb = item.pss_kb if item.pss_kb is not None else existing.pss_kb
+            existing.rss_kb = item.rss_kb if item.rss_kb is not None else existing.rss_kb
+    return list(merged.values())
+
+
+def parse_meminfo(output: str) -> tuple[int | None, int | None, list[ProcessSample]]:
+    """解析 dumpsys meminfo 的 Total PSS/RSS by process 段落。"""
+
+    process_map: dict[tuple[int | None, str], ProcessSample] = {}
+    section: str | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        upper = line.upper()
+        if "TOTAL PSS BY PROCESS" in upper:
+            section = "pss"
+            continue
+        if "TOTAL RSS BY PROCESS" in upper:
+            section = "rss"
+            continue
+        if line.endswith(":") and "BY PROCESS" not in upper:
+            section = None
+        if section is None:
+            continue
+
+        match = re.match(r"^([\d,]+)K:\s+(.+)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        amount = _int(match.group(1))
+        label = match.group(2)
+        pid_match = re.search(r"\(pid\s+(\d+)", label, flags=re.IGNORECASE)
+        pid = _int(pid_match.group(1)) if pid_match else None
+        name = re.sub(r"\s*\(pid\s+\d+.*?\)\s*$", "", label, flags=re.IGNORECASE).strip()
+        if not name or amount is None:
+            continue
+        key = (pid, name)
+        item = process_map.setdefault(key, ProcessSample(process_name=name, pid=pid))
+        if section == "pss":
+            item.pss_kb = amount
+        else:
+            item.rss_kb = amount
+
+    processes = list(process_map.values())
+    pss_total = sum(item.pss_kb or 0 for item in processes) or None
+    rss_total = sum(item.rss_kb or 0 for item in processes) or None
+    return pss_total, rss_total, processes
+
+
+def parse_surface_latency(output: str) -> float | None:
+    """根据 SurfaceFlinger present 时间戳计算最近窗口的显示帧率估计。"""
+
+    rows: list[list[int]] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if not tokens or not all(token.lstrip("-").isdigit() for token in tokens):
+            continue
+        values = [int(token) for token in tokens]
+        if len(values) >= 1:
+            rows.append(values)
+
+    if len(rows) < 3:
+        return None
+    refresh_period = rows[0][0]
+    timestamps = [row[-1] for row in rows[1:] if row[-1] > 0 and row[-1] < 9_000_000_000_000_000_000]
+    timestamps = sorted(set(timestamps))
+    if len(timestamps) < 2:
+        return None
+    deltas = [right - left for left, right in zip(timestamps, timestamps[1:]) if 1_000_000 <= right - left <= 1_000_000_000]
+    if not deltas:
+        return None
+    median_delta = statistics.median(deltas[-30:])
+    fps = 1_000_000_000 / median_delta
+    if refresh_period > 0:
+        max_display_fps = 1_000_000_000 / refresh_period * 1.2
+        fps = min(fps, max_display_fps)
+    return round(fps, 2)
+
+
+async def list_surface_layers(serial: str) -> list[str]:
+    """列出可供 --latency 测试的候选 layer 名称。"""
+
+    output = await run_adb("shell", "dumpsys", "SurfaceFlinger", "--list", serial=serial, timeout_seconds=7)
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def choose_surface_layer(layers: list[str]) -> str | None:
+    """尽量选择活动应用 layer；用户选择始终优先于该启发式。"""
+
+    if not layers:
+        return None
+    preferred = [layer for layer in layers if "surfaceview" in layer.lower() or "textureview" in layer.lower()]
+    ordinary = [layer for layer in layers if not any(token in layer.lower() for token in ("background", "statusbar", "navigationbar"))]
+    return (preferred or ordinary or layers)[0]

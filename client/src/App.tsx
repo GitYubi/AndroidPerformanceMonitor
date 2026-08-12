@@ -1,3 +1,6 @@
+/**
+ * 设计提示：驾驶舱遥测仪。深色工业基底、遥测青状态色与紧凑等宽数据标签。
+ */
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/NotFound";
@@ -27,7 +30,7 @@ function App() {
   return (
     <ErrorBoundary>
       <ThemeProvider
-        defaultTheme="light"
+        defaultTheme="dark"
         // switchable
       >
         <TooltipProvider>
