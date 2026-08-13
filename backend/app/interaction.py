@@ -1,0 +1,164 @@
+"""Android 11 真实输入事件驱动的 Perfetto 交互诊断。"""
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+
+
+TRACE_CONFIG = """buffers {{
+  size_kb: 32768
+  fill_policy: RING_BUFFER
+}}
+duration_ms: {duration_ms}
+data_sources {{
+  config {{
+    name: "linux.ftrace"
+    ftrace_config {{
+      atrace_categories: "input"
+      atrace_categories: "gfx"
+      atrace_categories: "view"
+      atrace_categories: "wm"
+      atrace_categories: "sched"
+      atrace_categories: "freq"
+      ftrace_events: "sched/sched_switch"
+      ftrace_events: "sched/sched_wakeup"
+      ftrace_events: "power/cpu_frequency"
+    }}
+  }}
+}}
+"""
+
+
+class InteractionError(RuntimeError):
+    pass
+
+
+@dataclass(slots=True)
+class InteractionRuntime:
+    interaction_id: str
+    serial: str
+    duration_seconds: int
+    state: str = "queued"
+    created_at_ms: int = field(default_factory=lambda: int(time.time() * 1000))
+    started_at_ms: int | None = None
+    ended_at_ms: int | None = None
+    trace_path: Path | None = None
+    config_path: Path | None = None
+    error: str | None = None
+
+    def serializable(self) -> dict[str, object]:
+        return {
+            "interaction_id": self.interaction_id,
+            "serial": self.serial,
+            "duration_seconds": self.duration_seconds,
+            "state": self.state,
+            "created_at_ms": self.created_at_ms,
+            "started_at_ms": self.started_at_ms,
+            "ended_at_ms": self.ended_at_ms,
+            "trace_ready": self.trace_path is not None and self.trace_path.exists(),
+            "trace_file": self.trace_path.name if self.trace_path else None,
+            "error": self.error,
+            "mode": "android11_input_frame_lifecycle",
+            "notice": "请在录制期间直接操作车机；工具不会注入点击或滑动。",
+        }
+
+
+class InteractionTraceManager:
+    def __init__(self, data_dir: Path) -> None:
+        self.data_dir = data_dir / "interaction-traces"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.active: dict[str, InteractionRuntime] = {}
+        self.history: dict[str, InteractionRuntime] = {}
+
+    async def start(self, serial: str, duration_seconds: int) -> str:
+        if not 5 <= duration_seconds <= 60:
+            raise ValueError("交互诊断时长必须在 5 到 60 秒之间")
+        if any(item.serial == serial and item.state in {"queued", "recording"} for item in self.active.values()):
+            raise ValueError("该车机已有正在运行的交互诊断")
+        interaction_id = str(uuid.uuid4())
+        runtime = InteractionRuntime(interaction_id=interaction_id, serial=serial, duration_seconds=duration_seconds)
+        self.active[interaction_id] = runtime
+        self.history[interaction_id] = runtime
+        asyncio.create_task(self._capture(runtime), name=f"interaction-{interaction_id}")
+        return interaction_id
+
+    def get(self, interaction_id: str) -> dict[str, object] | None:
+        runtime = self.history.get(interaction_id)
+        return runtime.serializable() if runtime else None
+
+    def trace_file(self, interaction_id: str) -> Path | None:
+        runtime = self.history.get(interaction_id)
+        if runtime and runtime.trace_path and runtime.trace_path.exists():
+            return runtime.trace_path
+        return None
+
+    async def _adb(self, serial: str, *args: str, timeout_seconds: float = 15.0) -> str:
+        process = await asyncio.create_subprocess_exec(
+            "adb", "-s", serial, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            if process.returncode is None:
+                process.kill()
+                try:
+                    await process.wait()
+                except ProcessLookupError:
+                    pass
+            raise InteractionError(f"ADB 命令超过 {int(timeout_seconds)} 秒未响应") from exc
+        if process.returncode:
+            raise InteractionError((stderr or stdout).decode("utf-8", errors="replace").strip())
+        return stdout.decode("utf-8", errors="replace")
+
+    async def _capture(self, runtime: InteractionRuntime) -> None:
+        token = runtime.interaction_id.replace("-", "")
+        runtime.config_path = self.data_dir / f"{token}.pbtxt"
+        runtime.trace_path = self.data_dir / f"{token}.pftrace"
+        device_config = f"/data/local/tmp/interaction_{token}.pbtxt"
+        device_trace = f"/data/local/tmp/interaction_{token}.pftrace"
+        try:
+            runtime.state = "preparing"
+            runtime.config_path.write_text(TRACE_CONFIG.format(duration_ms=runtime.duration_seconds * 1000), encoding="utf-8")
+            runtime.state = "pushing_config"
+            await self._adb(runtime.serial, "push", str(runtime.config_path), device_config)
+            runtime.state = "recording"
+            runtime.started_at_ms = int(time.time() * 1000)
+            await self._adb(
+                runtime.serial,
+                "shell",
+                "perfetto",
+                "--txt",
+                "-c",
+                device_config,
+                "-o",
+                device_trace,
+                timeout_seconds=runtime.duration_seconds + 30,
+            )
+            runtime.state = "pulling_trace"
+            await self._adb(
+                runtime.serial,
+                "pull",
+                device_trace,
+                str(runtime.trace_path),
+                timeout_seconds=90,
+            )
+            runtime.state = "completed"
+        except asyncio.TimeoutError:
+            runtime.state = "failed"
+            runtime.error = "ADB 或 Perfetto 命令未在限定时间内结束，已自动终止本次诊断"
+        except (InteractionError, OSError, KeyError, ValueError) as exc:
+            runtime.state = "failed"
+            runtime.error = str(exc) or "Perfetto 交互诊断失败"
+        finally:
+            runtime.ended_at_ms = int(time.time() * 1000)
+            self.active.pop(runtime.interaction_id, None)
+
+    def save_manifest(self) -> None:
+        manifest = self.data_dir / "manifest.json"
+        manifest.write_text(json.dumps([item.serializable() for item in self.history.values()], ensure_ascii=False, indent=2), encoding="utf-8")

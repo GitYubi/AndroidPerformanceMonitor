@@ -9,11 +9,12 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 
 from .adb import AdbError, enrich_device, list_devices, list_surface_layers
 from .models import StartSessionRequest
 from .monitor import MonitorManager
+from .interaction import InteractionError, InteractionTraceManager
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     manager = MonitorManager(DATA_ROOT)
     manager.store.recover_interrupted_sessions()
     app.state.manager = manager
+    app.state.interactions = InteractionTraceManager(DATA_ROOT)
     yield
 
 
@@ -135,3 +137,37 @@ async def export_session(session_id: str, request: Request) -> PlainTextResponse
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{session_id}-samples.csv"'},
     )
+def interactions_from(request: Request) -> InteractionTraceManager:
+    return request.app.state.interactions  # type: ignore[no-any-return]
+
+
+@app.post("/api/interactions", status_code=201)
+async def start_interaction(payload: dict[str, object], request: Request) -> dict[str, object]:
+    serial = payload.get("serial")
+    duration = payload.get("duration_seconds", 15)
+    if not isinstance(serial, str) or not serial.strip():
+        raise HTTPException(status_code=422, detail="serial 不能为空")
+    if not isinstance(duration, int):
+        raise HTTPException(status_code=422, detail="duration_seconds 必须为整数")
+    manager = interactions_from(request)
+    try:
+        interaction_id = await manager.start(serial.strip(), duration)
+    except (InteractionError, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return manager.get(interaction_id) or {"interaction_id": interaction_id, "state": "queued"}
+
+
+@app.get("/api/interactions/{interaction_id}")
+async def interaction_detail(interaction_id: str, request: Request) -> dict[str, object]:
+    detail = interactions_from(request).get(interaction_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="交互诊断不存在")
+    return detail
+
+
+@app.get("/api/interactions/{interaction_id}/trace")
+async def download_interaction_trace(interaction_id: str, request: Request) -> FileResponse:
+    trace_path = interactions_from(request).trace_file(interaction_id)
+    if trace_path is None:
+        raise HTTPException(status_code=409, detail="trace 尚未完成或不可用")
+    return FileResponse(trace_path, media_type="application/octet-stream", filename=trace_path.name)

@@ -16,6 +16,7 @@ from .adb import (
     list_surface_layers,
     merge_processes,
     parse_cpuinfo,
+    parse_gfxinfo_summary,
     parse_meminfo,
     parse_surface_latency,
     parse_top,
@@ -34,6 +35,7 @@ class RuntimeSession:
     task: asyncio.Task[None] | None = None
     selected_surface_layer: str | None = None
     reported_error_codes: set[str] = field(default_factory=set)
+    render_baselines: dict[str, tuple[int, int, float]] = field(default_factory=dict)
 
 
 class MonitorManager:
@@ -126,7 +128,6 @@ class MonitorManager:
         finally:
             runtime.writer.finish(final_state)
             self.active.pop(runtime.session_id, None)
-
     async def _capture_once(self, runtime: RuntimeSession) -> SamplePayload:
         statuses: dict[str, str] = {}
         cpu_total: float | None = None
@@ -134,8 +135,9 @@ class MonitorManager:
         rss_kb: int | None = None
         total_ram_kb: int | None = None
         fps: float | None = None
+        app_render_fps: float | None = None
+        app_jank_pct: float | None = None
         process_sets: list[list[ProcessSample]] = []
-
         jobs: list[tuple[str, asyncio.Task[object]]] = []
         if runtime.request.metrics.cpu:
             jobs.append(("cpu", asyncio.create_task(self._capture_cpu(runtime.request.serial))))
@@ -143,7 +145,7 @@ class MonitorManager:
             jobs.append(("memory", asyncio.create_task(self._capture_memory(runtime.request.serial))))
         if runtime.request.metrics.fps:
             jobs.append(("fps", asyncio.create_task(self._capture_fps(runtime))))
-
+            jobs.append(("render", asyncio.create_task(self._capture_app_render(runtime))))
         for metric, job in jobs:
             try:
                 result = await job
@@ -154,18 +156,23 @@ class MonitorManager:
                 elif metric == "memory":
                     pss_kb, rss_kb, total_ram_kb, processes = result  # type: ignore[misc]
                     process_sets.append(processes)
-                else:
+                elif metric == "fps":
                     fps = result  # type: ignore[assignment]
                     if fps is None:
                         statuses[metric] = "unavailable"
                         self._record_error_once(runtime, "fps_no_present_samples", "所选 SurfaceFlinger layer 暂无可计算的 present 时间戳；静态画面不会持续产生新帧，请选择正在变化的应用 layer。")
+                else:
+                    app_render_fps, app_jank_pct = result  # type: ignore[misc]
+                    if app_render_fps is None:
+                        statuses[metric] = "warming_up" if runtime.render_baselines else "unavailable"
+                        if not runtime.render_baselines:
+                            self._record_error_once(runtime, "render_fps_unavailable", "当前前台应用未提供可增量计算的 gfxinfo 帧统计；该指标仅支持部分 View/Canvas 渲染路径。")
             except AdbError as exc:
                 statuses[metric] = "unavailable"
                 self._record_error_once(runtime, f"{metric}_adb", str(exc))
             except Exception as exc:
                 statuses[metric] = "error"
                 self._record_error_once(runtime, f"{metric}_parse", str(exc))
-
         return SamplePayload(
             ts_ms=int(time.time() * 1000),
             cpu_total_pct=cpu_total,
@@ -173,9 +180,34 @@ class MonitorManager:
             rss_kb=rss_kb,
             total_ram_kb=total_ram_kb,
             fps=fps,
+            app_render_fps=app_render_fps,
+            app_jank_pct=app_jank_pct,
             statuses=statuses,
             processes=merge_processes(*process_sets),
         )
+
+    async def _capture_app_render(self, runtime: RuntimeSession) -> tuple[float | None, float | None]:
+        package = await get_foreground_package(runtime.request.serial)
+        if not package:
+            raise AdbError("无法识别当前前台应用包名")
+        output = await run_adb("shell", "dumpsys", "gfxinfo", package, serial=runtime.request.serial, timeout_seconds=7)
+        counters = parse_gfxinfo_summary(output)
+        if counters is None:
+            return None, None
+        total_frames, janky_frames = counters
+        now = time.monotonic()
+        previous = runtime.render_baselines.get(package)
+        runtime.render_baselines[package] = (total_frames, janky_frames, now)
+        if previous is None:
+            runtime.writer.add_event("info", "render_fps_warmup", f"开始采集 {package} 的 gfxinfo 增量帧统计")
+            return None, None
+        previous_total, previous_janky, previous_time = previous
+        delta_frames = total_frames - previous_total
+        delta_janky = janky_frames - previous_janky
+        elapsed = now - previous_time
+        if delta_frames <= 0 or delta_janky < 0 or elapsed <= 0:
+            return None, None
+        return round(delta_frames / elapsed, 2), round(delta_janky / delta_frames * 100, 2)
 
     def _record_error_once(self, runtime: RuntimeSession, code: str, message: str) -> None:
         if code not in runtime.reported_error_codes:

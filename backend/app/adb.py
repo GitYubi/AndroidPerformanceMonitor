@@ -278,6 +278,14 @@ def parse_surface_latency(output: str) -> float | None:
     return round(fps, 2)
 
 
+
+def parse_gfxinfo_summary(output: str) -> tuple[int, int] | None:
+    """Parse cumulative rendered and janky frame counts from dumpsys gfxinfo."""
+    total_match = re.search(r"Total frames rendered:\s*(\d+)", output, re.IGNORECASE)
+    janky_match = re.search(r"Janky frames:\s*(\d+)", output, re.IGNORECASE)
+    if not total_match or not janky_match:
+        return None
+    return int(total_match.group(1)), int(janky_match.group(1))
 async def list_surface_layers(serial: str) -> list[str]:
     """列出可供 --latency 测试的候选 layer 名称。"""
 
@@ -303,6 +311,9 @@ def choose_surface_layer(layers: list[str], foreground_package: str | None = Non
         if any(token in value for token in ("root", "container", "displayarea", "task=", "leaf:", "activityrecord", "wallpaper", "statusbar", "navigationbar", "imecontainer", "windowtoken")):
             return -100
         result = 0
+        if re.match(r"^[0-9a-f]{6,}\s+", value):
+            result -= 60
+
         if foreground_package and foreground_package.lower() in value:
             result += 200
         if "surfaceview" in value or "textureview" in value:
