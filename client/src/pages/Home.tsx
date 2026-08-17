@@ -91,6 +91,10 @@ const FRAME_SOURCE_LABELS: Record<string, string> = {
   gfxinfo: "gfxinfo 计数器",
 };
 
+// 应用渲染 R 线低于该值时视为“无有效渲染（空闲）”：曲线以虚线呈现并保持
+// 最后一次有效值，避免空闲期的低频读数与操作期连线形成剧烈起伏。
+const RENDER_IDLE_FPS = 5;
+
 function frameSourceLabel(source: string | null | undefined): string {
   return source ? FRAME_SOURCE_LABELS[source] || source : "—";
 }
@@ -211,9 +215,26 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
   const hasData = isFramePipeline
     ? points.some((point) => point.fps !== null || point.app_render_fps !== null || point.jank_pct !== null)
     : points.some((point) => point[dataKey] !== null);
-  const chartData = points.map((point) => ({
+  // 应用渲染 R 线拆分为两条：活跃期实线（真实值）与空闲期虚线（保持最后一次活跃值）。
+  let lastRenderFps: number | null = null;
+  const renderFpsActive: (number | null)[] = [];
+  const renderFpsHeld: (number | null)[] = [];
+  for (const point of points) {
+    const value = point.app_render_fps;
+    if (value !== null && value >= RENDER_IDLE_FPS) {
+      lastRenderFps = value;
+      renderFpsActive.push(value);
+      renderFpsHeld.push(null);
+    } else {
+      renderFpsActive.push(null);
+      renderFpsHeld.push(lastRenderFps);
+    }
+  }
+  const chartData = points.map((point, index) => ({
     ...point,
     viewValue: metric === "memory" && point.pss_kb !== null ? Number((point.pss_kb / 1024).toFixed(2)) : point[dataKey],
+    renderFpsActive: isFramePipeline ? renderFpsActive[index] : undefined,
+    renderFpsHeld: isFramePipeline ? renderFpsHeld[index] : undefined,
   }));
   const latest = points.at(-1);
   const latestText = isFramePipeline
@@ -241,7 +262,8 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
               <YAxis yAxisId="fps" width={44} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
               {isFramePipeline && <YAxis yAxisId="jank" orientation="right" width={36} domain={[0, 100]} tick={{ fill: "#fb7185", fontSize: 9, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} tickFormatter={(value: number) => `${value}%`} />}
               <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => [formatValue(value, name === "逐帧 Jank" ? "%" : " fps"), name]} />
-              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="app_render_fps" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />}
+              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsActive" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />}
+              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsHeld" name="渲染（空闲保持）" stroke="#7dd3fc" strokeWidth={1.5} strokeDasharray="5 4" dot={false} activeDot={false} isAnimationActive={false} connectNulls={false} opacity={0.65} />}
               <Line yAxisId="fps" type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "#f4b942" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "#f4b942" : meta.color, stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />
               {isFramePipeline && <Line yAxisId="jank" type="monotone" dataKey="jank_pct" name="逐帧 Jank" stroke="#fb7185" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls isAnimationActive={false} />}
             </LineChart>
