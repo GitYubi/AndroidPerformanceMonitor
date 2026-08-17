@@ -240,12 +240,14 @@ class MonitorManager:
         package = await get_foreground_package(runtime.request.serial)
         if not package:
             raise AdbError("无法识别当前前台应用包名")
+        # 窗口起点取命令执行前：车机上 adb 命令耗时可达 1-2s，
+        # 若取命令完成时刻会拉长窗口、低估渲染帧率。
+        now = time.monotonic()
         output = await run_adb("shell", "dumpsys", "gfxinfo", package, serial=runtime.request.serial, timeout_seconds=7)
         counters = parse_gfxinfo_summary(output)
         if counters is None:
             return None, None
         total_frames, janky_frames = counters
-        now = time.monotonic()
         previous = runtime.render_baselines.get(package)
         runtime.render_baselines[package] = (total_frames, janky_frames, now)
         if previous is None:
@@ -255,8 +257,14 @@ class MonitorManager:
         delta_frames = total_frames - previous_total
         delta_janky = janky_frames - previous_janky
         elapsed = now - previous_time
-        if delta_frames <= 0 or delta_janky < 0 or elapsed <= 0:
+        if elapsed <= 0:
             return None, None
+        if delta_frames <= 0:
+            # 计数器未增长：该窗口应用没有渲染（静态界面/空闲）或计数器重置。
+            # 返回 0.0 而非 None，让 R 线能区分“空闲”与“无数据”，
+            # 前端据此以虚线保持最后活跃值。
+            return 0.0, 0.0
+        delta_janky = max(0, delta_janky)
         return round(delta_frames / elapsed, 2), round(delta_janky / delta_frames * 100, 2)
 
     def _record_error_once(self, runtime: RuntimeSession, code: str, message: str) -> None:
