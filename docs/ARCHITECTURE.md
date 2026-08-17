@@ -22,9 +22,22 @@
 | --- | --- | --- | --- |
 | CPU 整体与进程 | `adb -s <serial> shell top -b -n 1` | `adb -s <serial> shell dumpsys cpuinfo` | 记录 `top` 总体 CPU 行（可用时）与进程 `%CPU`；`cpuinfo` 用于交叉校验进程视图。整体平均值与峰值只取有效样本。 | 自动识别 Toybox、procps 风格列头；无法读出总体行时，显示“整体 CPU 不可用”，仍保留进程数据。 |
 | Memory（系统与应用） | `adb -s <serial> shell dumpsys meminfo` | — | 系统总 PSS、总 RSS 与进程 PSS/RSS，统一以 KiB 存储、前端显示 MiB。 | 若 OEM 输出缺少 RSS，PSS 数据仍照常入库，RSS 标记为不可用。 |
-| 显示帧率 | `adb -s <serial> shell dumpsys SurfaceFlinger --latency <layer>` | `dumpsys SurfaceFlinger --list` | 用连续 present 时间戳的正间隔中位数计算 `fps = 1e9 / median(delta)`；同步保留候选 layer 名。 | 前置检查 `--latency` 输出；受 SELinux/厂商限制时，提示当前设备不支持而不中断 CPU、内存采样。 |
+| 显示帧率与逐帧统计 | 多源自动降级：`dumpsys SurfaceFlinger --frametimeline -all` → `dumpsys gfxinfo <pkg> framestats` → `dumpsys SurfaceFlinger --latency <layer>` | `dumpsys SurfaceFlinger --list`、`dumpsys gfxinfo <pkg>` 计数器 | 呈现 FPS = 最近 present 时间戳间隔中位数换算；逐帧源额外给出 `frame_count`、`jank_count`、`jank_pct`（>2 倍帧间隔）、`avg/p95/p99_frame_time_ms` 与 `input_latency_ms`。 | 会话启动读取 SDK 版本；`GET /api/frame-capabilities` 预探测可用源；采样中失败自动降到下一优先级并写会话事件。 |
 
 SurfaceFlinger 负责合成并发送显示缓冲区，且围绕显示刷新节奏工作；因此帧率模块将其读数表述为“所选显示 layer 的已呈现帧率估计”，而不是应用渲染线程的完整性能结论。[3]
+
+### 2.1 帧率数据源兼容矩阵（Android 10–12）
+
+目标车机版本不确定时，单一数据源不可靠。帧率模块按 SDK 版本与实时探测结果选择数据源，采样中失败自动降级：
+
+| 优先级 | 数据源 | 版本要求 | 维度 | 降级触发 |
+| --- | --- | --- | --- | --- |
+| 1 | FrameTimeline `dumpsys SurfaceFlinger --frametimeline -all` | API 31+（Android 12） | 显示帧呈现节奏 + 卡顿分类（App/SF/DisplayHAL） | 命令不可用、无可解析显示帧（静止画面）或厂商裁剪 |
+| 2 | framestats `dumpsys gfxinfo <pkg> framestats` | API 24+（Android 7） | 应用逐帧渲染/呈现时间戳 + 输入延迟 | 无前台包名、应用无帧数据、走非 View 渲染路径 |
+| 3 | SurfaceFlinger `--latency <layer>` | API 17+（Android 4.2） | 单 layer 呈现节奏 | 无候选 layer、时间戳不足 |
+| 4 | gfxinfo 累计计数器 | API 17+ | 渲染 FPS / Jank 增量（`app_render_fps`） | — |
+
+每个采样点写入 `frame_source` 列标明实际数据源；切换时产生 `frame_source_switch` 会话事件。`GET /api/frame-capabilities?serial=<id>` 返回只读探测结果供界面展示。
 
 ## 3. 会话与数据模型
 
@@ -39,9 +52,9 @@ session (1) ──< event (N)
 | 表 | 关键字段 | 用途 |
 | --- | --- | --- |
 | `session` | `id`, `serial`, `started_at`, `ended_at`, `duration_limit_s`, `enabled_metrics`, `state` | 会话基本信息与状态机。 |
-| `sample` | `id`, `session_id`, `ts_ms`, `cpu_total_pct`, `pss_kb`, `rss_kb`, `fps`, `raw_status` | 每秒一级指标点；仅保存标量。 |
+| `sample` | `id`, `session_id`, `ts_ms`, `cpu_total_pct`, `pss_kb`, `rss_kb`, `fps`, `frame_source`, `frame_count`, `jank_count`, `jank_pct`, `avg/p95/p99_frame_time_ms`, `input_latency_ms`, `raw_status` | 每秒一级指标点；逐帧统计仅在逐帧源可用时落盘。 |
 | `process_sample` | `sample_id`, `process_name`, `pid`, `cpu_pct`, `pss_kb`, `rss_kb` | 按进程保存指标明细，支持后续 Top-N 查询。 |
-| `event` | `session_id`, `ts_ms`, `severity`, `code`, `message` | 记录超时、权限不足、解析降级和用户停止。 |
+| `event` | `session_id`, `ts_ms`, `severity`, `code`, `message` | 记录超时、权限不足、解析降级、数据源切换和用户停止。 |
 
 ## 4. 内存与文件管理
 
@@ -58,12 +71,13 @@ session (1) ──< event (N)
 
 ## 5. 本地 API 契约
 
-后端监听 `127.0.0.1:8080`，由前端使用 `VITE_BACKEND_URL` 配置。首版使用 REST 轮询以降低本地环境中的长连接复杂度；后端同时预留 SSE 流接口，供后续切换为推送模式。
+后端监听 `127.0.0.1:8090`（默认；可用 `BACKEND_PORT` 环境变量覆盖，`run-local.sh` 会同步设置 `VITE_BACKEND_URL`），由前端使用 `VITE_BACKEND_URL` 配置。首版使用 REST 轮询以降低本地环境中的长连接复杂度；后端同时预留 SSE 流接口，供后续切换为推送模式。
 
 | 方法与路径 | 作用 |
 | --- | --- |
 | `GET /api/health` | 检查后端、ADB 二进制与可用设备数。 |
 | `GET /api/devices` | 列出 ADB `device` 状态的设备与基础属性。 |
+| `GET /api/frame-capabilities` | 只读探测车机支持的帧率数据源（FrameTimeline / framestats / SF latency）与推荐源。 |
 | `POST /api/sessions` | 创建并启动一个会话；请求体包含 `serial`、时长、间隔、启用模块和可选 SurfaceFlinger layer。 |
 | `POST /api/sessions/{id}/stop` | 手动停止当前会话并生成汇总。 |
 | `GET /api/sessions/{id}` | 返回会话状态、实时摘要、均值/峰值。 |
@@ -79,7 +93,7 @@ session (1) ──< event (N)
 | --- | --- | --- |
 | 目标设备 | 从已授权 ADB 设备列表选择 | 车机 Android 版本、OEM/SoC、是否启用 USB 调试或网络调试。 |
 | ADB 权限 | 仅使用 shell 用户可用命令 | 是否需要 root 设备或厂商签名版本以读取受限的 SurfaceFlinger layer。 |
-| 帧率口径 | 选定 SurfaceFlinger layer 的呈现帧率 | 是否需要“全屏合成帧率”、特定应用 layer，还是每个 layer 分别记录。 |
+| 帧率口径 | 多源自动降级：FrameTimeline → framestats → SF latency；单 layer 呈现节奏 | 是否需要“全屏合成帧率”、特定应用 layer，还是每个 layer 分别记录。 |
 | 保存策略 | SQLite + JSON/CSV，30 天或 30 会话 | 数据目录、日志保留时长、是否需要自动上传到测试管理系统。 |
 
 ## References

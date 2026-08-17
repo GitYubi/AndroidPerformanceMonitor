@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import shutil
 import statistics
@@ -27,6 +28,37 @@ class AdbDevice:
     product: str | None = None
     device: str | None = None
     android_version: str | None = None
+
+
+@dataclass(slots=True)
+class FrameStats:
+    """一个采样周期内从某个数据源解析出的逐帧统计。
+
+    所有字段都允许为 None：某个数据源不提供该维度时保持缺省，
+    由上层按“哪个维度有值用哪个”合并。
+    """
+
+    source: str = ""
+    fps: float | None = None
+    frame_count: int | None = None
+    jank_count: int | None = None
+    jank_pct: float | None = None
+    avg_frame_time_ms: float | None = None
+    p95_frame_time_ms: float | None = None
+    p99_frame_time_ms: float | None = None
+    input_latency_ms: float | None = None
+    refresh_period_ns: int | None = None
+    package: str | None = None
+    layer: str | None = None
+
+
+async def get_sdk_version(serial: str) -> int | None:
+    """读取设备 SDK 版本（API level），用于选择可用数据源。"""
+    try:
+        output = await run_adb("shell", "getprop", "ro.build.version.sdk", serial=serial, timeout_seconds=5)
+        return int(output.strip())
+    except (AdbError, ValueError):
+        return None
 
 
 async def run_adb(
@@ -277,6 +309,220 @@ def parse_surface_latency(output: str) -> float | None:
         fps = min(fps, max_display_fps)
     return round(fps, 2)
 
+
+def parse_surface_latency_stats(output: str) -> FrameStats | None:
+    """``dumpsys SurfaceFlinger --latency <layer>`` 的增强统计版。
+
+    在原有呈现 FPS 基础上额外给出刷新周期、窗口内帧数以及
+    “呈现间隔超过两倍刷新周期”的掉帧计数。
+    """
+
+    rows: list[list[int]] = []
+    for line in output.splitlines():
+        tokens = line.split()
+        if not tokens or not all(token.lstrip("-").isdigit() for token in tokens):
+            continue
+        values = [int(token) for token in tokens]
+        if len(values) >= 1:
+            rows.append(values)
+    if len(rows) < 3:
+        return None
+    refresh_period = rows[0][0] or 16_666_666
+    timestamps = sorted(
+        {
+            (row[1] if len(row) >= 2 and row[1] > 0 else row[-1])
+            for row in rows[1:]
+            if (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) > 0
+        }
+    )
+    deltas = [right - left for left, right in zip(timestamps, timestamps[1:]) if 1_000_000 <= right - left <= 1_000_000_000]
+    if not deltas:
+        return None
+    fps = 1_000_000_000 / statistics.median(deltas[-30:])
+    fps = min(fps, 1_000_000_000 / refresh_period * 1.2)
+    jank_count = sum(1 for delta in deltas if delta > 2 * refresh_period)
+    return FrameStats(
+        source="sf_latency",
+        fps=round(fps, 2),
+        frame_count=len(timestamps),
+        jank_count=jank_count,
+        jank_pct=round(jank_count / len(timestamps) * 100, 2) if jank_count else 0.0,
+        refresh_period_ns=refresh_period,
+    )
+
+
+def _percentile(sorted_values: list[float], percentile: float) -> float:
+    if not sorted_values:
+        return 0.0
+    rank = (len(sorted_values) - 1) * percentile
+    lower = math.floor(rank)
+    upper = math.ceil(rank)
+    if lower == upper:
+        return sorted_values[int(rank)]
+    fraction = rank - lower
+    return sorted_values[lower] * (1 - fraction) + sorted_values[upper] * fraction
+
+
+def _fps_from_present_ns(timestamps_ns: list[int], refresh_period_ns: int | None) -> float | None:
+    """由递增的呈现时间戳（ns）估算呈现 FPS；沿用 1ms–1s 间隔过滤与刷新率限幅。"""
+    if len(timestamps_ns) < 2:
+        return None
+    deltas = [right - left for left, right in zip(timestamps_ns, timestamps_ns[1:]) if 1_000_000 <= right - left <= 1_000_000_000]
+    if not deltas:
+        return None
+    fps = 1_000_000_000 / statistics.median(deltas[-30:])
+    if refresh_period_ns:
+        fps = min(fps, 1_000_000_000 / refresh_period_ns * 1.2)
+    return round(fps, 2)
+
+
+def parse_framestats(output: str, refresh_period_ns: int | None = None) -> FrameStats | None:
+    """解析 ``dumpsys gfxinfo <pkg> framestats``（Android 7 / API 24+）。
+
+    输出为“列头 + 逐帧逗号分隔时间戳（ns）”。按列头名索引取值，
+    因此兼容 Android 7–12 各版本列数差异（DisplayPresentTime 等在
+    较新版本才出现）。帧耗时 = FrameCompleted − IntendedVsync，
+    卡顿判定 = 帧耗时超过两倍帧间隔（与 gfxinfo 的 Janky frames 口径一致）。
+    """
+
+    header: list[str] | None = None
+    rows: list[list[str]] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if header is None:
+            if stripped.startswith("Flags"):
+                header = [token.strip() for token in stripped.split(",")]
+            continue
+        if not stripped or not stripped[0].isdigit():
+            continue
+        rows.append(stripped.split(","))
+    if not header or not rows:
+        return None
+    index = {name: i for i, name in enumerate(header)}
+    if "FrameCompleted" not in index:
+        return None
+
+    def column(row: list[str], name: str) -> int | None:
+        i = index.get(name)
+        if i is None or i >= len(row):
+            return None
+        token = row[i].strip()
+        if not token or token == "-1" or not token.lstrip("-").isdigit():
+            return None
+        return int(token)
+
+    period = refresh_period_ns or 16_666_666
+    frame_times: list[int] = []
+    present_times: list[int] = []
+    input_latencies: list[int] = []
+    jank_count = 0
+    for row in rows:
+        intended = column(row, "IntendedVsync")
+        completed = column(row, "FrameCompleted")
+        if intended is not None and completed is not None and completed > intended:
+            frame_times.append(completed - intended)
+            interval = column(row, "FrameInterval") or period
+            if completed - intended > 2 * interval:
+                jank_count += 1
+        present = column(row, "DisplayPresentTime") or completed
+        if present is not None and present > 0:
+            present_times.append(present)
+        newest_input = column(row, "NewestInputEvent")
+        handle_input = column(row, "HandleInputStart")
+        if newest_input is not None and handle_input is not None and handle_input > newest_input:
+            input_latencies.append(handle_input - newest_input)
+
+    if not frame_times:
+        return None
+    frame_times_ms = [value / 1_000_000 for value in frame_times]
+    fps = _fps_from_present_ns(present_times, period)
+    return FrameStats(
+        source="framestats",
+        fps=fps,
+        frame_count=len(frame_times),
+        jank_count=jank_count,
+        jank_pct=round(jank_count / len(frame_times) * 100, 2),
+        avg_frame_time_ms=round(sum(frame_times_ms) / len(frame_times_ms), 2),
+        p95_frame_time_ms=round(_percentile(sorted(frame_times_ms), 0.95), 2),
+        p99_frame_time_ms=round(_percentile(sorted(frame_times_ms), 0.99), 2),
+        input_latency_ms=round(sum(input_latencies) / len(input_latencies) / 1_000_000, 2) if input_latencies else None,
+        refresh_period_ns=period,
+    )
+
+
+_JANK_TYPE_NONE = re.compile(r"^Jank Type\s*:\s*None\s*$")
+_JANK_TYPE_ANY = re.compile(r"^Jank Type\s*:\s*(\S+)\s*$")
+
+
+def parse_frame_timeline(output: str) -> FrameStats | None:
+    """解析 ``dumpsys SurfaceFlinger --frametimeline -all``（Android 12 / API 31+）。
+
+    AOSP 输出按“Display Frame N”分节，每节给出 Vsync Period（ms）、
+    显示帧级 Jank Type，以及 Expected/Actual 三列（Start/End/Present，
+    单位为相对首帧的 ms）。SurfaceFlinger 合成显示帧的 Actual present
+    时间即“屏幕上真正呈现”的节奏；显示帧级 Jank Type 非 None 计为一次
+    卡顿（含 App/SurfaceFlinger/DisplayHAL 各类原因）。
+    """
+
+    refresh_period_ns: int | None = None
+    present_times_ms: list[float] = []
+    durations_ms: list[float] = []
+    jank_count = 0
+    in_display_frame = False
+    section_janky = False
+
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("Display Frame"):
+            in_display_frame = True
+            section_janky = False
+            continue
+        if not in_display_frame:
+            continue
+        if _JANK_TYPE_ANY.match(stripped) and not _JANK_TYPE_NONE.match(stripped):
+            if not section_janky:
+                jank_count += 1
+                section_janky = True
+            continue
+        vsync_match = re.match(r"^Vsync Period:\s*([\d.]+)\s*$", stripped)
+        if vsync_match:
+            refresh_period_ns = round(float(vsync_match.group(1)) * 1_000_000)
+            continue
+        # 显示帧级时间表无缩进，而 Surface 帧级表带 4 空格缩进。
+        if line.startswith("Actual") and "|" in line:
+            tokens = [token.strip() for token in line.split("|")]
+            if len(tokens) >= 4:
+                try:
+                    start, end, present = (float(tokens[1]), float(tokens[2]), float(tokens[3]))
+                except ValueError:
+                    continue
+                if present > 0:
+                    present_times_ms.append(present)
+                if end > start and end > 0:
+                    durations_ms.append(end - start)
+            continue
+
+    if not present_times_ms:
+        return None
+    present_times_ns = [round(value * 1_000_000) for value in present_times_ms]
+    fps = _fps_from_present_ns(present_times_ns, refresh_period_ns)
+    if durations_ms:
+        avg = round(sum(durations_ms) / len(durations_ms), 2)
+        p95 = round(_percentile(sorted(durations_ms), 0.95), 2)
+        p99 = round(_percentile(sorted(durations_ms), 0.99), 2)
+    else:
+        avg = p95 = p99 = None
+    return FrameStats(
+        source="frametimeline",
+        fps=fps,
+        frame_count=len(present_times_ms),
+        jank_count=jank_count,
+        jank_pct=round(jank_count / len(present_times_ms) * 100, 2) if present_times_ms else None,
+        avg_frame_time_ms=avg,
+        p95_frame_time_ms=p95,
+        p99_frame_time_ms=p99,
+        refresh_period_ns=refresh_period_ns,
+    )
 
 
 def parse_gfxinfo_summary(output: str) -> tuple[int, int] | None:

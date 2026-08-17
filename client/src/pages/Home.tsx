@@ -65,6 +65,34 @@ interface SessionPoint {
   fps: number | null;
   app_render_fps: number | null;
   app_jank_pct: number | null;
+  frame_source: string | null;
+  frame_count: number | null;
+  jank_count: number | null;
+  jank_pct: number | null;
+  avg_frame_time_ms: number | null;
+  p95_frame_time_ms: number | null;
+  p99_frame_time_ms: number | null;
+  input_latency_ms: number | null;
+}
+
+interface FrameCapabilities {
+  sdk_version: number | null;
+  android_release: string | null;
+  foreground_package: string | null;
+  sources: { frametimeline: boolean; framestats: boolean; sf_latency: boolean };
+  recommended_source: string;
+  notes: string[];
+}
+
+const FRAME_SOURCE_LABELS: Record<string, string> = {
+  frametimeline: "FrameTimeline",
+  framestats: "framestats",
+  sf_latency: "SF --latency",
+  gfxinfo: "gfxinfo 计数器",
+};
+
+function frameSourceLabel(source: string | null | undefined): string {
+  return source ? FRAME_SOURCE_LABELS[source] || source : "—";
 }
 
 interface SummaryMetric {
@@ -103,7 +131,7 @@ interface MonitorEvent {
   message: string;
 }
 
-const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8080").replace(/\/$/, "");
+const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
   cpu: { label: "CPU 整体占用（逻辑核归一）", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
   memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
@@ -181,7 +209,7 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
   const dataKey = meta.apiKey as keyof SessionPoint;
   const isFramePipeline = metric === "fps";
   const hasData = isFramePipeline
-    ? points.some((point) => point.fps !== null || point.app_render_fps !== null)
+    ? points.some((point) => point.fps !== null || point.app_render_fps !== null || point.jank_pct !== null)
     : points.some((point) => point[dataKey] !== null);
   const chartData = points.map((point) => ({
     ...point,
@@ -189,7 +217,7 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
   }));
   const latest = points.at(-1);
   const latestText = isFramePipeline
-    ? `R ${formatValue(latest?.app_render_fps, " fps")} · P ${formatValue(latest?.fps, " fps")}`
+    ? `R ${formatValue(latest?.app_render_fps, " fps")} · P ${formatValue(latest?.fps, " fps")} · J ${formatValue(latest?.jank_pct, "%")}`
     : displayMetricValue(metric, latest?.[dataKey] as number | null);
   return (
     <section className="telemetry-panel relative min-h-0 overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80" style={{ height }}>
@@ -199,7 +227,7 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
           <span className="h-2 w-2 rounded-full" style={{ backgroundColor: meta.color, boxShadow: `0 0 12px ${meta.color}` }} />
           <div>
             <h2 className="text-xs font-semibold tracking-[0.08em] text-slate-100">{meta.label}</h2>
-            <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">{isFramePipeline ? "LIVE TRACE · RENDER / PRESENT FPS" : `LIVE TRACE · ${meta.unit}`}</p>
+            <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">{isFramePipeline ? `LIVE TRACE · SOURCE ${frameSourceLabel(latest?.frame_source)} · RENDER / PRESENT / JANK` : `LIVE TRACE · ${meta.unit}`}</p>
           </div>
         </div>
         <span className="font-telemetry text-[11px] text-slate-300">{hasData ? latestText : "等待首个采样点"}</span>
@@ -210,10 +238,12 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
             <LineChart data={chartData} margin={{ top: 4, right: 20, left: -15, bottom: 0 }}>
               <CartesianGrid stroke="#314158" strokeDasharray="2 5" vertical={false} />
               <XAxis dataKey="ts_ms" tickFormatter={formatTime} minTickGap={46} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
-              <YAxis width={44} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
-              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => [formatValue(value, " fps"), name]} />
-              {isFramePipeline && <Line type="monotone" dataKey="app_render_fps" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />}
-              <Line type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "#f4b942" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "#f4b942" : meta.color, stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />
+              <YAxis yAxisId="fps" width={44} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
+              {isFramePipeline && <YAxis yAxisId="jank" orientation="right" width={36} domain={[0, 100]} tick={{ fill: "#fb7185", fontSize: 9, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} tickFormatter={(value: number) => `${value}%`} />}
+              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => [formatValue(value, name === "逐帧 Jank" ? "%" : " fps"), name]} />
+              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="app_render_fps" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />}
+              <Line yAxisId="fps" type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "#f4b942" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "#f4b942" : meta.color, stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />
+              {isFramePipeline && <Line yAxisId="jank" type="monotone" dataKey="jank_pct" name="逐帧 Jank" stroke="#fb7185" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls isAnimationActive={false} />}
             </LineChart>
           </ResponsiveContainer>
         ) : <div className="scanline-accent grid h-full place-items-center border-t border-dashed border-slate-700/60"><div className="text-center"><Activity className="mx-auto mb-2 text-slate-600" size={18} /><p className="font-telemetry text-[11px] tracking-wider text-slate-500">NO TELEMETRY YET</p></div></div>}
@@ -230,6 +260,7 @@ export default function Home() {
   const [metrics, setMetrics] = useState<Record<MetricKey, boolean>>({ cpu: true, memory: true, fps: true });
   const [surfaceLayer, setSurfaceLayer] = useState("");
   const [layers, setLayers] = useState<string[]>([]);
+  const [frameCapability, setFrameCapability] = useState<FrameCapabilities | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<MonitorSession | null>(null);
   const [points, setPoints] = useState<SessionPoint[]>([]);
@@ -286,6 +317,16 @@ export default function Home() {
     void requestApi<{ layers: string[] }>(`/api/surface-layers?serial=${encodeURIComponent(selectedSerial)}`)
       .then((payload) => setLayers(payload.layers.slice(0, 80)))
       .catch(() => setLayers([]));
+  }, [selectedSerial, metrics.fps]);
+
+  useEffect(() => {
+    if (!selectedSerial || !metrics.fps) {
+      setFrameCapability(null);
+      return;
+    }
+    void requestApi<FrameCapabilities>(`/api/frame-capabilities?serial=${encodeURIComponent(selectedSerial)}`)
+      .then(setFrameCapability)
+      .catch(() => setFrameCapability(null));
   }, [selectedSerial, metrics.fps]);
 
   useEffect(() => {
@@ -407,12 +448,23 @@ export default function Home() {
             </section>
 
             {metrics.fps && <section>
-              <div className="mb-2 flex items-center gap-2"><Layers3 size={14} className="text-amber-200" /><p className="text-xs font-medium text-slate-300">SurfaceFlinger layer</p></div>
+              <div className="mb-2 flex items-center gap-2"><Layers3 size={14} className="text-amber-200" /><p className="text-xs font-medium text-slate-300">帧率数据源 · SurfaceFlinger layer</p></div>
               <select value={surfaceLayer} disabled={running || !selectedSerial} onChange={(event) => setSurfaceLayer(event.target.value)} className="h-9 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-amber-300/60">
                 <option value="">自动选择活跃 layer</option>
                 {layers.map((layer) => <option key={layer} value={layer}>{layer}</option>)}
               </select>
-              <p className="mt-1.5 text-[10px] leading-4 text-slate-500">受 OEM 权限限制时，帧率模块将单独降级，不影响 CPU 与 Memory。</p>
+              {frameCapability ? (
+                <div className="mt-2 rounded-sm border border-slate-700 bg-slate-950/35 px-2.5 py-2">
+                  <div className="flex items-center justify-between">
+                    <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">Android {frameCapability.android_release || (frameCapability.sdk_version ?? "—")} · FRAME SOURCE</p>
+                    <span className="font-telemetry text-[10px] text-cyan-200">→ {frameSourceLabel(frameCapability.recommended_source)}</span>
+                  </div>
+                  <p className="mt-1.5 text-[10px] leading-4 text-slate-400">
+                    FrameTimeline {frameCapability.sources.frametimeline ? "✓" : "✗"} · framestats {frameCapability.sources.framestats ? "✓" : "✗"} · SF latency ✓
+                  </p>
+                  {frameCapability.notes.length > 0 && <p className="mt-1 text-[10px] leading-4 text-amber-100/70">{frameCapability.notes[0]}</p>}
+                </div>
+              ) : <p className="mt-1.5 text-[10px] leading-4 text-slate-500">选择设备后自动探测可用的逐帧数据源；采集时按版本自动降级。</p>}
             </section>}
 
             <InteractionDiagnostic serial={selectedSerial} />
@@ -459,6 +511,8 @@ export default function Home() {
               { label: "应用渲染 FPS 平均 / 最低", metric: metricSummary(session, "app_render_fps"), icon: Activity, tone: "text-sky-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "内容呈现 FPS 平均 / 最低", metric: metricSummary(session, "fps"), icon: Gauge, tone: "text-amber-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "渲染 Jank 平均 / 峰值", metric: metricSummary(session, "app_jank_pct"), icon: AlertTriangle, tone: "text-rose-200", output: (item: SummaryMetric) => formatValue(item.average, "%") + " / " + formatValue(item.peak, "%") },
+              { label: "逐帧 Jank 平均 / 峰值", metric: metricSummary(session, "frame_jank_pct"), icon: AlertTriangle, tone: "text-rose-200", output: (item: SummaryMetric) => formatValue(item.average, "%") + " / " + formatValue(item.peak, "%") },
+              { label: "逐帧 P95 帧耗时 平均 / 峰值", metric: metricSummary(session, "frame_p95"), icon: Activity, tone: "text-violet-200", output: (item: SummaryMetric) => formatValue(item.average, " ms") + " / " + formatValue(item.peak, " ms") },
             ].map(({ label, metric, icon: Icon, tone, output }) => <article key={label} className="telemetry-panel rounded-md border border-slate-700/70 bg-slate-900/80 p-3.5"><div className="flex items-center justify-between"><p className="text-[11px] text-slate-400">{label}</p><Icon size={14} className={tone} /></div><p className="font-telemetry mt-2.5 text-sm font-medium text-slate-100">{metric ? output(metric) : "— / —"}</p><p className="mt-1 font-telemetry text-[10px] text-slate-500">{metric?.valid_count ? `${metric.valid_count} VALID SAMPLES` : "NOT RECORDED"}</p></article>)}
           </section>
 

@@ -23,8 +23,11 @@ class SessionWriter:
     def write_sample(self, payload: SamplePayload) -> None:
         cursor = self.connection.execute(
             """
-            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, total_ram_kb, fps, app_render_fps, app_jank_pct, raw_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, total_ram_kb, fps, app_render_fps,
+                                app_jank_pct, frame_source, frame_count, jank_count, jank_pct,
+                                avg_frame_time_ms, p95_frame_time_ms, p99_frame_time_ms, input_latency_ms,
+                                raw_status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.ts_ms,
@@ -35,6 +38,14 @@ class SessionWriter:
                 payload.fps,
                 payload.app_render_fps,
                 payload.app_jank_pct,
+                payload.frame_source,
+                payload.frame_count,
+                payload.jank_count,
+                payload.jank_pct,
+                payload.avg_frame_time_ms,
+                payload.p95_frame_time_ms,
+                payload.p99_frame_time_ms,
+                payload.input_latency_ms,
                 json.dumps(payload.statuses or {}, ensure_ascii=False),
             ),
         )
@@ -82,6 +93,11 @@ def _connect(database_path: Path) -> sqlite3.Connection:
     return connection
 
 
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    columns = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    return column in columns
+
+
 def _calculate_summary(connection: sqlite3.Connection) -> dict[str, Any]:
     summary: dict[str, Any] = {"sample_count": 0, "metrics": {}}
     summary["sample_count"] = int(connection.execute("SELECT COUNT(*) FROM sample").fetchone()[0])
@@ -92,8 +108,14 @@ def _calculate_summary(connection: sqlite3.Connection) -> dict[str, Any]:
         "fps": ("fps", "fps"),
         "app_render_fps": ("app_render_fps", "fps"),
         "app_jank_pct": ("app_jank_pct", "pct"),
+        "frame_jank_pct": ("jank_pct", "pct"),
+        "frame_p95": ("p95_frame_time_ms", "ms"),
+        "frame_p99": ("p99_frame_time_ms", "ms"),
+        "frame_avg": ("avg_frame_time_ms", "ms"),
     }
     for key, (column, unit) in definitions.items():
+        if not _column_exists(connection, "sample", column):
+            continue
         aggregate = "MIN" if key in {"fps", "app_render_fps"} else "MAX"
         row = connection.execute(
             f"SELECT AVG({column}) AS average, {aggregate}({column}) AS peak, COUNT({column}) AS valid_count FROM sample"
@@ -145,6 +167,14 @@ class SessionStore:
                 fps REAL,
                 app_render_fps REAL,
                 app_jank_pct REAL,
+                frame_source TEXT,
+                frame_count INTEGER,
+                jank_count INTEGER,
+                jank_pct REAL,
+                avg_frame_time_ms REAL,
+                p95_frame_time_ms REAL,
+                p99_frame_time_ms REAL,
+                input_latency_ms REAL,
                 raw_status TEXT NOT NULL
             );
             CREATE TABLE process_sample (
@@ -216,11 +246,14 @@ class SessionStore:
         connection = _connect(path)
         try:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sample)").fetchall()}
-            total_ram_column = "total_ram_kb" if "total_ram_kb" in columns else "NULL AS total_ram_kb"
-            render_fps_column = "app_render_fps" if "app_render_fps" in columns else "NULL AS app_render_fps"
-            jank_column = "app_jank_pct" if "app_jank_pct" in columns else "NULL AS app_jank_pct"
+            column = lambda name: name if name in columns else f"NULL AS {name}"  # noqa: E731
             rows = connection.execute(
-                f"SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {total_ram_column}, {render_fps_column}, {jank_column}, fps FROM sample ORDER BY id DESC LIMIT ?",
+                f"""SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {column("total_ram_kb")},
+                           {column("app_render_fps")}, {column("app_jank_pct")}, fps,
+                           {column("frame_source")}, {column("frame_count")}, {column("jank_count")},
+                           {column("jank_pct")}, {column("avg_frame_time_ms")}, {column("p95_frame_time_ms")},
+                           {column("p99_frame_time_ms")}, {column("input_latency_ms")}
+                    FROM sample ORDER BY id DESC LIMIT ?""",
                 (max(1, min(limit, 1000)),),
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
@@ -270,7 +303,13 @@ class SessionStore:
     def to_csv(self, session_id: str) -> str:
         rows = self.get_series(session_id, limit=100_000)
         output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=["ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "total_ram_kb", "app_render_fps", "app_jank_pct", "fps"])
+        fieldnames = [
+            "ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "total_ram_kb",
+            "app_render_fps", "app_jank_pct", "fps",
+            "frame_source", "frame_count", "jank_count", "jank_pct",
+            "avg_frame_time_ms", "p95_frame_time_ms", "p99_frame_time_ms", "input_latency_ms",
+        ]
+        writer = csv.DictWriter(output, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
         return output.getvalue()

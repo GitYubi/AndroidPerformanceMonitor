@@ -32,8 +32,10 @@
 - [x] 生成 Monkey 可读取的黑名单文件。
 - [x] 核验黑名单参数与 1 秒间隔点击/滑动 Monkey 命令。
 
-- [ ] 读取已连接车机的 Android 版本、构建类型、刷新率和图形服务能力。
-- [ ] 探测 FrameTimeline、Perfetto、SurfaceFlinger、gfxinfo 与输入事件的可用性。
+- [x] 读取已连接车机的 Android 版本（SDK API level）与图形服务能力。
+- [x] 探测 FrameTimeline、SurfaceFlinger、framestats 与 gfxinfo 的可用性（`/api/frame-capabilities`）。
+- [x] 实现 FrameTimeline → framestats → SF latency 的多源自动降级采样与逐帧 Jank/P95 统计。
+- [ ] 在 Android 12 模拟器或真实车机验证 FrameTimeline dump 的实际输出格式并复核解析。
 - [ ] 验证低风险只读诊断命令的权限和输出格式。
 - [ ] 输出该车机可实施的交互驱动帧性能方案。
 

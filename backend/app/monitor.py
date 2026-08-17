@@ -10,17 +10,26 @@ from pathlib import Path
 
 from .adb import (
     AdbError,
+    FrameStats,
     choose_surface_layer,
     get_foreground_package,
+    get_sdk_version,
     list_devices,
     list_surface_layers,
     merge_processes,
     parse_cpuinfo,
     parse_gfxinfo_summary,
     parse_meminfo,
-    parse_surface_latency,
+    parse_surface_latency_stats,
     parse_top,
     run_adb,
+)
+from .frame_sources import (
+    FRAME_SOURCE_FRAMESTATS,
+    FRAME_SOURCE_FRAMETIMELINE,
+    FRAME_SOURCE_SF_LATENCY,
+    SOURCE_LABELS,
+    capture_frame_metrics,
 )
 from .models import ProcessSample, SamplePayload, StartSessionRequest
 from .storage import SessionStore, SessionWriter
@@ -36,6 +45,8 @@ class RuntimeSession:
     selected_surface_layer: str | None = None
     reported_error_codes: set[str] = field(default_factory=set)
     render_baselines: dict[str, tuple[int, int, float]] = field(default_factory=dict)
+    sdk_version: int | None = None
+    active_frame_source: str | None = None
 
 
 class MonitorManager:
@@ -57,6 +68,7 @@ class MonitorManager:
 
         session_id = str(uuid.uuid4())
         created_at_ms = int(time.time() * 1000)
+        sdk_version = await get_sdk_version(request.serial)
         metadata = {
             "session_id": session_id,
             "serial": request.serial,
@@ -65,7 +77,8 @@ class MonitorManager:
             "interval_ms": request.interval_ms,
             "enabled_metrics": request.metrics.model_dump(),
             "surface_layer": request.surface_layer,
-            "app_version": "0.1.0",
+            "sdk_version": sdk_version,
+            "app_version": "0.2.0",
         }
         writer = self.store.create_session(session_id, metadata)
         runtime = RuntimeSession(
@@ -73,7 +86,10 @@ class MonitorManager:
             request=request,
             writer=writer,
             selected_surface_layer=request.surface_layer,
+            sdk_version=sdk_version,
         )
+        if sdk_version is None:
+            writer.add_event("warning", "sdk_probe_failed", "无法读取设备 SDK 版本；帧率数据源将按未知版本探测并降级。")
         self.active[session_id] = runtime
         runtime.task = asyncio.create_task(self._run(runtime), name=f"monitor-{session_id}")
         return session_id
@@ -134,7 +150,7 @@ class MonitorManager:
         pss_kb: int | None = None
         rss_kb: int | None = None
         total_ram_kb: int | None = None
-        fps: float | None = None
+        frame_stats: FrameStats | None = None
         app_render_fps: float | None = None
         app_jank_pct: float | None = None
         process_sets: list[list[ProcessSample]] = []
@@ -157,10 +173,11 @@ class MonitorManager:
                     pss_kb, rss_kb, total_ram_kb, processes = result  # type: ignore[misc]
                     process_sets.append(processes)
                 elif metric == "fps":
-                    fps = result  # type: ignore[assignment]
-                    if fps is None:
-                        statuses[metric] = "unavailable"
-                        self._record_error_once(runtime, "fps_no_present_samples", "所选 SurfaceFlinger layer 暂无可计算的 present 时间戳；静态画面不会持续产生新帧，请选择正在变化的应用 layer。")
+                    frame_stats = result  # type: ignore[assignment]
+                    if frame_stats is None or frame_stats.fps is None:
+                        statuses[metric] = "unavailable" if frame_stats is None else "limited"
+                        if frame_stats is None:
+                            self._record_error_once(runtime, "fps_no_present_samples", "所选帧率数据源暂无可计算的呈现时间戳；静态画面不会持续产生新帧，请操作正在变化的界面。")
                 else:
                     app_render_fps, app_jank_pct = result  # type: ignore[misc]
                     if app_render_fps is None:
@@ -179,9 +196,17 @@ class MonitorManager:
             pss_kb=pss_kb,
             rss_kb=rss_kb,
             total_ram_kb=total_ram_kb,
-            fps=fps,
+            fps=frame_stats.fps if frame_stats else None,
             app_render_fps=app_render_fps,
             app_jank_pct=app_jank_pct,
+            frame_source=frame_stats.source if frame_stats else None,
+            frame_count=frame_stats.frame_count if frame_stats else None,
+            jank_count=frame_stats.jank_count if frame_stats else None,
+            jank_pct=frame_stats.jank_pct if frame_stats else None,
+            avg_frame_time_ms=frame_stats.avg_frame_time_ms if frame_stats else None,
+            p95_frame_time_ms=frame_stats.p95_frame_time_ms if frame_stats else None,
+            p99_frame_time_ms=frame_stats.p99_frame_time_ms if frame_stats else None,
+            input_latency_ms=frame_stats.input_latency_ms if frame_stats else None,
             statuses=statuses,
             processes=merge_processes(*process_sets),
         )
@@ -225,12 +250,37 @@ class MonitorManager:
     async def _capture_memory(self, serial: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
         output = await run_adb("shell", "dumpsys", "meminfo", serial=serial, timeout_seconds=8)
         return parse_meminfo(output)
-    async def _capture_fps(self, runtime: RuntimeSession) -> float | None:
+    async def _capture_fps(self, runtime: RuntimeSession) -> FrameStats | None:
+        """按版本与可用性自动选择逐帧数据源，全部失败时回退 SF --latency。"""
+        package = await get_foreground_package(runtime.request.serial)
+        per_frame = await capture_frame_metrics(runtime.request.serial, package, runtime.sdk_version)
+        if per_frame is not None:
+            self._switch_frame_source(runtime, per_frame.source)
+            return per_frame
+        self._switch_frame_source(runtime, FRAME_SOURCE_SF_LATENCY)
+        if runtime.sdk_version is None or runtime.sdk_version >= 24:
+            self._record_error_once(runtime, "frame_perframe_unavailable", "逐帧数据源（FrameTimeline / framestats）不可用或暂未产生数据，已回退为 SurfaceFlinger layer 呈现节奏采样。")
+        return await self._capture_sf_latency_fallback(runtime, package)
+
+    def _switch_frame_source(self, runtime: RuntimeSession, source: str) -> None:
+        if runtime.active_frame_source == source:
+            return
+        previous = runtime.active_frame_source
+        runtime.active_frame_source = source
+        detail = f"帧率数据源切换为 {SOURCE_LABELS.get(source, source)}"
+        if previous:
+            detail += f"（原：{SOURCE_LABELS.get(previous, previous)}）"
+        runtime.writer.add_event("info", "frame_source_switch", detail)
+
+    async def _capture_sf_latency_fallback(self, runtime: RuntimeSession, foreground_package: str | None = None) -> FrameStats | None:
         if runtime.request.surface_layer is None:
-            layers, foreground_package = await asyncio.gather(
-                list_surface_layers(runtime.request.serial),
-                get_foreground_package(runtime.request.serial),
-            )
+            if foreground_package is None:
+                layers, foreground_package = await asyncio.gather(
+                    list_surface_layers(runtime.request.serial),
+                    get_foreground_package(runtime.request.serial),
+                )
+            else:
+                layers = await list_surface_layers(runtime.request.serial)
             candidate = choose_surface_layer(layers, foreground_package)
             if candidate is None:
                 raise AdbError("未找到可用的 SurfaceFlinger layer")
@@ -253,4 +303,7 @@ class MonitorManager:
             serial=runtime.request.serial,
             timeout_seconds=7,
         )
-        return parse_surface_latency(output)
+        stats = parse_surface_latency_stats(output)
+        if stats is not None:
+            stats.layer = runtime.selected_surface_layer
+        return stats

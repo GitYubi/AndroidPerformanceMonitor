@@ -66,6 +66,15 @@ class SamplePayload:
     fps: float | None = None
     app_render_fps: float | None = None
     app_jank_pct: float | None = None
+    # 逐帧统计（来自 FrameTimeline / framestats / SF latency 中最优可用源）
+    frame_source: str | None = None
+    frame_count: int | None = None
+    jank_count: int | None = None
+    jank_pct: float | None = None
+    avg_frame_time_ms: float | None = None
+    p95_frame_time_ms: float | None = None
+    p99_frame_time_ms: float | None = None
+    input_latency_ms: float | None = None
     statuses: dict[str, str] | None = None
     processes: list[ProcessSample] | None = None
 

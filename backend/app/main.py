@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
 from .adb import AdbError, enrich_device, list_devices, list_surface_layers
+from .frame_sources import probe_frame_capabilities
 from .models import StartSessionRequest
 from .monitor import MonitorManager
 from .interaction import InteractionError, InteractionTraceManager
@@ -32,7 +33,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Android 车机性能监测 API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:3000", "http://localhost:3000"],
+    # 前端 dev server 可能落在 localhost 任意端口（3000 被占用时自动顺延），
+    # 因此按回环地址 + 任意端口放行；后端本身仅绑定 127.0.0.1，不会暴露给外部。
+    allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
     allow_credentials=False,
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
@@ -68,6 +71,16 @@ async def surface_layers(serial: str = Query(min_length=1, max_length=128)) -> d
         return {"layers": await list_surface_layers(serial)}
     except AdbError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/frame-capabilities")
+async def frame_capabilities(serial: str = Query(min_length=1, max_length=128)) -> dict[str, object]:
+    """探测车机支持的帧率数据源（FrameTimeline / framestats / SF latency）。"""
+    try:
+        capabilities = await probe_frame_capabilities(serial)
+    except AdbError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return capabilities.serializable()
 
 
 @app.post("/api/sessions", status_code=201)
