@@ -27,6 +27,11 @@ class StartSessionRequest(BaseModel):
     interval_ms: int = Field(default=1000, ge=500, le=5000)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     surface_layer: str | None = Field(default=None, max_length=256)
+    # 设备日志导出：留空表示不导出该类型（仅前端提示）
+    anr_path: str | None = Field(default=None, max_length=256)
+    crash_path: str | None = Field(default=None, max_length=256)
+    tombstone_path: str | None = Field(default=None, max_length=256)
+    log_export_root: str | None = Field(default=None, max_length=512)
 
     @field_validator("serial")
     @classmethod
@@ -41,6 +46,9 @@ class StartSessionRequest(BaseModel):
         if not self.metrics.enabled_names():
             raise ValueError("至少需要启用一项测试")
         return self
+
+    def log_export_enabled(self) -> bool:
+        return any((self.anr_path, self.crash_path, self.tombstone_path))
 
 
 @dataclass(slots=True)

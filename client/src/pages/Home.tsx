@@ -283,6 +283,7 @@ export default function Home() {
   const [surfaceLayer, setSurfaceLayer] = useState("");
   const [layers, setLayers] = useState<string[]>([]);
   const [frameCapability, setFrameCapability] = useState<FrameCapabilities | null>(null);
+  const [logPaths, setLogPaths] = useState({ anr: "", crash: "", tombstone: "", exportRoot: "" });
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<MonitorSession | null>(null);
   const [points, setPoints] = useState<SessionPoint[]>([]);
@@ -386,6 +387,10 @@ export default function Home() {
           interval_ms: intervalMs,
           metrics,
           surface_layer: metrics.fps && surfaceLayer ? surfaceLayer : null,
+          anr_path: logPaths.anr.trim() || null,
+          crash_path: logPaths.crash.trim() || null,
+          tombstone_path: logPaths.tombstone.trim() || null,
+          log_export_root: logPaths.exportRoot.trim() || null,
         }),
       });
       setActiveSessionId(started.session_id);
@@ -407,7 +412,7 @@ export default function Home() {
     try {
       await requestApi(`/api/sessions/${activeSessionId}/stop`, { method: "POST" });
       await refreshSession(activeSessionId);
-      toast.success("采样已停止", { description: "会话汇总已写入本地 SQLite 文件。" });
+      toast.success("采样已停止", { description: "会话汇总已写入本地 SQLite；设备日志导出结果见会话事件区。" });
     } catch (error) {
       toast.error("停止采样失败", { description: error instanceof Error ? error.message : "未知错误" });
     } finally {
@@ -497,6 +502,17 @@ export default function Home() {
                 </div>
               ) : <p className="mt-1.5 text-[10px] leading-4 text-slate-500">选择设备后自动探测可用的逐帧数据源；采集时按版本自动降级。</p>}
             </section>}
+
+            <section>
+              <div className="mb-2 flex items-center gap-2"><Download size={14} className="text-emerald-200" /><p className="text-xs font-medium text-slate-300">设备日志导出</p></div>
+              <div className="space-y-1.5">
+                <input value={logPaths.anr} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, anr: event.target.value }))} placeholder="ANR 路径，如 /data/anr" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
+                <input value={logPaths.crash} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, crash: event.target.value }))} placeholder="Crash 路径，如 /data/crash" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
+                <input value={logPaths.tombstone} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, tombstone: event.target.value }))} placeholder="Tombstone 路径，如 /data/tombstones" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
+                <input value={logPaths.exportRoot} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, exportRoot: event.target.value }))} placeholder="导出根目录（留空 = 项目根/DevicesLogs）" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
+              </div>
+              <p className="mt-1.5 text-[10px] leading-4 text-slate-500">停止测试时自动导出到 <code className="font-telemetry">DevicesLogs/&lt;结束时间&gt;/ANR·Crash·Tombstone/</code> 并清理车机日志（保留目录）。留空的类型不导出，仅提示。</p>
+            </section>
 
             <InteractionDiagnostic serial={selectedSerial} />
             <div className="border-t border-slate-700/70 pt-4">

@@ -24,6 +24,7 @@ from .adb import (
     parse_top,
     run_adb,
 )
+from .device_logs import DeviceLogConfig, export_and_clean_device_logs
 from .frame_sources import (
     FRAME_SOURCE_FRAMESTATS,
     FRAME_SOURCE_FRAMETIMELINE,
@@ -33,6 +34,9 @@ from .frame_sources import (
 )
 from .models import ProcessSample, SamplePayload, StartSessionRequest
 from .storage import SessionStore, SessionWriter
+
+# 项目根目录（backend/app 的上级的上级）：设备日志默认导出到 <root>/DevicesLogs
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 @dataclass(slots=True)
@@ -142,8 +146,28 @@ class MonitorManager:
             final_state = "failed"
             runtime.writer.add_event("error", "runtime_failure", str(exc))
         finally:
+            if runtime.request.log_export_enabled():
+                try:
+                    await self._export_device_logs(runtime)
+                except Exception as exc:
+                    runtime.writer.add_event("warning", "log_export_failed", f"设备日志导出异常：{exc}")
             runtime.writer.finish(final_state)
             self.active.pop(runtime.session_id, None)
+
+    async def _export_device_logs(self, runtime: RuntimeSession) -> None:
+        """会话结束（停止/自然到期）后拉取并清理车机日志。"""
+        config = DeviceLogConfig(
+            anr=runtime.request.anr_path,
+            crash=runtime.request.crash_path,
+            tombstone=runtime.request.tombstone_path,
+            export_root=runtime.request.log_export_root,
+        )
+        await export_and_clean_device_logs(
+            runtime.request.serial,
+            config,
+            PROJECT_ROOT,
+            lambda code, severity, message: runtime.writer.add_event(severity, code, message),
+        )
     async def _capture_once(self, runtime: RuntimeSession) -> SamplePayload:
         statuses: dict[str, str] = {}
         cpu_total: float | None = None

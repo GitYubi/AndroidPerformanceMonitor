@@ -1,6 +1,9 @@
 """针对常见 Android 文本输出形态的无设备解析测试。"""
 
+import re
+
 from app.adb import ProcessSample, extract_foreground_package, merge_processes, parse_cpuinfo, parse_frame_timeline, parse_framestats, parse_meminfo, parse_surface_latency, parse_surface_latency_stats, parse_top
+from app.device_logs import LOG_KIND_ANR, LOG_KIND_CRASH, LOG_KIND_TOMBSTONE, DeviceLogConfig
 from app.frame_sources import FRAME_SOURCE_FRAMESTATS, FRAME_SOURCE_FRAMETIMELINE, FRAME_SOURCE_SF_LATENCY, source_priority
 
 
@@ -211,6 +214,34 @@ def test_extract_foreground_package_legacy_m_resumed() -> None:
 
 def test_extract_foreground_package_none() -> None:
     assert extract_foreground_package("no activities here") is None
+
+
+def test_device_log_config_enabled_pairs() -> None:
+    config = DeviceLogConfig(anr="/data/anr", tombstone="/data/tombstones")
+    pairs = config.enabled_pairs()
+    assert pairs == [(LOG_KIND_ANR, "/data/anr"), (LOG_KIND_TOMBSTONE, "/data/tombstones")]
+    assert DeviceLogConfig().enabled_pairs() == []
+    assert DeviceLogConfig(crash="/data/crash").enabled_pairs() == [(LOG_KIND_CRASH, "/data/crash")]
+
+
+def test_device_log_path_validation() -> None:
+    valid = re.compile(r"^[A-Za-z0-9_./-]+$")
+    assert valid.match("/data/anr")
+    assert valid.match("/data/tombstones_1")
+    assert valid.match("/data/app/com.foo.bar/logs")
+    # 包含注入风险字符的路径应被拒绝
+    assert not valid.match("/data/anr;rm -rf /")
+    assert not valid.match("/data/$(id)")
+    assert not valid.match("/data/anr with space")
+
+
+def test_device_log_folder_name_format() -> None:
+    import time as _time
+
+    from app.device_logs import export_and_clean_device_logs  # noqa: F401
+
+    folder = _time.strftime("%Y_%m_%d-%H_%M_%S")
+    assert re.match(r"^\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$", folder)
 
 
 def test_source_priority_gates_by_sdk() -> None:
