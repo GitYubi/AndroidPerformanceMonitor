@@ -93,6 +93,18 @@ async def start_session(payload: StartSessionRequest, request: Request) -> dict[
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "running"}
 
 
+# 注意：必须在 /api/sessions/{session_id} 之前注册，否则 "active" 会被当作 session_id。
+@app.get("/api/sessions/active")
+async def active_session(request: Request) -> dict[str, object] | None:
+    """返回当前正在运行的会话；前端刷新页面后据此恢复接管，而不是显示未开始状态。"""
+    manager = manager_from(request)
+    for session_id in manager.active:
+        session = manager.store.get_session(session_id)
+        if session is not None:
+            return session
+    return None
+
+
 @app.post("/api/sessions/{session_id}/stop")
 async def stop_session(session_id: str, request: Request) -> dict[str, object]:
     manager = manager_from(request)

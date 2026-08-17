@@ -300,10 +300,19 @@ export default function Home() {
 
   const refreshDevices = useCallback(async () => {
     try {
-      const [healthPayload, devicePayload] = await Promise.all([requestApi<Health>("/api/health"), requestApi<Device[]>("/api/devices")]);
+      const [healthPayload, devicePayload, activePayload] = await Promise.all([
+        requestApi<Health>("/api/health"),
+        requestApi<Device[]>("/api/devices"),
+        requestApi<MonitorSession | null>("/api/sessions/active").catch(() => null),
+      ]);
       setHealth(healthPayload);
       setDevices(devicePayload);
       setSelectedSerial((current) => current || devicePayload.find((device) => device.state === "device")?.serial || "");
+      // 后端可能仍有正在运行的采样会话（例如前端刷新）：恢复接管，而不是显示“未开始”状态。
+      if (activePayload) {
+        setActiveSessionId(activePayload.session_id);
+        setSession(activePayload);
+      }
       setApiError("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "无法连接本地后端";
