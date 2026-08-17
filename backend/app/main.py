@@ -7,7 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, PlainTextResponse
 
@@ -91,6 +91,26 @@ async def start_session(payload: StartSessionRequest, request: Request) -> dict[
     except (AdbError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "running"}
+
+
+@app.get("/api/sessions")
+async def list_sessions(request: Request) -> dict[str, object]:
+    """列出本地全部历史会话（按修改时间倒序）。"""
+    return {"sessions": manager_from(request).store.list_sessions()}
+
+
+@app.post("/api/sessions/import", status_code=201)
+async def import_session(request: Request, file: UploadFile = File(...)) -> dict[str, object]:
+    """导入外部会话数据库文件（monitor.db 二进制）。"""
+    store = manager_from(request).store
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=422, detail="文件为空")
+    try:
+        session_id = store.import_database(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return store.get_session(session_id) or {"session_id": session_id, "state": "imported"}
 
 
 # 注意：必须在 /api/sessions/{session_id} 之前注册，否则 "active" 会被当作 session_id。

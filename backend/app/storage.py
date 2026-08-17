@@ -5,8 +5,10 @@ from __future__ import annotations
 import csv
 import io
 import json
+import re
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -136,8 +138,38 @@ class SessionStore:
         self.data_root = data_root
         self.data_root.mkdir(parents=True, exist_ok=True)
 
+    def _session_dir_name(self, serial: str) -> str:
+        """会话目录名：设备号_日期（同设备同日多会话追加 _2/_3 序号）。
+
+        设备序列号中的非文件系统安全字符（如网络 adb 的冒号）替换为下划线。
+        """
+        device = re.sub(r"[^A-Za-z0-9_.-]", "_", serial)
+        base = f"{device}_{time.strftime('%Y_%m_%d')}"
+        dir_name = base
+        counter = 2
+        while (self.data_root / dir_name).exists():
+            dir_name = f"{base}_{counter}"
+            counter += 1
+        return dir_name
+
+    def _find_session_dir(self, session_id: str) -> Path | None:
+        """按 metadata.json 反查 session_id 对应的会话目录。"""
+        for dir_path in self.data_root.iterdir():
+            if not dir_path.is_dir():
+                continue
+            meta_path = dir_path / "metadata.json"
+            if not meta_path.exists():
+                continue
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if meta.get("session_id") == session_id:
+                return dir_path
+        return None
+
     def create_session(self, session_id: str, metadata: dict[str, Any]) -> SessionWriter:
-        session_dir = self.data_root / session_id
+        session_dir = self.data_root / self._session_dir_name(metadata["serial"])
         session_dir.mkdir(parents=True, exist_ok=False)
         database_path = session_dir / "monitor.db"
         connection = _connect(database_path)
@@ -221,7 +253,12 @@ class SessionStore:
         return SessionWriter(database_path)
 
     def database_path(self, session_id: str) -> Path:
-        return self.data_root / session_id / "monitor.db"
+        """定位会话数据库；兼容旧版 UUID 目录名与新版 设备_日期 目录名。"""
+        direct = self.data_root / session_id / "monitor.db"
+        if direct.exists():
+            return direct
+        dir_path = self._find_session_dir(session_id)
+        return (dir_path / "monitor.db") if dir_path is not None else direct
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         path = self.database_path(session_id)
@@ -332,4 +369,87 @@ class SessionStore:
             finally:
                 connection.close()
         return recovered
+
+    def list_sessions(self, limit: int = 100) -> list[dict[str, Any]]:
+        """按修改时间倒序列出本地全部历史会话（含 running）。"""
+        sessions: list[dict[str, Any]] = []
+        paths = sorted(self.data_root.glob("*/monitor.db"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in paths:
+            connection = _connect(path)
+            try:
+                row = connection.execute("SELECT session_id FROM session WHERE id = 1").fetchone()
+            finally:
+                connection.close()
+            if row is None:
+                continue
+            session = self.get_session(row["session_id"])
+            if session is not None:
+                session["dir_name"] = path.parent.name
+                sessions.append(session)
+            if len(sessions) >= limit:
+                break
+        return sessions
+
+    def import_database(self, data: bytes) -> str:
+        """导入外部会话数据库（monitor.db 的二进制内容）。
+
+        校验为合法会话库后放入 data/<设备号>_<日期>/；若 session_id 已在本地
+        存在则生成新 id 并改写库内 session_id 保持一致。
+        """
+        tmp_path = self.data_root / f".import_{uuid.uuid4().hex}.db"
+        tmp_path.write_bytes(data)
+        try:
+            connection = _connect(tmp_path)
+            row = connection.execute("SELECT session_id, state, serial FROM session WHERE id = 1").fetchone()
+            connection.close()
+        except sqlite3.Error as exc:
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError(f"不是有效的会话数据库：{exc}") from exc
+        if row is None:
+            tmp_path.unlink(missing_ok=True)
+            raise ValueError("会话数据库缺少 session 记录")
+
+        session_id = row["session_id"]
+        if self._find_session_dir(session_id) is not None:
+            session_id = str(uuid.uuid4())
+        serial = row["serial"] or "unknown"
+        target_dir = self.data_root / self._session_dir_name(serial)
+        target_dir.mkdir(parents=True, exist_ok=False)
+        tmp_path.replace(target_dir / "monitor.db")
+
+        if session_id != row["session_id"]:
+            connection = _connect(target_dir / "monitor.db")
+            connection.execute("UPDATE session SET session_id = ? WHERE id = 1", (session_id,))
+            connection.commit()
+            connection.close()
+
+        # 先写 metadata.json（database_path 反查目录依赖它），再查会话。
+        connection = _connect(target_dir / "monitor.db")
+        try:
+            full = connection.execute("SELECT * FROM session WHERE id = 1").fetchone()
+        finally:
+            connection.close()
+        if full is not None:
+            meta = dict(full)
+            (target_dir / "metadata.json").write_text(
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "serial": meta.get("serial"),
+                        "created_at_ms": meta.get("created_at_ms"),
+                        "started_at_ms": meta.get("started_at_ms"),
+                        "ended_at_ms": meta.get("ended_at_ms"),
+                        "state": meta.get("state"),
+                        "duration_seconds": meta.get("duration_seconds"),
+                        "interval_ms": meta.get("interval_ms"),
+                        "enabled_metrics": json.loads(meta.get("enabled_metrics_json") or "{}"),
+                        "surface_layer": meta.get("surface_layer"),
+                        "imported": True,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+        return session_id
 

@@ -15,6 +15,7 @@ import {
   Download,
   Gauge,
   HardDrive,
+  History,
   Layers3,
   Loader2,
   Play,
@@ -36,6 +37,8 @@ import {
   YAxis,
 } from "recharts";
 import { toast } from "sonner";
+import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { ScrollArea } from "@/components/ui/scroll-area";
 
 type MetricKey = "cpu" | "memory" | "fps";
 type ProcessMetric = "cpu" | "pss" | "rss";
@@ -118,6 +121,7 @@ interface MonitorSession {
   interval_ms: number;
   enabled_metrics: Record<MetricKey, boolean>;
   surface_layer?: string | null;
+  dir_name?: string;
   summary: { sample_count?: number; metrics?: Record<string, SummaryMetric> };
 }
 
@@ -218,6 +222,21 @@ function formatTime(timestamp: number): string {
   return new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(timestamp);
 }
 
+function formatDateTime(timestamp: number): string {
+  return new Intl.DateTimeFormat("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(timestamp);
+}
+
+function stateLabel(state: string): string {
+  return state === "completed" ? "完成" : state === "stopped" ? "停止" : state === "interrupted" ? "中断" : state === "failed" ? "失败" : state === "running" ? "运行中" : state;
+}
+
+function stateTone(state: string): string {
+  if (state === "completed") return "text-emerald-200 border-emerald-300/25 bg-emerald-300/8";
+  if (state === "stopped") return "text-sky-200 border-sky-300/25 bg-sky-300/8";
+  if (state === "running") return "text-cyan-200 border-cyan-300/25 bg-cyan-300/8";
+  return "text-amber-200 border-amber-300/25 bg-amber-300/8";
+}
+
 function formatValue(value: number | null | undefined, unit = "", fractionDigits = 1): string {
   if (value === null || value === undefined || Number.isNaN(value)) return "—";
   return `${value.toFixed(fractionDigits)}${unit}`;
@@ -226,6 +245,12 @@ function formatValue(value: number | null | undefined, unit = "", fractionDigits
 function displayMetricValue(metric: MetricKey, value: number | null | undefined): string {
   if (metric === "memory" && value !== null && value !== undefined) return `${(value / 1024).toFixed(1)} MiB`;
   return formatValue(value, METRIC_META[metric].unit);
+}
+
+function formatProcessValue(value: number | null | undefined, metric: ProcessMetric): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  if (metric === "cpu") return `${value.toFixed(1)}%`;
+  return `${(value / 1024).toFixed(1)} MiB`;
 }
 
 function memoryPercent(value: number | null | undefined, totalRamKb: number | null | undefined): string {
@@ -321,7 +346,10 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
               <XAxis dataKey="ts_ms" tickFormatter={formatTime} minTickGap={46} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
               <YAxis yAxisId="fps" width={44} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
               {isFramePipeline && <YAxis yAxisId="jank" orientation="right" width={36} domain={[0, 100]} tick={{ fill: "#fb7185", fontSize: 9, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} tickFormatter={(value: number) => `${value}%`} />}
-              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => [formatValue(value, name === "逐帧 Jank" ? "%" : " fps"), name]} />
+              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => {
+                const unit = name === "逐帧 Jank" ? "%" : isFramePipeline ? " fps" : metric === "memory" ? " MiB" : "%";
+                return [formatValue(value, unit), name];
+              }} />
               {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsActive" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />}
               {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsHeld" name="渲染（空闲保持）" stroke="#7dd3fc" strokeWidth={1.5} strokeDasharray="5 4" dot={false} activeDot={false} isAnimationActive={false} connectNulls={false} opacity={0.65} />}
               <Line yAxisId="fps" type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "#f4b942" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "#f4b942" : meta.color, stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />
@@ -338,7 +366,7 @@ export default function Home() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedSerial, setSelectedSerial] = useState("");
   const [durationMinutes, setDurationMinutes] = useState(60);
-  const [intervalMs, setIntervalMs] = useState(1000);
+  const [intervalMs, setIntervalMs] = useState(500);
   const [metrics, setMetrics] = useState<Record<MetricKey, boolean>>({ cpu: true, memory: true, fps: true });
   const [surfaceLayer, setSurfaceLayer] = useState("");
   const [layers, setLayers] = useState<string[]>([]);
@@ -354,11 +382,21 @@ export default function Home() {
   const [events, setEvents] = useState<MonitorEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState("");
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historySessions, setHistorySessions] = useState<MonitorSession[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const enabledMetrics = useMemo(() => (Object.keys(metrics) as MetricKey[]).filter((metric) => metrics[metric]), [metrics]);
   const chartHeight = enabledMetrics.length === 1 ? 400 : enabledMetrics.length === 2 ? 278 : 202;
   const selectedDevice = devices.find((device) => device.serial === selectedSerial);
   const running = session?.state === "running";
+  const remainingSeconds = running && session?.started_at_ms
+    ? Math.max(0, Math.ceil((session.started_at_ms + session.duration_seconds * 1000 - nowMs) / 1000))
+    : null;
+  const remainingText = remainingSeconds === null
+    ? null
+    : `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, "0")}`;
   const totalRamKb = points.at(-1)?.total_ram_kb ?? null;
 
   const refreshDevices = useCallback(async () => {
@@ -410,6 +448,11 @@ export default function Home() {
   useEffect(() => { void refreshDevices(); }, [refreshDevices]);
 
   useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
     try { localStorage.setItem(LOG_PATHS_STORAGE_KEY, JSON.stringify(logPaths)); } catch { /* ignore */ }
   }, [logPaths]);
 
@@ -420,6 +463,39 @@ export default function Home() {
   const toggleSection = useCallback((key: string) => {
     setCollapsed((current) => ({ ...current, [key]: !current[key] }));
   }, []);
+
+  const loadHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    try {
+      const payload = await requestApi<{ sessions: MonitorSession[] }>("/api/sessions");
+      setHistorySessions(payload.sessions);
+    } catch (error) {
+      toast.error("加载历史会话失败", { description: error instanceof Error ? error.message : "未知错误" });
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, []);
+
+  const viewHistorySession = async (sessionId: string) => {
+    setHistoryOpen(false);
+    setActiveSessionId(sessionId);
+    await refreshSession(sessionId);
+    toast.info("正在查看历史会话", { description: "历史数据仅保存在本机 data/ 目录；开始新采样会切换到新会话。" });
+  };
+
+  const importSessionFile = async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    try {
+      const response = await fetch(`${API_BASE}/api/sessions/import`, { method: "POST", body: form });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.detail || `导入失败：${response.status}`);
+      toast.success("会话已导入", { description: `session ${String(body.session_id || "").slice(0, 8)} 已加入历史列表` });
+      await loadHistory();
+    } catch (error) {
+      toast.error("导入失败", { description: error instanceof Error ? error.message : "未知错误" });
+    }
+  };
 
   useEffect(() => {
     if (!selectedSerial || !metrics.fps) {
@@ -634,9 +710,11 @@ export default function Home() {
                 </div>
               </div>
               <div className="flex flex-wrap gap-2 xl:justify-end">
+                {remainingText !== null && <div className="rounded-sm border border-cyan-300/25 bg-cyan-300/8 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-cyan-200">Countdown</p><p className="font-telemetry mt-0.5 text-xs text-cyan-100">{remainingText}</p></div>}
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Window</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">{session ? `${Math.ceil(session.duration_seconds / 60)}m @ ${session.interval_ms / 1000}s` : `${durationMinutes}m @ ${intervalMs / 1000}s`}</p></div>
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Storage</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">SQLite · WAL</p></div>
                 {activeSessionId && <Button variant="outline" onClick={downloadCsv} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><Download size={14} /> 导出 CSV</Button>}
+                <Button variant="outline" onClick={() => { void loadHistory(); setHistoryOpen(true); }} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><History size={14} /> 历史会话</Button>
               </div>
             </div>
           </section>
@@ -664,7 +742,7 @@ export default function Home() {
           <section className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_330px]">
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">
               <div className="flex items-center justify-between border-b border-slate-700/70 px-4 py-3"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-cyan-200">Process pressure</p><h2 className="mt-0.5 text-sm font-semibold">应用 / 进程聚合排行</h2></div><select value={processMetric} onChange={(event) => setProcessMetric(event.target.value as ProcessMetric)} className="rounded-sm border border-slate-700 bg-slate-950/30 px-2 py-1 text-[11px] text-slate-300 outline-none"><option value="cpu">CPU</option><option value="pss">PSS</option><option value="rss">RSS</option></select></div>
-              <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-left"><thead className="bg-slate-950/35 font-telemetry text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="px-4 py-2.5 font-medium">Process</th><th className="px-3 py-2.5 font-medium">PID</th><th className="px-3 py-2.5 font-medium">Average</th><th className="px-3 py-2.5 font-medium">Peak</th><th className="px-4 py-2.5 text-right font-medium">Samples</th></tr></thead><tbody>{processes.length ? processes.map((row, index) => <tr key={`${row.process_name}-${row.pid ?? index}`} className="border-t border-slate-800/85 text-xs text-slate-300"><td className="max-w-[260px] truncate px-4 py-3 font-medium text-slate-200">{row.process_name}</td><td className="font-telemetry px-3 py-3 text-slate-500">{row.pid ?? "—"}</td><td className="font-telemetry px-3 py-3 text-cyan-100">{formatValue(row.average, processMetric === "cpu" ? "%" : " KiB")}</td><td className="font-telemetry px-3 py-3 text-amber-100">{formatValue(row.peak, processMetric === "cpu" ? "%" : " KiB")}</td><td className="font-telemetry px-4 py-3 text-right text-slate-500">{row.samples}</td></tr>) : <tr><td colSpan={5} className="px-4 py-9 text-center text-xs text-slate-500">开始采样后，按所选指标显示进程的平均值与峰值。</td></tr>}</tbody></table></div>
+              <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-left"><thead className="bg-slate-950/35 font-telemetry text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="px-4 py-2.5 font-medium">Process</th><th className="px-3 py-2.5 font-medium">PID</th><th className="px-3 py-2.5 font-medium">Average</th><th className="px-3 py-2.5 font-medium">Peak</th><th className="px-4 py-2.5 text-right font-medium">Samples</th></tr></thead><tbody>{processes.length ? processes.map((row, index) => <tr key={`${row.process_name}-${row.pid ?? index}`} className="border-t border-slate-800/85 text-xs text-slate-300"><td className="max-w-[260px] truncate px-4 py-3 font-medium text-slate-200">{row.process_name}</td><td className="font-telemetry px-3 py-3 text-slate-500">{row.pid ?? "—"}</td><td className="font-telemetry px-3 py-3 text-cyan-100">{formatProcessValue(row.average, processMetric)}</td><td className="font-telemetry px-3 py-3 text-amber-100">{formatProcessValue(row.peak, processMetric)}</td><td className="font-telemetry px-4 py-3 text-right text-slate-500">{row.samples}</td></tr>) : <tr><td colSpan={5} className="px-4 py-9 text-center text-xs text-slate-500">开始采样后，按所选指标显示进程的平均值与峰值。</td></tr>}</tbody></table></div>
             </article>
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">
               <div className="border-b border-slate-700/70 px-4 py-3"><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-amber-200">Session events</p><h2 className="mt-0.5 text-sm font-semibold">会话事件</h2></div>
@@ -674,6 +752,52 @@ export default function Home() {
           <footer className="flex flex-col justify-between gap-2 border-t border-slate-700/55 px-1 pt-4 pb-2 text-[10px] text-slate-500 sm:flex-row"><p>ADB 指令在本地后端执行；任一模块失败仅降级该模块并写入会话事件。</p><p className="font-telemetry">LOCALHOST · SQLITE WAL · NO CLOUD UPLOAD</p></footer>
         </div>
       </main>
+
+      <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
+        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto border-slate-700 bg-slate-900 text-slate-100 sm:max-w-3xl">
+          <DialogHeader>
+            <DialogTitle className="text-sm font-semibold">历史会话</DialogTitle>
+            <DialogDescription className="text-xs text-slate-500">本地 data/ 目录中的会话记录；可导入外部 monitor.db 文件后查看。</DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center gap-2 rounded-sm border border-slate-700 bg-slate-950/35 px-2.5 py-2">
+              <input
+                type="file"
+                accept=".db"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void importSessionFile(file);
+                  event.target.value = "";
+                }}
+                className="text-[11px] text-slate-400 file:mr-2 file:rounded-sm file:border-0 file:bg-slate-700 file:px-2 file:py-1 file:text-[11px] file:text-slate-200"
+              />
+              <span className="text-[10px] text-slate-500">导入 monitor.db（支持跨机器拷贝的会话文件）</span>
+            </div>
+            <ScrollArea className="h-[50vh] rounded-sm border border-slate-700/70">
+              {historyLoading ? (
+                <div className="grid h-full place-items-center"><Loader2 className="animate-spin text-cyan-200" size={18} /></div>
+              ) : historySessions.length === 0 ? (
+                <div className="grid h-full place-items-center text-xs text-slate-500">暂无历史会话</div>
+              ) : (
+                <div className="divide-y divide-slate-800/85">
+                  {historySessions.map((item) => (
+                    <div key={item.session_id} className="flex items-center justify-between gap-3 px-4 py-3">
+                      <div className="min-w-0">
+                        <p className="font-telemetry text-[11px] text-slate-200">{item.dir_name || item.session_id.slice(0, 8)}</p>
+                        <p className="mt-0.5 truncate text-[11px] text-slate-500">{formatDateTime(item.created_at_ms)} · {item.serial} · {item.duration_seconds / 60}m @ {item.interval_ms / 1000}s · {item.summary?.sample_count ?? 0} 样本</p>
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        <span className={`rounded-sm border px-1.5 py-0.5 font-telemetry text-[10px] ${stateTone(item.state)}`}>{stateLabel(item.state)}</span>
+                        <Button variant="outline" onClick={() => void viewHistorySession(item.session_id)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </ScrollArea>
+          </div>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
