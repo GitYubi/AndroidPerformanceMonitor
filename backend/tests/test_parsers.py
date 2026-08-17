@@ -1,6 +1,6 @@
 """针对常见 Android 文本输出形态的无设备解析测试。"""
 
-from app.adb import ProcessSample, merge_processes, parse_cpuinfo, parse_frame_timeline, parse_framestats, parse_meminfo, parse_surface_latency, parse_surface_latency_stats, parse_top
+from app.adb import ProcessSample, extract_foreground_package, merge_processes, parse_cpuinfo, parse_frame_timeline, parse_framestats, parse_meminfo, parse_surface_latency, parse_surface_latency_stats, parse_top
 from app.frame_sources import FRAME_SOURCE_FRAMESTATS, FRAME_SOURCE_FRAMETIMELINE, FRAME_SOURCE_SF_LATENCY, source_priority
 
 
@@ -150,6 +150,42 @@ def test_parse_frame_timeline() -> None:
     assert stats.refresh_period_ns == 16_666_666
 
 
+def test_parse_frame_timeline_samsung_oem() -> None:
+    """三星固件：Actual Present time 全为 0.00，Jank Type 恒为 Unknown jank。
+
+    应退回用 Actual End time 估算帧率（间隔 ≈ 16.7ms → 60fps），
+    且 Unknown jank 不计入卡顿，避免 jank 恒为 100%。
+    """
+    lines = ["Number of display frames : 6"]
+    for index in range(6):
+        end_ms = 16.7 * (index + 1) + 3.0
+        start_ms = 16.7 * index + 0.5
+        lines.extend(
+            [
+                f"Display Frame {index} [*] ",
+                "Prediction State : Valid",
+                "Jank Type : Unknown jank",
+                "Present Metadata : Unknown Present",
+                "Finish Metadata: Unknown Finish",
+                "Start Metadata: Unknown Start",
+                "Vsync Period:  16.666666",
+                f"Present delta: {541833:.6f}",
+                "Present delta % refreshrate:   0.000001",
+                "\t\tStart time\t\t|    End time\t\t|    Present time",
+                "Expected\t|\t     16.67\t|\t     32.33\t|\t     32.33",
+                f"Actual  \t|\t{start_ms:10.2f}\t|\t{end_ms:10.2f}\t|\t      0.00",
+                "----------------------------------------------------------------------------------------",
+                "",
+            ]
+        )
+    stats = parse_frame_timeline("\n".join(lines))
+    assert stats is not None
+    assert stats.source == "frametimeline"
+    assert 58.0 <= (stats.fps or 0) <= 61.0  # end 时间间隔 ≈ 60fps
+    assert stats.jank_count == 0  # Unknown jank 不计入
+    assert stats.frame_count == 6
+
+
 def test_parse_surface_latency_stats() -> None:
     output = """16666666\n0 0 1000000000\n0 0 1016666666\n0 0 1033333332\n0 0 1049999998\n"""
     stats = parse_surface_latency_stats(output)
@@ -157,6 +193,24 @@ def test_parse_surface_latency_stats() -> None:
     assert stats.source == "sf_latency"
     assert 59.0 <= (stats.fps or 0) <= 61.0
     assert stats.jank_count == 0
+
+
+def test_extract_foreground_package_android13_top_resumed() -> None:
+    """Android 12L/13+ 输出为 topResumedActivity=...（等号分隔）。"""
+    output = """ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)
+    topResumedActivity=ActivityRecord{cd3bdfc u0 com.android.settings/.applications.ManageApplications} t23}
+    topPausedActivity=ActivityRecord{0}"""
+    assert extract_foreground_package(output) == "com.android.settings"
+
+
+def test_extract_foreground_package_legacy_m_resumed() -> None:
+    """Android 12 以下输出为 mResumedActivity: ...（冒号分隔）。"""
+    output = "  mResumedActivity: ActivityRecord{abc123 u0 com.example.nav/.MainActivity} t12}"
+    assert extract_foreground_package(output) == "com.example.nav"
+
+
+def test_extract_foreground_package_none() -> None:
+    assert extract_foreground_package("no activities here") is None
 
 
 def test_source_priority_gates_by_sdk() -> None:

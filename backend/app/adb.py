@@ -450,8 +450,22 @@ def parse_framestats(output: str, refresh_period_ns: int | None = None) -> Frame
     )
 
 
-_JANK_TYPE_NONE = re.compile(r"^Jank Type\s*:\s*None\s*$")
 _JANK_TYPE_ANY = re.compile(r"^Jank Type\s*:\s*(\S+)\s*$")
+
+# AOSP JankInfo.h 中明确的卡顿类型。部分 OEM（如三星）会把所有帧标记为
+# "Unknown jank"（该字段在其固件中不可用），此类不计入卡顿，避免 jank 恒为
+# 100% 的误导；此时 jank 信息应回退到 framestats 的帧耗时计算。
+_KNOWN_JANK_TYPES = {
+    "AppDeadlineMissed",
+    "BufferStuffing",
+    "SurfaceFlingerCpuDeadlineMissed",
+    "SurfaceFlingerGpuDeadlineMissed",
+    "SurfaceFlingerScheduling",
+    "SurfaceFlingerStuffing",
+    "DisplayHAL",
+    "PredictionError",
+    "Dropped",
+}
 
 
 def parse_frame_timeline(output: str) -> FrameStats | None:
@@ -459,13 +473,16 @@ def parse_frame_timeline(output: str) -> FrameStats | None:
 
     AOSP 输出按“Display Frame N”分节，每节给出 Vsync Period（ms）、
     显示帧级 Jank Type，以及 Expected/Actual 三列（Start/End/Present，
-    单位为相对首帧的 ms）。SurfaceFlinger 合成显示帧的 Actual present
-    时间即“屏幕上真正呈现”的节奏；显示帧级 Jank Type 非 None 计为一次
-    卡顿（含 App/SurfaceFlinger/DisplayHAL 各类原因）。
+    单位为相对首帧的 ms）。
+
+    兼容性：部分 OEM（三星）不填充 Actual Present time（全部为 0.00），
+    此时退回到 Actual End time 估算帧节奏（相邻帧间隔与呈现节奏一致）；
+    其 Jank Type 一律为 "Unknown jank"，不计入卡顿。
     """
 
     refresh_period_ns: int | None = None
     present_times_ms: list[float] = []
+    end_times_ms: list[float] = []
     durations_ms: list[float] = []
     jank_count = 0
     in_display_frame = False
@@ -479,8 +496,9 @@ def parse_frame_timeline(output: str) -> FrameStats | None:
             continue
         if not in_display_frame:
             continue
-        if _JANK_TYPE_ANY.match(stripped) and not _JANK_TYPE_NONE.match(stripped):
-            if not section_janky:
+        jank_match = _JANK_TYPE_ANY.match(stripped)
+        if jank_match:
+            if jank_match.group(1) in _KNOWN_JANK_TYPES and not section_janky:
                 jank_count += 1
                 section_janky = True
             continue
@@ -498,14 +516,17 @@ def parse_frame_timeline(output: str) -> FrameStats | None:
                     continue
                 if present > 0:
                     present_times_ms.append(present)
+                if end > 0:
+                    end_times_ms.append(end)
                 if end > start and end > 0:
                     durations_ms.append(end - start)
             continue
 
-    if not present_times_ms:
+    timestamps_ms = present_times_ms if len(present_times_ms) >= 2 else end_times_ms
+    if not timestamps_ms:
         return None
-    present_times_ns = [round(value * 1_000_000) for value in present_times_ms]
-    fps = _fps_from_present_ns(present_times_ns, refresh_period_ns)
+    timestamps_ns = [round(value * 1_000_000) for value in timestamps_ms]
+    fps = _fps_from_present_ns(timestamps_ns, refresh_period_ns)
     if durations_ms:
         avg = round(sum(durations_ms) / len(durations_ms), 2)
         p95 = round(_percentile(sorted(durations_ms), 0.95), 2)
@@ -515,9 +536,9 @@ def parse_frame_timeline(output: str) -> FrameStats | None:
     return FrameStats(
         source="frametimeline",
         fps=fps,
-        frame_count=len(present_times_ms),
+        frame_count=len(timestamps_ms),
         jank_count=jank_count,
-        jank_pct=round(jank_count / len(present_times_ms) * 100, 2) if present_times_ms else None,
+        jank_pct=round(jank_count / len(timestamps_ms) * 100, 2) if timestamps_ms else None,
         avg_frame_time_ms=avg,
         p95_frame_time_ms=p95,
         p99_frame_time_ms=p99,
@@ -540,11 +561,24 @@ async def list_surface_layers(serial: str) -> list[str]:
 
 
 
+# Android 12L/13+ 的 dumpsys activity activities 中 mResumedActivity 已改名
+# 为 topResumedActivity（分隔符也从 ":" 变为 "="），这里两种格式都兼容。
+_FOREGROUND_PACKAGE_RE = re.compile(
+    r"^\s*(?:mResumedActivity|topResumedActivity)\s*[:=]\s*(?:ActivityRecord\{[^}]*\s+)?u\d+\s+([A-Za-z0-9_.]+)/",
+    flags=re.MULTILINE,
+)
+
+
+def extract_foreground_package(output: str) -> str | None:
+    """从 dumpsys activity activities 输出解析前台包名（纯函数，可单测）。"""
+    match = _FOREGROUND_PACKAGE_RE.search(output)
+    return match.group(1) if match else None
+
+
 async def get_foreground_package(serial: str) -> str | None:
     """Return the package name of the current resumed activity when available."""
     output = await run_adb("shell", "dumpsys", "activity", "activities", serial=serial, timeout_seconds=5)
-    match = re.search(r"mResumedActivity:.*?\bu\d+\s+([A-Za-z0-9_.]+)/", output)
-    return match.group(1) if match else None
+    return extract_foreground_package(output)
 
 
 def choose_surface_layer(layers: list[str], foreground_package: str | None = None) -> str | None:
