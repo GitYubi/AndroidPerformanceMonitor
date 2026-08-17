@@ -108,7 +108,8 @@ class MonitorManager:
         runtime.stop_event.set()
         if runtime.task:
             try:
-                await asyncio.wait_for(asyncio.shield(runtime.task), timeout=10)
+                # 60s：等待采样循环结束并完成 finally 中的设备日志导出。
+                await asyncio.wait_for(asyncio.shield(runtime.task), timeout=60)
             except TimeoutError:
                 runtime.task.cancel()
                 try:

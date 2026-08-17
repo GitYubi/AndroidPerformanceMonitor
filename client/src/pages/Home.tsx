@@ -8,6 +8,7 @@ import {
   Activity,
   AlertTriangle,
   Check,
+  ChevronDown,
   ChevronRight,
   CircleStop,
   Cpu,
@@ -24,7 +25,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   CartesianGrid,
   Line,
@@ -136,6 +137,65 @@ interface MonitorEvent {
 }
 
 const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
+
+const LOG_PATHS_STORAGE_KEY = "acpm.logPaths.v1";
+const COLLAPSED_STORAGE_KEY = "acpm.collapsed.v1";
+
+const DEFAULT_LOG_PATHS = { anr: "", crash: "", tombstone: "", exportRoot: "" };
+
+function loadJsonStorage<T extends Record<string, unknown>>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<T>;
+      return { ...fallback, ...parsed };
+    }
+  } catch {
+    /* 忽略损坏的本地存储 */
+  }
+  return fallback;
+}
+
+function SectionHeader({
+  title,
+  icon,
+  collapsed,
+  onToggle,
+  right,
+}: {
+  title: string;
+  icon?: ReactNode;
+  collapsed: boolean;
+  onToggle: () => void;
+  right?: ReactNode;
+}) {
+  return (
+    <button type="button" onClick={onToggle} className="mb-2 flex w-full items-center justify-between text-left">
+      <span className="flex items-center gap-1.5">
+        {icon}
+        <span className="text-xs font-medium text-slate-300">{title}</span>
+      </span>
+      <span className="flex items-center gap-1.5">
+        {right}
+        {collapsed ? <ChevronRight size={14} className="text-slate-500" /> : <ChevronDown size={14} className="text-slate-500" />}
+      </span>
+    </button>
+  );
+}
+
+function notifyLogExport(events: MonitorEvent[]) {
+  const logEvents = events.filter((event) => event.code.startsWith("log_export"));
+  if (logEvents.length === 0) return;
+  for (const event of logEvents) {
+    const kind = event.code.replace("log_export_", "").toUpperCase();
+    const title = `设备日志 · ${kind}`;
+    if (event.severity === "warning" || event.severity === "error") {
+      toast.warning(title, { description: event.message });
+    } else {
+      toast.success(title, { description: event.message });
+    }
+  }
+}
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
   cpu: { label: "CPU 整体占用（逻辑核归一）", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
   memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
@@ -283,7 +343,9 @@ export default function Home() {
   const [surfaceLayer, setSurfaceLayer] = useState("");
   const [layers, setLayers] = useState<string[]>([]);
   const [frameCapability, setFrameCapability] = useState<FrameCapabilities | null>(null);
-  const [logPaths, setLogPaths] = useState({ anr: "", crash: "", tombstone: "", exportRoot: "" });
+  const [logPaths, setLogPaths] = useState(() => loadJsonStorage(LOG_PATHS_STORAGE_KEY, DEFAULT_LOG_PATHS));
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => loadJsonStorage(COLLAPSED_STORAGE_KEY, {}));
+  const prevSessionState = useRef<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<MonitorSession | null>(null);
   const [points, setPoints] = useState<SessionPoint[]>([]);
@@ -334,12 +396,30 @@ export default function Home() {
       setPoints(seriesPayload.points);
       setProcesses(processPayload.processes);
       setEvents(eventPayload.events);
+      // 检测 running → 终态 的状态转换（手动停止或自然到期），此时弹设备日志导出结果。
+      const previousState = prevSessionState.current;
+      prevSessionState.current = sessionPayload.state;
+      if (previousState === "running" && sessionPayload.state !== "running") {
+        notifyLogExport(eventPayload.events);
+      }
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "刷新会话失败");
     }
   }, [processMetric]);
 
   useEffect(() => { void refreshDevices(); }, [refreshDevices]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LOG_PATHS_STORAGE_KEY, JSON.stringify(logPaths)); } catch { /* ignore */ }
+  }, [logPaths]);
+
+  useEffect(() => {
+    try { localStorage.setItem(COLLAPSED_STORAGE_KEY, JSON.stringify(collapsed)); } catch { /* ignore */ }
+  }, [collapsed]);
+
+  const toggleSection = useCallback((key: string) => {
+    setCollapsed((current) => ({ ...current, [key]: !current[key] }));
+  }, []);
 
   useEffect(() => {
     if (!selectedSerial || !metrics.fps) {
@@ -457,35 +537,45 @@ export default function Home() {
           </div>
           <div className="space-y-5 p-4">
             <section>
-              <div className="mb-2 flex items-center justify-between"><label className="text-xs font-medium text-slate-300">目标车机</label><button onClick={() => void refreshDevices()} className="text-slate-500 transition hover:text-cyan-200" aria-label="刷新 ADB 设备"><RefreshCw size={14} /></button></div>
-              <div className="relative">
+              <SectionHeader
+                title="目标车机"
+                collapsed={!!collapsed.device}
+                onToggle={() => toggleSection("device")}
+                right={<button type="button" onClick={(event) => { event.stopPropagation(); void refreshDevices(); }} className="text-slate-500 transition hover:text-cyan-200" aria-label="刷新 ADB 设备"><RefreshCw size={14} /></button>}
+              />
+              {!collapsed.device && <><div className="relative">
                 <Usb size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500" />
                 <select value={selectedSerial} onChange={(event) => setSelectedSerial(event.target.value)} disabled={running} className="h-10 w-full appearance-none rounded-sm border border-slate-600/80 bg-slate-950/55 pl-9 pr-7 text-xs text-slate-200 outline-none transition focus:border-cyan-300/70 disabled:cursor-not-allowed disabled:opacity-60">
                   <option value="">选择已连接设备</option>
                   {devices.map((device) => <option key={device.serial} value={device.serial} disabled={device.state !== "device"}>{device.model || device.serial} · {device.state}</option>)}
                 </select>
               </div>
-              <p className="mt-2 font-telemetry text-[10px] text-slate-500">{selectedDevice ? `${selectedDevice.serial} · Android ${selectedDevice.android_version || "—"}` : "USB / TCP ADB · 需完成设备授权"}</p>
+              <p className="mt-2 font-telemetry text-[10px] text-slate-500">{selectedDevice ? `${selectedDevice.serial} · Android ${selectedDevice.android_version || "—"}` : "USB / TCP ADB · 需完成设备授权"}</p></>}
             </section>
 
             <section>
-              <p className="mb-2 text-xs font-medium text-slate-300">采样窗口</p>
-              <div className="grid grid-cols-4 gap-1.5">
+              <SectionHeader title="采样窗口" collapsed={!!collapsed.window} onToggle={() => toggleSection("window")} />
+              {!collapsed.window && <><div className="grid grid-cols-4 gap-1.5">
                 {[5, 15, 30, 60].map((minutes) => <button key={minutes} disabled={running} onClick={() => setDurationMinutes(minutes)} className={`rounded-sm border py-2 font-telemetry text-[11px] transition ${durationMinutes === minutes ? "border-cyan-300/45 bg-cyan-300/12 text-cyan-100" : "border-slate-700 bg-slate-950/30 text-slate-500 hover:border-slate-500"}`}>{minutes}m</button>)}
               </div>
-              <div className="mt-2 flex items-center justify-between rounded-sm border border-slate-700/60 bg-slate-950/30 px-2.5 py-2"><span className="text-[11px] text-slate-400">采样间隔</span><select value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))} disabled={running} className="bg-transparent font-telemetry text-[11px] text-cyan-100 outline-none"><option value={500}>0.5s</option><option value={1000}>1.0s</option><option value={2000}>2.0s</option><option value={5000}>5.0s</option></select></div>
+              <div className="mt-2 flex items-center justify-between rounded-sm border border-slate-700/60 bg-slate-950/30 px-2.5 py-2"><span className="text-[11px] text-slate-400">采样间隔</span><select value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))} disabled={running} className="bg-transparent font-telemetry text-[11px] text-cyan-100 outline-none"><option value={500}>0.5s</option><option value={1000}>1.0s</option><option value={2000}>2.0s</option><option value={5000}>5.0s</option></select></div></>}
             </section>
 
             <section>
-              <div className="mb-2 flex items-center justify-between"><p className="text-xs font-medium text-slate-300">采样模块</p><span className="font-telemetry text-[10px] text-cyan-200">{enabledMetrics.length}/3 ON</span></div>
-              <div className="space-y-2">
+              <SectionHeader
+                title="采样模块"
+                collapsed={!!collapsed.metrics}
+                onToggle={() => toggleSection("metrics")}
+                right={<span className="font-telemetry text-[10px] text-cyan-200">{enabledMetrics.length}/3 ON</span>}
+              />
+              {!collapsed.metrics && <div className="space-y-2">
                 {(Object.keys(METRIC_META) as MetricKey[]).map((metric) => <MetricToggle key={metric} metric={metric} checked={metrics[metric]} onCheckedChange={(checked) => !running && setMetrics((current) => ({ ...current, [metric]: checked }))} />)}
-              </div>
+              </div>}
             </section>
 
             {metrics.fps && <section>
-              <div className="mb-2 flex items-center gap-2"><Layers3 size={14} className="text-amber-200" /><p className="text-xs font-medium text-slate-300">帧率数据源 · SurfaceFlinger layer</p></div>
-              <select value={surfaceLayer} disabled={running || !selectedSerial} onChange={(event) => setSurfaceLayer(event.target.value)} className="h-9 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-amber-300/60">
+              <SectionHeader title="帧率数据源 · SurfaceFlinger layer" icon={<Layers3 size={14} className="text-amber-200" />} collapsed={!!collapsed.fps} onToggle={() => toggleSection("fps")} />
+              {!collapsed.fps && <><select value={surfaceLayer} disabled={running || !selectedSerial} onChange={(event) => setSurfaceLayer(event.target.value)} className="h-9 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-amber-300/60">
                 <option value="">自动选择活跃 layer</option>
                 {layers.map((layer) => <option key={layer} value={layer}>{layer}</option>)}
               </select>
@@ -500,21 +590,24 @@ export default function Home() {
                   </p>
                   {frameCapability.notes.length > 0 && <p className="mt-1 text-[10px] leading-4 text-amber-100/70">{frameCapability.notes[0]}</p>}
                 </div>
-              ) : <p className="mt-1.5 text-[10px] leading-4 text-slate-500">选择设备后自动探测可用的逐帧数据源；采集时按版本自动降级。</p>}
+              ) : <p className="mt-1.5 text-[10px] leading-4 text-slate-500">选择设备后自动探测可用的逐帧数据源；采集时按版本自动降级。</p>}</>}
             </section>}
 
             <section>
-              <div className="mb-2 flex items-center gap-2"><Download size={14} className="text-emerald-200" /><p className="text-xs font-medium text-slate-300">设备日志导出</p></div>
-              <div className="space-y-1.5">
+              <SectionHeader title="设备日志导出" icon={<Download size={14} className="text-emerald-200" />} collapsed={!!collapsed.logs} onToggle={() => toggleSection("logs")} />
+              {!collapsed.logs && <><div className="space-y-1.5">
                 <input value={logPaths.anr} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, anr: event.target.value }))} placeholder="ANR 路径，如 /data/anr" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.crash} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, crash: event.target.value }))} placeholder="Crash 路径，如 /data/crash" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.tombstone} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, tombstone: event.target.value }))} placeholder="Tombstone 路径，如 /data/tombstones" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.exportRoot} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, exportRoot: event.target.value }))} placeholder="导出根目录（留空 = 项目根/DevicesLogs）" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
               </div>
-              <p className="mt-1.5 text-[10px] leading-4 text-slate-500">停止测试时自动导出到 <code className="font-telemetry">DevicesLogs/&lt;结束时间&gt;/ANR·Crash·Tombstone/</code> 并清理车机日志（保留目录）。留空的类型不导出，仅提示。</p>
+              <p className="mt-1.5 text-[10px] leading-4 text-slate-500">停止测试时自动导出到 <code className="font-telemetry">DevicesLogs/&lt;结束时间&gt;/ANR·Crash·Tombstone/</code> 并清理车机日志（保留目录）。留空的类型不导出，仅提示。</p></>}
             </section>
 
-            <InteractionDiagnostic serial={selectedSerial} />
+            <section>
+              <SectionHeader title="交互诊断（Perfetto）" icon={<Activity size={14} className="text-violet-200" />} collapsed={!!collapsed.interaction} onToggle={() => toggleSection("interaction")} />
+              {!collapsed.interaction && <InteractionDiagnostic serial={selectedSerial} />}
+            </section>
             <div className="border-t border-slate-700/70 pt-4">
               {running ? (
                 <Button onClick={() => void stopSession()} disabled={loading} className="h-10 w-full bg-red-400 text-red-950 hover:bg-red-300"><CircleStop size={15} /> {loading ? "正在停止…" : "停止并汇总"}</Button>
