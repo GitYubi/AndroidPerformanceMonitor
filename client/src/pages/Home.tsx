@@ -201,6 +201,26 @@ function notifyLogExport(events: MonitorEvent[]) {
     }
   }
 }
+
+// 独立倒计时组件：内部每秒 tick，只重渲染自身，
+// 避免每秒 setState 触发整个 Home（图表/表格）重渲染。
+function Countdown({ startedAtMs, durationSeconds, running }: { startedAtMs: number; durationSeconds: number; running: boolean }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [running]);
+  const remaining = running ? Math.max(0, Math.ceil((startedAtMs + durationSeconds * 1000 - nowMs) / 1000)) : null;
+  if (remaining === null) return null;
+  const text = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, "0")}`;
+  return (
+    <div className="rounded-sm border border-cyan-300/25 bg-cyan-300/8 px-3 py-2">
+      <p className="font-telemetry text-[9px] uppercase tracking-wider text-cyan-200">Countdown</p>
+      <p className="font-telemetry mt-0.5 text-xs text-cyan-100">{text}</p>
+    </div>
+  );
+}
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
   cpu: { label: "CPU 整体占用（逻辑核归一）", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
   memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
@@ -383,7 +403,6 @@ export default function Home() {
   const [events, setEvents] = useState<MonitorEvent[]>([]);
   const [loading, setLoading] = useState(false);
   const [apiError, setApiError] = useState("");
-  const [nowMs, setNowMs] = useState(() => Date.now());
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historySessions, setHistorySessions] = useState<MonitorSession[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -392,12 +411,6 @@ export default function Home() {
   const chartHeight = enabledMetrics.length === 1 ? 400 : enabledMetrics.length === 2 ? 278 : 202;
   const selectedDevice = devices.find((device) => device.serial === selectedSerial);
   const running = session?.state === "running";
-  const remainingSeconds = running && session?.started_at_ms
-    ? Math.max(0, Math.ceil((session.started_at_ms + session.duration_seconds * 1000 - nowMs) / 1000))
-    : null;
-  const remainingText = remainingSeconds === null
-    ? null
-    : `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, "0")}`;
   // 内存采样独立降频后 total_ram 仅在有内存采样的周期出现，取最近非空值
   const totalRamKb = (() => {
     for (let index = points.length - 1; index >= 0; index -= 1) {
@@ -429,35 +442,41 @@ export default function Home() {
     }
   }, []);
 
-  const refreshSession = useCallback(async (sessionId: string) => {
+  // 快速轮询（1s）：会话状态 + 曲线核心；检测运行结束并弹日志导出 toast
+  const refreshCore = useCallback(async (sessionId: string) => {
     try {
-      const [sessionPayload, seriesPayload, processPayload, eventPayload] = await Promise.all([
+      const [sessionPayload, seriesPayload] = await Promise.all([
         requestApi<MonitorSession>(`/api/sessions/${sessionId}`),
         requestApi<{ points: SessionPoint[] }>(`/api/sessions/${sessionId}/series?limit=180`),
-        requestApi<{ processes: ProcessRow[] }>(`/api/sessions/${sessionId}/processes?metric=${processMetric}&limit=10`),
-        requestApi<{ events: MonitorEvent[] }>(`/api/sessions/${sessionId}/events`),
       ]);
       setSession(sessionPayload);
       setPoints(seriesPayload.points);
-      setProcesses(processPayload.processes);
-      setEvents(eventPayload.events);
-      // 检测 running → 终态 的状态转换（手动停止或自然到期），此时弹设备日志导出结果。
       const previousState = prevSessionState.current;
       prevSessionState.current = sessionPayload.state;
       if (previousState === "running" && sessionPayload.state !== "running") {
-        notifyLogExport(eventPayload.events);
+        try {
+          const eventPayload = await requestApi<{ events: MonitorEvent[] }>(`/api/sessions/${sessionId}/events`);
+          notifyLogExport(eventPayload.events);
+        } catch { /* toast 失败不影响状态 */ }
       }
     } catch (error) {
       setApiError(error instanceof Error ? error.message : "刷新会话失败");
     }
+  }, []);
+
+  // 慢速轮询（3s）：进程排行 + 事件（非核心曲线，降低轮询开销）
+  const refreshSlow = useCallback(async (sessionId: string) => {
+    try {
+      const [processPayload, eventPayload] = await Promise.all([
+        requestApi<{ processes: ProcessRow[] }>(`/api/sessions/${sessionId}/processes?metric=${processMetric}&limit=10`),
+        requestApi<{ events: MonitorEvent[] }>(`/api/sessions/${sessionId}/events`),
+      ]);
+      setProcesses(processPayload.processes);
+      setEvents(eventPayload.events);
+    } catch { /* 慢速轮询失败静默，下轮重试 */ }
   }, [processMetric]);
 
   useEffect(() => { void refreshDevices(); }, [refreshDevices]);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, []);
 
   useEffect(() => {
     try { localStorage.setItem(LOG_PATHS_STORAGE_KEY, JSON.stringify(logPaths)); } catch { /* ignore */ }
@@ -486,7 +505,7 @@ export default function Home() {
   const viewHistorySession = async (sessionId: string) => {
     setHistoryOpen(false);
     setActiveSessionId(sessionId);
-    await refreshSession(sessionId);
+    await Promise.all([refreshCore(sessionId), refreshSlow(sessionId)]);
     toast.info("正在查看历史会话", { description: "历史数据仅保存在本机 data/ 目录；开始新采样会切换到新会话。" });
   };
 
@@ -526,10 +545,17 @@ export default function Home() {
 
   useEffect(() => {
     if (!activeSessionId) return;
-    void refreshSession(activeSessionId);
-    const timer = window.setInterval(() => { void refreshSession(activeSessionId); }, 1000);
+    void refreshCore(activeSessionId);
+    const timer = window.setInterval(() => { void refreshCore(activeSessionId); }, 1000);
     return () => window.clearInterval(timer);
-  }, [activeSessionId, refreshSession]);
+  }, [activeSessionId, refreshCore]);
+
+  useEffect(() => {
+    if (!activeSessionId) return;
+    void refreshSlow(activeSessionId);
+    const timer = window.setInterval(() => { void refreshSlow(activeSessionId); }, 3000);
+    return () => window.clearInterval(timer);
+  }, [activeSessionId, refreshSlow]);
 
   const startSession = async () => {
     if (!selectedSerial) {
@@ -574,7 +600,7 @@ export default function Home() {
     setLoading(true);
     try {
       await requestApi(`/api/sessions/${activeSessionId}/stop`, { method: "POST" });
-      await refreshSession(activeSessionId);
+      await Promise.all([refreshCore(activeSessionId), refreshSlow(activeSessionId)]);
       toast.success("采样已停止", { description: "会话汇总已写入本地 SQLite；设备日志导出结果见会话事件区。" });
     } catch (error) {
       toast.error("停止采样失败", { description: error instanceof Error ? error.message : "未知错误" });
@@ -717,7 +743,7 @@ export default function Home() {
                 </div>
               </div>
               <div className="flex flex-wrap gap-2 xl:justify-end">
-                {remainingText !== null && <div className="rounded-sm border border-cyan-300/25 bg-cyan-300/8 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-cyan-200">Countdown</p><p className="font-telemetry mt-0.5 text-xs text-cyan-100">{remainingText}</p></div>}
+                {session?.started_at_ms && <Countdown startedAtMs={session.started_at_ms} durationSeconds={session.duration_seconds} running={running} />}
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Window</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">{session ? `${Math.ceil(session.duration_seconds / 60)}m @ ${session.interval_ms / 1000}s` : `${durationMinutes}m @ ${intervalMs / 1000}s`}</p></div>
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Storage</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">SQLite · WAL</p></div>
                 {activeSessionId && <Button variant="outline" onClick={downloadCsv} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><Download size={14} /> 导出 CSV</Button>}
