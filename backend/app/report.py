@@ -249,10 +249,14 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         parts.append('<p class="empty">该会话没有采样数据。</p>')
 
     # ---------- 进程排行 ----------
-    def process_table(title: str, rows: list[dict[str, Any]], unit: str) -> str:
+    def process_table(title: str, rows: list[dict[str, Any]], unit: str, scale: float = 1.0) -> str:
+        # get_processes 的 pss/rss 为 KiB，显示 MiB 时需除以 1024
+        def scaled(value: float | None) -> float | None:
+            return None if value is None else value / scale
+
         body = "".join(
             f"<tr><td>{_escape(row['process_name'])}</td><td>{row.get('pid') or '—'}</td>"
-            f"<td>{_fmt(row.get('average'), 1)} {unit}</td><td>{_fmt(row.get('peak'), 1)} {unit}</td>"
+            f"<td>{_fmt(scaled(row.get('average')), 1)} {unit}</td><td>{_fmt(scaled(row.get('peak')), 1)} {unit}</td>"
             f"<td>{row.get('samples', 0)}</td></tr>"
             for row in rows
         )
@@ -265,11 +269,11 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     if processes_cpu or processes_pss or processes_rss:
         parts.append('<h2>进程排行</h2>')
         if processes_cpu:
-            parts.append(process_table("进程 CPU 占用排行", processes_cpu, "%"))
+            parts.append(process_table("进程 CPU 占用排行", processes_cpu, "%", scale=1))
         if processes_pss:
-            parts.append(process_table("进程 PSS 占用排行", processes_pss, "MiB"))
+            parts.append(process_table("进程 PSS 占用排行", processes_pss, "MiB", scale=1024))
         if processes_rss:
-            parts.append(process_table("进程 RSS 占用排行", processes_rss, "MiB"))
+            parts.append(process_table("进程 RSS 占用排行", processes_rss, "MiB", scale=1024))
 
     # ---------- 事件 ----------
     if events:
