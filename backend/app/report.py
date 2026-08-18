@@ -283,8 +283,8 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     # ---------- 指标口径说明 ----------
     meanings = [
         ("CPU 整体", "%", "整机 CPU 利用率，多核总容量归一到 0-100%", "top 总体行（总容量 − idle）"),
-        ("PSS", "MiB", "整机所有进程 PSS 加总；共享内存按比例分摊，接近系统真实占用（可与系统 Used RAM 对比）", "dumpsys meminfo · TOTAL PSS BY PROCESS"),
-        ("RSS", "MiB", "整机所有进程 RSS 加总；RSS 不摊共享页，多进程加总会重复计算共享内存，总和超过物理内存属正常，仅作参考", "dumpsys meminfo · TOTAL RSS BY PROCESS"),
+        ("PSS", "MiB", "整机所有进程 PSS 总和；共享内存按比例分摊，接近系统真实占用（可与系统 Used RAM 对比）", "dumpsys meminfo · TOTAL PSS BY PROCESS"),
+        ("RSS", "MiB", "整机所有进程 RSS 总和；RSS 不摊共享页，多进程加总会重复计算共享内存，总和超过物理内存属正常，仅作参考", "dumpsys meminfo · TOTAL RSS BY PROCESS"),
         ("呈现 FPS", "fps", "帧送上屏幕的呈现节奏；低于刷新率且持续说明显示链路吃紧", "FrameTimeline / framestats / SF latency 最优可用源"),
         ("应用渲染 FPS", "fps", "应用主动渲染帧率；静态界面回落 0 属正常", "gfxinfo 计数器增量"),
         ("逐帧 Jank", "%", "窗口内帧耗时超过两倍帧间隔的帧占比；越高掉帧越频繁", "framestats / FrameTimeline 逐帧时间戳"),
