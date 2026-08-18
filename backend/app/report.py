@@ -225,8 +225,8 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     # ---------- 总览卡片 ----------
     parts.append('<h2>测试总览</h2><div class="grid">')
     parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；平均=周期内每秒采样的均值，峰值=最高值。{cpu.get('valid_count', 0)} 个有效样本"))
-    parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程 PSS 加总。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
-    parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "整机所有进程 RSS 加总。RSS 不摊共享页，加总会重复计算共享内存，总和可能超过物理内存，仅作参考"))
+    parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程查询的 PSS 总和。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
+    parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "整机所有进程查询的 RSS 总和。RSS 不摊共享页，总和会重复计算共享内存，数值可能超过物理内存，仅作参考"))
     parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "屏幕呈现节奏（帧送上屏的速率）；平均=均值，最低=周期内最差表现。来自 FrameTimeline / framestats / SF latency 中最优可用源"))
     parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "窗口内卡顿帧占比的峰值（帧耗时超过两倍帧间隔）；逐帧口径，无则用 gfxinfo 计数口径"))
     parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "应用主动渲染帧率（gfxinfo 计数器增量）；静态界面不重绘时回落 0 属正常，非卡顿"))

@@ -640,7 +640,7 @@ export default function Home() {
         <aside className="telemetry-panel h-fit overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80 lg:sticky lg:top-5">
           <div className="border-b border-slate-700/70 px-4 py-3.5">
             <div className="flex items-center justify-between">
-              <div className="flex items-center gap-2"><SlidersHorizontal size={15} className="text-cyan-200" /><h2 className="text-sm font-semibold">会话骨架</h2></div>
+              <div className="flex items-center gap-2"><SlidersHorizontal size={15} className="text-cyan-200" /><h2 className="text-sm font-semibold">配置信息</h2></div>
               <span className="font-telemetry text-[10px] text-slate-500">01 / CONFIG</span>
             </div>
           </div>
