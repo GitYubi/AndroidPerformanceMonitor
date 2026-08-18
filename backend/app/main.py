@@ -9,13 +9,14 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from .adb import AdbError, enrich_device, list_devices, list_surface_layers
 from .frame_sources import probe_frame_capabilities
 from .models import StartSessionRequest
 from .monitor import MonitorManager
 from .interaction import InteractionError, InteractionTraceManager
+from .report import generate_report
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
@@ -170,6 +171,28 @@ async def session_events(session_id: str, request: Request) -> dict[str, object]
     if store.get_session(session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     return {"events": store.get_events(session_id)}
+
+
+@app.get("/api/sessions/{session_id}/report")
+async def session_report(
+    session_id: str,
+    request: Request,
+    download: int = Query(default=0, ge=0, le=1),
+) -> HTMLResponse:
+    """生成会话的 HTML 性能测试报告（当前或历史会话均可）。"""
+    store = manager_from(request).store
+    session = store.get_session(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    try:
+        content = generate_report(session_id, store)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"报告生成失败：{exc}") from exc
+    headers = {}
+    if download:
+        serial = str(session.get("serial", "device")).replace(":", "_")
+        headers["Content-Disposition"] = f'attachment; filename="report_{serial}_{session_id[:8]}.html"'
+    return HTMLResponse(content=content, headers=headers)
 
 
 @app.get("/api/sessions/{session_id}/export", response_class=PlainTextResponse)

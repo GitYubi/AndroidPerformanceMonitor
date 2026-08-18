@@ -296,6 +296,10 @@ class SessionStore:
             return [dict(row) for row in reversed(rows)]
         finally:
             connection.close()
+
+    def get_all_samples(self, session_id: str) -> list[dict[str, Any]]:
+        """全量采样点（报告生成用，不做行数限制）。"""
+        return self.get_series(session_id, limit=1_000_000)
     def get_processes(self, session_id: str, metric: str, limit: int = 10) -> list[dict[str, Any]]:
         column = {"cpu": "cpu_pct", "pss": "pss_kb", "rss": "rss_kb"}.get(metric)
         if column is None:

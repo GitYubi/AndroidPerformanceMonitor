@@ -13,6 +13,7 @@ import {
   CircleStop,
   Cpu,
   Download,
+  FileText,
   Gauge,
   HardDrive,
   History,
@@ -714,6 +715,7 @@ export default function Home() {
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Window</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">{session ? `${Math.ceil(session.duration_seconds / 60)}m @ ${session.interval_ms / 1000}s` : `${durationMinutes}m @ ${intervalMs / 1000}s`}</p></div>
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Storage</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">SQLite · WAL</p></div>
                 {activeSessionId && <Button variant="outline" onClick={downloadCsv} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><Download size={14} /> 导出 CSV</Button>}
+                {activeSessionId && <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${activeSessionId}/report`, "_blank", "noopener,noreferrer")} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={14} /> 生成报告</Button>}
                 <Button variant="outline" onClick={() => { void loadHistory(); setHistoryOpen(true); }} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><History size={14} /> 历史会话</Button>
               </div>
             </div>
@@ -788,6 +790,7 @@ export default function Home() {
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         <span className={`rounded-sm border px-1.5 py-0.5 font-telemetry text-[10px] ${stateTone(item.state)}`}>{stateLabel(item.state)}</span>
+                        <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${item.session_id}/report`, "_blank", "noopener,noreferrer")} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={12} /> 报告</Button>
                         <Button variant="outline" onClick={() => void viewHistorySession(item.session_id)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
                       </div>
                     </div>
