@@ -14,13 +14,58 @@ from __future__ import annotations
 
 import asyncio
 
-from .adb import AdbError, get_foreground_package, get_sdk_version, parse_gfxinfo_summary, run_adb
+from .adb import (
+    AdbError,
+    choose_surface_layer,
+    get_foreground_package,
+    get_sdk_version,
+    list_surface_layers,
+    parse_gfxinfo_summary,
+    parse_surface_latency_stats,
+    run_adb,
+)
 from .frame_sources import capture_frame_metrics, SOURCE_LABELS
 
 # 巡检状态：按前台包名跟踪 gfxinfo 计数基线，用于 R 线增量判定。
 # 全局单设备场景（工具本就是单主机/单车机），包名变化时自动重置。
 _probe_state: dict[str, object] = {}
 _probe_lock = asyncio.Lock()
+
+
+async def _probe_present(serial: str, package: str, sdk_version: int | None) -> tuple[bool, str, bool, str]:
+    """按主工具同款降级链检测 P（呈现 FPS）与 J（逐帧 Jank）可测性。
+
+    先试逐帧源（FrameTimeline / framestats），无结果时降级到
+    SurfaceFlinger --latency（与 monitor._capture_fps 一致），
+    保证非 View 渲染应用（如 mediacenter）也能判定 P 可用。
+    返回 (p_ok, p_detail, jank_ok, jank_detail)。
+    """
+    stats = await capture_frame_metrics(serial, package, sdk_version)
+    if stats is not None:
+        source_label = SOURCE_LABELS.get(stats.source, stats.source)
+        p_ok = stats.fps is not None
+        p_detail = f"{stats.fps} fps @ {source_label}" if p_ok else f"无呈现时间戳 @ {source_label}"
+        jank_ok = bool(stats.frame_count and stats.frame_count > 0)
+        jank_detail = f"{stats.frame_count} 帧 / {stats.jank_pct}% jank @ {source_label}" if jank_ok else "无逐帧数据"
+        return p_ok, p_detail, jank_ok, jank_detail
+
+    # 降级：SF --latency 兜底（同主工具）
+    try:
+        layers = await list_surface_layers(serial)
+        layer = choose_surface_layer(layers, package)
+        if layer is None:
+            return False, "逐帧源不可用且未找到可测 layer", False, "逐帧源不可用"
+        output = await run_adb("shell", "dumpsys", "SurfaceFlinger", "--latency", layer, serial=serial, timeout_seconds=7)
+        latency_stats = parse_surface_latency_stats(output)
+    except AdbError:
+        latency_stats = None
+        layer = None
+    if latency_stats is not None and latency_stats.fps is not None:
+        p_detail = f"{latency_stats.fps} fps @ sf_latency（{layer}）"
+        jank_ok = latency_stats.jank_pct is not None
+        jank_detail = f"{latency_stats.jank_pct}% jank @ sf_latency" if jank_ok else "sf_latency 无 jank 数据"
+        return True, p_detail, jank_ok, jank_detail
+    return False, "逐帧源与 SF latency 均无可用数据", False, "无可用数据源"
 
 
 async def probe_status(serial: str) -> dict[str, object]:
@@ -58,24 +103,13 @@ async def probe_status(serial: str) -> dict[str, object]:
         else:
             r_detail = "gfxinfo 无计数段（应用从未产生 HWUI 帧）"
 
-        # ---------- P / Jank：逐帧数据源 ----------
-        p_ok = False
-        jank_ok = False
-        p_detail = "—"
-        jank_detail = "—"
+        # ---------- P / Jank：逐帧源 → SF latency 兜底 ----------
         try:
             sdk_version = await get_sdk_version(serial)
-            stats = await capture_frame_metrics(serial, package, sdk_version)
+            p_ok, p_detail, jank_ok, jank_detail = await _probe_present(serial, package, sdk_version)
         except AdbError:
-            stats = None
-        if stats is not None:
-            source_label = SOURCE_LABELS.get(stats.source, stats.source)
-            p_ok = stats.fps is not None
-            p_detail = f"{stats.fps} fps @ {source_label}" if p_ok else f"无呈现时间戳 @ {source_label}"
-            jank_ok = bool(stats.frame_count and stats.frame_count > 0)
-            jank_detail = f"{stats.frame_count} 帧 / {stats.jank_pct}% jank @ {source_label}" if jank_ok else "无逐帧数据"
-        else:
-            p_detail = jank_detail = "无可用逐帧数据源"
+            p_ok, jank_ok = False, False
+            p_detail = jank_detail = "检测失败（ADB 不可用）"
 
         return {
             "package": package,
