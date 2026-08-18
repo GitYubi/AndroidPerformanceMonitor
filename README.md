@@ -137,30 +137,29 @@ adb devices -l
 
 > 配置留空的类型不导出（仅提示）。`/data/anr`、`/data/tombstones` 在部分车机上仅 root 可写，但**读取**通常可用；若被拒绝，会以 warning 事件记录并跳过。默认导出根目录为项目根目录下的 `DevicesLogs`，已在 `.gitignore` 中排除。
 
-## FPS 可测性巡检
+## FPS 数据链路巡检
 
-排查"车机哪个界面拿不到 FPS 信息"的独立小工具（`tools/fps_probe.py`）。它逐个打开候选界面、滑动触发渲染，并检测该界面的 FPS 数据链路（gfxinfo 计数器增量 / framestats 是否有数据 / 滑动时是否更新），输出每个界面的结论：
+排查"车机哪个界面拿不到 FPS 信息"的独立界面工具。后端启动后访问：
 
-| 结论 | 含义 |
-| --- | --- |
-| 可测（R 线可用） | 走 View/HWUI 渲染，滑动后计数器增长，实时曲线可用 |
-| 计数器不增长（纯合成动画 / SurfaceView / 静态界面） | 界面渲染不经 gfxinfo 计数（如桌面滑动、视频），R 线拿不到属正常 |
-| gfxinfo 与 framestats 均无数据 | 可能权限受限或非 HWUI 渲染 |
-| 启动失败或未成为前台 | 应用无法通过 monkey/am 启动，或启动后未停留在前台 |
-
-```bash
-# 指定界面检测
-backend/.venv/bin/python tools/fps_probe.py --serial 42b86e9c \
-    --packages com.baic.icc.launcher,com.baic.icc.wallpaperstore
-
-# 自动扫描车机 HMI 相关包（含 baic/icc/adayo/launcher/settings/media 等关键词）
-backend/.venv/bin/python tools/fps_probe.py --serial 42b86e9c --auto
-
-# JSON 输出（便于接入脚本）
-backend/.venv/bin/python tools/fps_probe.py --serial 42b86e9c --packages ... --json
+```
+http://127.0.0.1:8090/fps-probe
 ```
 
-> 检测会真实打开并滑动车机界面（结束后自动回到桌面）；单界面约需 10–20 秒。
+**不自动操作**：你自己在车机上打开目标界面并操作（滑动/点击触发渲染），页面每秒检测并显示当前前台包名，以及三个参数是否可测：
+
+| 参数 | 判定 | 显示 |
+| --- | --- | --- |
+| R · 应用渲染 | gfxinfo 计数器在操作时是否增长（增量判定） | ✓ / ✗ |
+| P · 呈现帧率 | 逐帧数据源（FrameTimeline / framestats）是否产出呈现 FPS | ✓ / ✗ |
+| J · 逐帧 Jank | 逐帧数据源是否有帧数据（frame_count > 0） | ✓ / ✗ |
+
+每个参数旁附实时详情（计数增量、当前 FPS、帧数与 Jank 占比）。典型结果解读：
+
+- **R ✗ 且操作后持续 ✗**：该界面渲染不经过 gfxinfo（纯合成动画如桌面滑动、SurfaceView 视频），R 线拿不到属正常；
+- **R ✓**：走 View/HWUI 渲染，实时 R 曲线可用；
+- **P / J ✗**：无可用逐帧数据源（权限受限或设备不支持）。
+
+> 页面由后端直接返回（自包含 HTML + 1s 轮询），不依赖前端构建；巡检状态按前台包名自动重置。
 
 ## 历史会话
 

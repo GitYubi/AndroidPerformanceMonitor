@@ -12,6 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from .adb import AdbError, enrich_device, list_devices, list_surface_layers
+from .fps_probe import PAGE_HTML, probe_status
 from .frame_sources import probe_frame_capabilities
 from .models import StartSessionRequest
 from .monitor import MonitorManager
@@ -92,6 +93,21 @@ async def start_session(payload: StartSessionRequest, request: Request) -> dict[
     except (AdbError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "running"}
+
+
+@app.get("/fps-probe", response_class=HTMLResponse)
+async def fps_probe_page() -> HTMLResponse:
+    """FPS 数据链路巡检页面（自包含，不依赖前端构建）。"""
+    return HTMLResponse(content=PAGE_HTML)
+
+
+@app.get("/api/fps-probe/status")
+async def fps_probe_status(serial: str = Query(min_length=1, max_length=128)) -> dict[str, object]:
+    """巡检当前前台界面的 R / P / Jank 可测状态。"""
+    try:
+        return await probe_status(serial)
+    except AdbError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
 
 @app.get("/api/sessions")
