@@ -132,14 +132,30 @@ async def probe_frame_capabilities(serial: str) -> FrameCapabilities:
     )
 
 
-async def capture_frame_metrics(serial: str, package: str | None, sdk_version: int | None) -> FrameStats | None:
+# 数据源失败冷却周期数：解析失败后暂停尝试（如 60 周期 ≈ 30s @0.5s），
+# 冷却到期自动复测一次，避免每周期白跑已确认不可用的源（慢车机尤其浪费）。
+FRAME_SOURCE_COOLDOWN_CYCLES = 60
+
+
+async def capture_frame_metrics(
+    serial: str,
+    package: str | None,
+    sdk_version: int | None,
+    cooldowns: dict[str, int] | None = None,
+) -> FrameStats | None:
     """按优先级尝试逐帧数据源，返回第一个成功解析的结果；全部失败返回 None。
 
     SurfaceFlinger --latency 与 gfxinfo 计数器属于 monitor 的兜底链路，
     不在此处尝试（前者需要会话内 layer 选择状态）。
+
+    cooldowns：源 → 剩余冷却周期数。冷却中的源直接跳过；解析失败/异常时
+    设置冷却；成功时清除冷却。None 表示不做冷却（巡检等单次调用场景）。
     """
 
     for source in source_priority(sdk_version):
+        if cooldowns and cooldowns.get(source, 0) > 0:
+            cooldowns[source] -= 1
+            continue
         try:
             if source == FRAME_SOURCE_FRAMETIMELINE:
                 output = await run_adb("shell", "dumpsys", "SurfaceFlinger", "--frametimeline", "-all", serial=serial, timeout_seconds=7)
@@ -154,6 +170,10 @@ async def capture_frame_metrics(serial: str, package: str | None, sdk_version: i
         except AdbError:
             stats = None
         if stats is not None:
+            if cooldowns is not None:
+                cooldowns.pop(source, None)
             stats.package = package
             return stats
+        if cooldowns is not None and source != FRAME_SOURCE_SF_LATENCY:
+            cooldowns[source] = FRAME_SOURCE_COOLDOWN_CYCLES
     return None

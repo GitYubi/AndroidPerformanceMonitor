@@ -52,9 +52,19 @@ class RuntimeSession:
     sdk_version: int | None = None
     active_frame_source: str | None = None
     sample_cycle: int = 0
+    # 前台包名缓存：每 FOREGROUND_REFRESH_CYCLES 个周期刷新一次，
+    # 避免 fps/render 两条链路每周期各自查询 dumpsys activity。
+    foreground_package: str | None = None
+    foreground_checked_cycle: int = -1
+    # 帧率数据源失败冷却：frametimeline/framestats 持续失败时暂停尝试。
+    frame_source_cooldowns: dict[str, int] = field(default_factory=dict)
     # 异步内存采样：worker 完成后更新结果，不阻塞主采样循环
     memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
     memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
+
+
+# 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
+FOREGROUND_REFRESH_CYCLES = 4
 
 
 class MonitorManager:
@@ -190,6 +200,14 @@ class MonitorManager:
         jobs: list[tuple[str, asyncio.Task[object]]] = []
         if runtime.request.metrics.cpu:
             jobs.append(("cpu", asyncio.create_task(self._capture_cpu(runtime.request.serial))))
+        # 前台包名缓存刷新（dumpsys activity 每 FOREGROUND_REFRESH_CYCLES 周期一次；
+        # 首周期立即刷新，避免缓存初始为 None 导致 render 链路误报）
+        if runtime.foreground_checked_cycle < 0 or runtime.sample_cycle - runtime.foreground_checked_cycle >= FOREGROUND_REFRESH_CYCLES:
+            try:
+                runtime.foreground_package = await get_foreground_package(runtime.request.serial)
+            except AdbError:
+                pass
+            runtime.foreground_checked_cycle = runtime.sample_cycle
         # 内存完全独立：命中采样节奏且无在途 meminfo 时后台启动 worker，
         # 主循环不等待——全量 meminfo 在部分车机耗时数秒，异步化后
         # CPU/FPS 周期严格按 interval 落点，内存值以最近一次完成结果更新。
@@ -262,7 +280,7 @@ class MonitorManager:
         )
 
     async def _capture_app_render(self, runtime: RuntimeSession) -> tuple[float | None, float | None]:
-        package = await get_foreground_package(runtime.request.serial)
+        package = runtime.foreground_package
         if not package:
             raise AdbError("无法识别当前前台应用包名")
         # 窗口起点取命令执行前：车机上 adb 命令耗时可达 1-2s，
@@ -312,8 +330,8 @@ class MonitorManager:
         return parse_meminfo(output)
     async def _capture_fps(self, runtime: RuntimeSession) -> FrameStats | None:
         """按版本与可用性自动选择逐帧数据源，全部失败时回退 SF --latency。"""
-        package = await get_foreground_package(runtime.request.serial)
-        per_frame = await capture_frame_metrics(runtime.request.serial, package, runtime.sdk_version)
+        package = runtime.foreground_package
+        per_frame = await capture_frame_metrics(runtime.request.serial, package, runtime.sdk_version, runtime.frame_source_cooldowns)
         if per_frame is not None:
             self._switch_frame_source(runtime, per_frame.source)
             return per_frame
