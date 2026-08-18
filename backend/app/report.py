@@ -245,7 +245,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         parts.append('<p class="empty">该会话没有采样数据。</p>')
 
     # ---------- 进程排行 ----------
-    def process_table(rows: list[dict[str, Any]], unit: str) -> str:
+    def process_table(title: str, rows: list[dict[str, Any]], unit: str) -> str:
         body = "".join(
             f"<tr><td>{_escape(row['process_name'])}</td><td>{row.get('pid') or '—'}</td>"
             f"<td>{_fmt(row.get('average'), 1)} {unit}</td><td>{_fmt(row.get('peak'), 1)} {unit}</td>"
@@ -253,7 +253,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
             for row in rows
         )
         return (
-            '<div class="chart"><h3>进程聚合排行</h3>'
+            f'<div class="chart"><h3>{_escape(title)}</h3>'
             "<table><tr><th>进程</th><th>PID</th><th>平均</th><th>峰值</th><th>样本数</th></tr>"
             f"{body}</table></div>"
         )
@@ -261,11 +261,11 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     if processes_cpu or processes_pss or processes_rss:
         parts.append('<h2>进程排行</h2>')
         if processes_cpu:
-            parts.append(process_table(processes_cpu, "%"))
+            parts.append(process_table("进程 CPU 占用排行", processes_cpu, "%"))
         if processes_pss:
-            parts.append(process_table(processes_pss, "MiB"))
+            parts.append(process_table("进程 PSS 占用排行", processes_pss, "MiB"))
         if processes_rss:
-            parts.append(process_table(processes_rss, "MiB"))
+            parts.append(process_table("进程 RSS 占用排行", processes_rss, "MiB"))
 
     # ---------- 事件 ----------
     if events:
