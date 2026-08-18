@@ -207,7 +207,11 @@ th{{color:#94a3b8;font-weight:500;}} td{{color:#cbd5e1;}}
 .event{{padding:4px 0;font-size:12px;color:#94a3b8;}} .event .code{{color:#cbd5e1;font-family:monospace;}}
 .warn{{color:#fbbf24;}} .err{{color:#f87171;}}
 footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#64748b;font-size:11px;}}
-</style></head><body><div class="wrap">
+.capture-btn{{position:fixed;top:16px;right:16px;background:#1e293b;border:1px solid #334155;color:#7dd3fc;border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;z-index:10;font-family:inherit;}}
+.capture-btn:hover{{background:#334155;}}
+</style></head><body>
+<button class="capture-btn" data-capture-btn onclick="capturePNG()">保存为图片 (PNG)</button>
+<div class="wrap">
 <header>
 <h1>Android 车机性能测试报告</h1>
 <div class="meta">
@@ -302,6 +306,35 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
 
     parts.append(
         f'<footer>生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")} ｜ 会话 {_escape(session_id)} ｜ Android 车机性能监测工具</footer>'
-        "</div></body></html>"
+        "</div>"
+        "<script>"
+        "function capturePNG(){"
+        "var wrap=document.querySelector('.wrap');"
+        "var width=wrap.scrollWidth,height=wrap.scrollHeight;"
+        "var cssText='';"
+        "for(var i=0;i<document.styleSheets.length;i++){try{var rules=document.styleSheets[i].cssRules;"
+        "for(var j=0;j<rules.length;j++){cssText+=rules[j].cssText;}}catch(e){}}"
+        "var clone=wrap.cloneNode(true);"
+        "var btn=clone.querySelector('[data-capture-btn]');if(btn){btn.remove();}"
+        "var svg='<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"'+width+'\" height=\"'+height+'\">'"
+        "+'<foreignObject width=\"100%\" height=\"100%\">'"
+        "+'<div xmlns=\"http://www.w3.org/1999/xhtml\"><style>'+cssText+'</style>'+clone.outerHTML+'</div>'"
+        "+'</foreignObject></svg>';"
+        "var img=new Image();"
+        "img.onload=function(){"
+        "var canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;"
+        "var ctx=canvas.getContext('2d');"
+        "ctx.fillStyle='#0f172a';ctx.fillRect(0,0,width,height);"
+        "ctx.drawImage(img,0,0);"
+        "canvas.toBlob(function(blob){"
+        "var a=document.createElement('a');a.href=URL.createObjectURL(blob);"
+        "a.download='report_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.png';"
+        "a.click();"
+        "},'image/png');"
+        "};"
+        "img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);"
+        "}"
+        "</script>"
+        "</body></html>"
     )
     return "".join(parts)
