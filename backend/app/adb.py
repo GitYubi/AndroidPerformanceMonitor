@@ -547,12 +547,23 @@ def parse_frame_timeline(output: str) -> FrameStats | None:
 
 
 def parse_gfxinfo_summary(output: str) -> tuple[int, int] | None:
-    """Parse cumulative rendered and janky frame counts from dumpsys gfxinfo."""
-    total_match = re.search(r"Total frames rendered:\s*(\d+)", output, re.IGNORECASE)
-    janky_match = re.search(r"Janky frames:\s*(\d+)", output, re.IGNORECASE)
-    if not total_match or not janky_match:
-        return None
-    return int(total_match.group(1)), int(janky_match.group(1))
+    """从 dumpsys gfxinfo 输出解析累计渲染帧数。
+
+    gfxinfo 按进程分段（``** Graphics info for pid N [pkg] **``），多进程应用
+    （车机 HMI 常见）会输出多段；旧实现用 re.search 固定取第一段，可能取到
+    不活跃进程导致计数器不增长。这里解析所有段，取累计帧数最大的进程
+    （= 渲染最活跃的进程）作为增量基准。
+    """
+    sections = re.split(r"\*\* Graphics info for pid \d+", output)
+    best: tuple[int, int] | None = None
+    for section in sections:
+        total_match = re.search(r"Total frames rendered:\s*(\d+)", section, re.IGNORECASE)
+        janky_match = re.search(r"Janky frames:\s*(\d+)", section, re.IGNORECASE)
+        if total_match and janky_match:
+            candidate = (int(total_match.group(1)), int(janky_match.group(1)))
+            if best is None or candidate[0] > best[0]:
+                best = candidate
+    return best
 async def list_surface_layers(serial: str) -> list[str]:
     """列出可供 --latency 测试的候选 layer 名称。"""
 

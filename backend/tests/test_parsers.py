@@ -2,7 +2,7 @@
 
 import re
 
-from app.adb import ProcessSample, extract_foreground_package, merge_processes, parse_cpuinfo, parse_frame_timeline, parse_framestats, parse_meminfo, parse_surface_latency, parse_surface_latency_stats, parse_top
+from app.adb import ProcessSample, extract_foreground_package, merge_processes, parse_cpuinfo, parse_frame_timeline, parse_framestats, parse_gfxinfo_summary, parse_meminfo, parse_surface_latency, parse_surface_latency_stats, parse_top
 from app.device_logs import LOG_KIND_ANR, LOG_KIND_CRASH, LOG_KIND_TOMBSTONE, DeviceLogConfig
 from app.frame_sources import FRAME_SOURCE_FRAMESTATS, FRAME_SOURCE_FRAMETIMELINE, FRAME_SOURCE_SF_LATENCY, source_priority
 
@@ -242,6 +242,52 @@ def test_device_log_folder_name_format() -> None:
 
     folder = _time.strftime("%Y_%m_%d-%H_%M_%S")
     assert re.match(r"^\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}$", folder)
+
+
+def test_parse_gfxinfo_summary_single_process() -> None:
+    output = """** Graphics info for pid 4042 [com.example.app] **
+Total frames rendered: 2828
+Janky frames: 560 (19.80%)"""
+    assert parse_gfxinfo_summary(output) == (2828, 560)
+
+
+def test_parse_gfxinfo_summary_takes_most_active_process() -> None:
+    """多进程输出：第一段是不活跃进程（帧数少），应取渲染最活跃的段。"""
+    output = """** Graphics info for pid 5678 [com.example.app:remote] **
+Total frames rendered: 120
+Janky frames: 2 (1.67%)
+
+** Graphics info for pid 4042 [com.example.app] **
+Total frames rendered: 2828
+Janky frames: 560 (19.80%)"""
+    assert parse_gfxinfo_summary(output) == (2828, 560)
+
+
+def test_parse_gfxinfo_summary_first_process_active() -> None:
+    """多进程输出：第一段就是活跃进程时仍取第一段。"""
+    output = """** Graphics info for pid 4042 [com.example.app] **
+Total frames rendered: 9999
+Janky frames: 100 (1.00%)
+
+** Graphics info for pid 5678 [com.example.app:remote] **
+Total frames rendered: 50
+Janky frames: 1 (2.00%)"""
+    assert parse_gfxinfo_summary(output) == (9999, 100)
+
+
+def test_parse_gfxinfo_summary_skips_broken_section() -> None:
+    """某段缺 Janky 字段时跳过该段，不拖垮整体解析。"""
+    output = """** Graphics info for pid 5678 [com.example.app:remote] **
+Total frames rendered: 5000
+
+** Graphics info for pid 4042 [com.example.app] **
+Total frames rendered: 3000
+Janky frames: 100 (3.33%)"""
+    assert parse_gfxinfo_summary(output) == (3000, 100)
+
+
+def test_parse_gfxinfo_summary_none() -> None:
+    assert parse_gfxinfo_summary("no gfx data here") is None
 
 
 def test_source_priority_gates_by_sdk() -> None:
