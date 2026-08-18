@@ -9,7 +9,7 @@
 | 模块 | 已实现内容 | 默认行为 |
 | --- | --- | --- |
 | CPU | 调用 `top -b -n 1` 与 `dumpsys cpuinfo`，解析整体 CPU 与进程 CPU；汇总平均值、峰值与进程排行 | 采样间隔默认 0.5 秒；多核 `top` 输出优先按“总容量 − idle”换算整体利用率。 |
-| Memory | 调用 `dumpsys meminfo`，记录按进程汇总的 PSS/RSS 及其聚合值 | 以 KiB 落盘，界面以 MiB 显示；单独缺失 RSS 时 PSS 继续工作。 |
+| Memory | 调用 `dumpsys meminfo`，记录按进程汇总的 PSS/RSS 及其聚合值 | 以 KiB 落盘，界面以 MiB 显示；**独立降频采样**（默认每 5 个采样周期采一次，全量 meminfo 在部分车机耗时数秒，降频避免拖慢整个周期）；单独缺失 RSS 时 PSS 继续工作。 |
 | FPS | **多数据源自动降级**：FrameTimeline → framestats → SurfaceFlinger `--latency`，估算呈现帧率并输出逐帧 Jank / P95 / P99 帧耗时、应用渲染空闲态（虚线保持） | 启动时探测 SDK 版本与数据源可用性，采样中失败自动降级；未选定 layer 时自动选择候选 layer。 |
 | 设备日志导出 | 测试结束时自动拉取车机 ANR / Crash / Tombstone 日志到本地，并清理车机日志（保留目录） | 导出到 `DevicesLogs/<结束时间>/ANR|Crash|Tombstone/`；路径留空则不导出该类型。 |
 | 历史会话 | 本地 `data/` 目录全部历史会话的查看（曲线/事件/进程/汇总）、CSV 导出与外部 `monitor.db` 导入 | 会话目录按 `<设备号>_<日期>` 命名；导入文件自动校验并去冲突。 |

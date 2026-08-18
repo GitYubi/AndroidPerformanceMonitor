@@ -27,6 +27,10 @@ class StartSessionRequest(BaseModel):
     interval_ms: int = Field(default=1000, ge=500, le=5000)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     surface_layer: str | None = Field(default=None, max_length=256)
+    # 内存采样独立降频：每 N 个采样周期采一次内存（dumpsys meminfo 全量
+    # 在部分车机上耗时数秒，会拖慢整个采样周期；内存变化缓慢，降频不损失
+    # 趋势信息）。默认 5：0.5s 间隔下约 2.5s 一个内存点。
+    memory_cycle_skip: int = Field(default=5, ge=1, le=60)
     # 设备日志导出：留空表示不导出该类型（仅前端提示）
     anr_path: str | None = Field(default=None, max_length=256)
     crash_path: str | None = Field(default=None, max_length=256)

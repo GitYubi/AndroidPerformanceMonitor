@@ -398,7 +398,13 @@ export default function Home() {
   const remainingText = remainingSeconds === null
     ? null
     : `${Math.floor(remainingSeconds / 60)}:${String(remainingSeconds % 60).padStart(2, "0")}`;
-  const totalRamKb = points.at(-1)?.total_ram_kb ?? null;
+  // 内存采样独立降频后 total_ram 仅在有内存采样的周期出现，取最近非空值
+  const totalRamKb = (() => {
+    for (let index = points.length - 1; index >= 0; index -= 1) {
+      if (points[index].total_ram_kb != null) return points[index].total_ram_kb;
+    }
+    return null;
+  })();
 
   const refreshDevices = useCallback(async () => {
     try {

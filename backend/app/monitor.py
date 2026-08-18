@@ -51,6 +51,10 @@ class RuntimeSession:
     render_baselines: dict[str, tuple[int, int, float]] = field(default_factory=dict)
     sdk_version: int | None = None
     active_frame_source: str | None = None
+    sample_cycle: int = 0
+    # 异步内存采样：worker 完成后更新结果，不阻塞主采样循环
+    memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
+    memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
 
 
 class MonitorManager:
@@ -79,6 +83,7 @@ class MonitorManager:
             "created_at_ms": created_at_ms,
             "duration_seconds": request.duration_seconds,
             "interval_ms": request.interval_ms,
+            "memory_cycle_skip": request.memory_cycle_skip,
             "enabled_metrics": request.metrics.model_dump(),
             "surface_layer": request.surface_layer,
             "sdk_version": sdk_version,
@@ -131,6 +136,7 @@ class MonitorManager:
                     break
 
                 payload = await self._capture_once(runtime)
+                runtime.sample_cycle += 1
                 runtime.writer.write_sample(payload)
                 next_tick += interval_seconds
                 delay = max(0.0, next_tick - time.monotonic())
@@ -147,6 +153,8 @@ class MonitorManager:
             final_state = "failed"
             runtime.writer.add_event("error", "runtime_failure", str(exc))
         finally:
+            if runtime.memory_task is not None and not runtime.memory_task.done():
+                runtime.memory_task.cancel()
             if runtime.request.log_export_enabled():
                 try:
                     await self._export_device_logs(runtime)
@@ -182,8 +190,25 @@ class MonitorManager:
         jobs: list[tuple[str, asyncio.Task[object]]] = []
         if runtime.request.metrics.cpu:
             jobs.append(("cpu", asyncio.create_task(self._capture_cpu(runtime.request.serial))))
+        # 内存完全独立：命中采样节奏且无在途 meminfo 时后台启动 worker，
+        # 主循环不等待——全量 meminfo 在部分车机耗时数秒，异步化后
+        # CPU/FPS 周期严格按 interval 落点，内存值以最近一次完成结果更新。
         if runtime.request.metrics.memory:
-            jobs.append(("memory", asyncio.create_task(self._capture_memory(runtime.request.serial))))
+            if (
+                runtime.sample_cycle % runtime.request.memory_cycle_skip == 0
+                and (runtime.memory_task is None or runtime.memory_task.done())
+            ):
+                runtime.memory_task = asyncio.create_task(self._capture_memory(runtime.request.serial))
+            if runtime.memory_task is not None and runtime.memory_task.done():
+                try:
+                    runtime.memory_result = runtime.memory_task.result()
+                    statuses["memory"] = "ok"
+                except (AdbError, Exception) as exc:
+                    self._record_error_once(runtime, "memory_adb", f"内存采样失败：{exc}")
+                runtime.memory_task = None
+            if runtime.memory_result is not None:
+                pss_kb, rss_kb, total_ram_kb, processes = runtime.memory_result
+                process_sets.append(processes)
         if runtime.request.metrics.fps:
             jobs.append(("fps", asyncio.create_task(self._capture_fps(runtime))))
             jobs.append(("render", asyncio.create_task(self._capture_app_render(runtime))))
@@ -281,7 +306,9 @@ class MonitorManager:
         return total, merge_processes(top_processes, parse_cpuinfo(cpuinfo_output))
 
     async def _capture_memory(self, serial: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
-        output = await run_adb("shell", "dumpsys", "meminfo", serial=serial, timeout_seconds=8)
+        # 内存已异步化，超时放宽到 15s（部分车机全量 meminfo 在负载下可达 8s+）；
+        # worker 独立运行，不阻塞主采样循环。
+        output = await run_adb("shell", "dumpsys", "meminfo", serial=serial, timeout_seconds=15)
         return parse_meminfo(output)
     async def _capture_fps(self, runtime: RuntimeSession) -> FrameStats | None:
         """按版本与可用性自动选择逐帧数据源，全部失败时回退 SF --latency。"""
