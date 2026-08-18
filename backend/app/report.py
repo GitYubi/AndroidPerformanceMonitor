@@ -58,11 +58,12 @@ def _downsample(values: list[float | None], max_points: int = _CHART_MAX_POINTS)
     return result
 
 
-def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]], unit: str) -> str:
+def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]], unit: str, description: str = "") -> str:
     """生成单张 SVG 折线图；series = [(名称, 值序列, 颜色), ...]。"""
     all_values = [value for _, values, _ in series for value in values if value is not None]
     if not all_values:
-        return f'<div class="chart"><h3>{_escape(title)}</h3><p class="empty">无有效数据</p></div>'
+        note = f'<p class="meaning">{_escape(description)}</p>' if description else ""
+        return f'<div class="chart"><h3>{_escape(title)}</h3><p class="empty">无有效数据</p>{note}</div>'
     y_min = min(all_values)
     y_max = max(all_values)
     if y_min == y_max:
@@ -98,13 +99,14 @@ def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]
             f'<line x1="44" y1="{grid_y:.1f}" x2="900" y2="{grid_y:.1f}" stroke="#334155" stroke-width="0.5"/>'
             f'<text x="4" y="{grid_y + 3:.1f}" font-size="9" fill="#94a3b8">{value:.1f}</text>'
         )
+    note = f'<p class="meaning">{_escape(description)}</p>' if description else ""
     return (
         f'<div class="chart"><h3>{_escape(title)} <span class="unit">{_escape(unit)}</span></h3>'
         f'<svg viewBox="0 0 {_CHART_WIDTH} {_CHART_HEIGHT}" preserveAspectRatio="xMidYMid meet" '
         f'width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">'
         f'{grid}{polylines}'
         f'<line x1="44" y1="{_CHART_HEIGHT - 12}" x2="900" y2="{_CHART_HEIGHT - 12}" stroke="#475569" stroke-width="1"/>'
-        f'</svg></div>'
+        f'</svg>{note}</div>'
     )
 
 
@@ -196,6 +198,7 @@ h1{{font-size:20px;margin:0 0 8px;}} h2{{font-size:15px;color:#7dd3fc;margin:28p
 .card-sub{{color:#64748b;font-size:10px;}} .unit{{color:#64748b;font-size:10px;font-weight:400;}}
 .chart{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px 14px;margin-bottom:14px;}}
 .empty{{color:#64748b;font-size:12px;}}
+.meaning{{color:#64748b;font-size:10px;line-height:1.6;margin:6px 0 0;}}
 table{{width:100%;border-collapse:collapse;font-size:12px;}}
 th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #1e293b;}}
 th{{color:#94a3b8;font-weight:500;}} td{{color:#cbd5e1;}}
@@ -217,27 +220,27 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
 
     # ---------- 总览卡片 ----------
     parts.append('<h2>测试总览</h2><div class="grid">')
-    parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"{cpu.get('valid_count', 0)} 个有效样本"))
-    parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程 PSS 加总"))
-    parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "按进程 RSS 加总"))
-    parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "全屏合成/呈现节奏"))
-    parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "逐帧口径（无则用 gfxinfo 计数）"))
-    parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "gfxinfo 计数器增量"))
-    parts.append(_overview_card("逐帧 Jank 平均 / 峰值", f'{_fmt(frame_jank.get("average"))}% / {_fmt(frame_jank.get("peak"))}%', "超过两倍帧间隔的帧占比"))
-    parts.append(_overview_card("逐帧 P95 帧耗时", f'{_fmt(frame_p95.get("average"))} ms', "帧耗时分布 95 分位"))
-    parts.append(_overview_card("警告 / 错误事件", str(warning_count), "采样与导出过程的异常记录"))
-    parts.append(_overview_card("帧率数据源", " / ".join(f"{k}×{v}" for k, v in sorted(source_counts.items())) or "未启用帧率", "按采样点统计"))
+    parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；平均=周期内每秒采样的均值，峰值=最高值。{cpu.get('valid_count', 0)} 个有效样本"))
+    parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程 PSS 加总。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
+    parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "按进程 RSS 加总。RSS=进程独占的物理内存（不摊共享），通常 ≥ PSS"))
+    parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "屏幕呈现节奏（帧送上屏的速率）；平均=均值，最低=周期内最差表现。来自 FrameTimeline / framestats / SF latency 中最优可用源"))
+    parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "窗口内卡顿帧占比的峰值（帧耗时超过两倍帧间隔）；逐帧口径，无则用 gfxinfo 计数口径"))
+    parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "应用主动渲染帧率（gfxinfo 计数器增量）；静态界面不重绘时回落 0 属正常，非卡顿"))
+    parts.append(_overview_card("逐帧 Jank 平均 / 峰值", f'{_fmt(frame_jank.get("average"))}% / {_fmt(frame_jank.get("peak"))}%', "窗口内帧耗时超过两倍帧间隔的帧占比；越高说明掉帧越频繁"))
+    parts.append(_overview_card("逐帧 P95 帧耗时", f'{_fmt(frame_p95.get("average"))} ms', "帧耗时分布的 95 分位：95% 的帧在此耗时以内。60Hz 下超过 16.7ms 即可能掉帧"))
+    parts.append(_overview_card("警告 / 错误事件", str(warning_count), "采样与日志导出过程中的异常记录数（权限不足、解析失败、数据源降级等）"))
+    parts.append(_overview_card("帧率数据源", " / ".join(f"{k}×{v}" for k, v in sorted(source_counts.items())) or "未启用帧率", "按采样点统计实际使用的数据源（FrameTimeline / framestats / SF latency）"))
     parts.append("</div>")
 
     # ---------- 折线图 ----------
     parts.append('<h2>测试周期曲线</h2>')
     if samples:
-        parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "#39d6d3")], "%"))
-        parts.append(_svg_line_chart("内存占用（PSS / RSS）", [("PSS", _downsample(pss_series), "#88d66c"), ("RSS", _downsample(rss_series), "#34d399")], "MiB"))
-        parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "#f4b942")], "fps"))
-        parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "#7dd3fc")], "fps"))
-        parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "#fb7185")], "%"))
-        parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", _downsample(avg_frame_series), "#94a3b8"), ("p95", _downsample(p95_frame_series), "#f472b6"), ("p99", _downsample(p99_frame_series), "#f87171")], "ms"))
+        parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "#39d6d3")], "%", "整机 CPU 利用率（多核归一），来源 top 总体行。接近 100% 说明系统资源吃紧。"))
+        parts.append(_svg_line_chart("内存占用（PSS / RSS）", [("PSS", _downsample(pss_series), "#88d66c"), ("RSS", _downsample(rss_series), "#34d399")], "MiB", "按进程加总的内存占用；PSS 摊共享内存、RSS 为独占物理内存。"))
+        parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "#f4b942")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
+        parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "#7dd3fc")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
+        parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "#fb7185")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。"))
+        parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", _downsample(avg_frame_series), "#94a3b8"), ("p95", _downsample(p95_frame_series), "#f472b6"), ("p99", _downsample(p99_frame_series), "#f87171")], "ms", "每秒窗口内帧耗时均值与分位数。60Hz 下帧耗时超过 16.7ms 意味着错过 vsync、可能出现掉帧；p95/p99 衡量尾延迟。"))
     else:
         parts.append('<p class="empty">该会话没有采样数据。</p>')
 
@@ -276,6 +279,26 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
                 f' <span style="color:#475569">{time.strftime("%H:%M:%S", time.localtime(event["ts_ms"] / 1000))}</span></div>'
             )
         parts.append("</div>")
+
+    # ---------- 指标口径说明 ----------
+    meanings = [
+        ("CPU 整体", "%", "整机 CPU 利用率，多核总容量归一到 0-100%", "top 总体行（总容量 − idle）"),
+        ("PSS", "MiB", "按进程 PSS 加总；共享内存按比例分摊，接近应用实际内存开销", "dumpsys meminfo"),
+        ("RSS", "MiB", "按进程 RSS 加总；进程独占物理内存，不摊共享，通常 ≥ PSS", "dumpsys meminfo"),
+        ("呈现 FPS", "fps", "帧送上屏幕的呈现节奏；低于刷新率且持续说明显示链路吃紧", "FrameTimeline / framestats / SF latency 最优可用源"),
+        ("应用渲染 FPS", "fps", "应用主动渲染帧率；静态界面回落 0 属正常", "gfxinfo 计数器增量"),
+        ("逐帧 Jank", "%", "窗口内帧耗时超过两倍帧间隔的帧占比；越高掉帧越频繁", "framestats / FrameTimeline 逐帧时间戳"),
+        ("P95 / P99 帧耗时", "ms", "帧耗时分布分位数；60Hz 下超 16.7ms 意味着错过 vsync、可能掉帧", "逐帧时间戳计算"),
+        ("丢帧率", "%", "窗口内卡顿帧占比峰值，衡量最差表现", "逐帧口径优先，回退 gfxinfo 计数"),
+        ("警告 / 错误事件", "次", "采样与日志导出过程的异常记录数（权限、解析、降级等）", "会话事件表"),
+    ]
+    parts.append('<h2>指标口径说明</h2><div class="chart"><table>'
+                 "<tr><th>指标</th><th>单位</th><th>含义</th><th>数据来源</th></tr>"
+                 + "".join(
+                     f"<tr><td>{_escape(name)}</td><td>{_escape(unit)}</td><td>{_escape(meaning)}</td><td>{_escape(source)}</td></tr>"
+                     for name, unit, meaning, source in meanings
+                 )
+                 + "</table></div>")
 
     parts.append(
         f'<footer>生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")} ｜ 会话 {_escape(session_id)} ｜ Android 车机性能监测工具</footer>'
