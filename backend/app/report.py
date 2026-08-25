@@ -153,6 +153,16 @@ def generate_report(session_id: str, store: SessionStore) -> str:
     p95_frame_series = series_of("p95_frame_time_ms")
     p99_frame_series = series_of("p99_frame_time_ms")
 
+    # 内存占用率 = PSS / Total RAM（total_ram 独立降频，取最近非空值，与前端一致）
+    memory_percent_series: list[float | None] = []
+    last_total_ram: int | None = None
+    for sample in samples:
+        if sample.get("total_ram_kb"):
+            last_total_ram = sample["total_ram_kb"]
+        pss = sample.get("pss_kb")
+        memory_percent_series.append((pss / last_total_ram * 100) if (pss is not None and last_total_ram) else None)
+    memory_percent_values = [value for value in memory_percent_series if value is not None]
+
     # ---------- 总览 ----------
     cpu = _summary_metric(summary, "cpu")
     pss = _summary_metric(summary, "memory_pss")
@@ -227,6 +237,12 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；平均=周期内每秒采样的均值，峰值=最高值。{cpu.get('valid_count', 0)} 个有效样本"))
     parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程查询的 PSS 总和。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
     parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "整机所有进程查询的 RSS 总和。RSS 不摊共享页，总和会重复计算共享内存，数值可能超过物理内存，仅作参考"))
+    if memory_percent_values:
+        parts.append(_overview_card(
+            "内存占用率 平均 / 峰值",
+            f'{_fmt(sum(memory_percent_values) / len(memory_percent_values))}% / {_fmt(max(memory_percent_values))}%',
+            "整机 PSS 占物理内存（Total RAM）比例，反映系统整体内存压力",
+        ))
     parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "屏幕呈现节奏（帧送上屏的速率）；平均=均值，最低=周期内最差表现。来自 FrameTimeline / framestats / SF latency 中最优可用源"))
     parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "窗口内卡顿帧占比的峰值（帧耗时超过两倍帧间隔）；逐帧口径，无则用 gfxinfo 计数口径"))
     parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "应用主动渲染帧率（gfxinfo 计数器增量）；静态界面不重绘时回落 0 属正常，非卡顿"))
@@ -241,6 +257,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     if samples:
         parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "#39d6d3")], "%", "整机 CPU 利用率（多核归一），来源 top 总体行。接近 100% 说明系统资源吃紧。"))
         parts.append(_svg_line_chart("内存占用（PSS / RSS）", [("PSS", _downsample(pss_series), "#88d66c"), ("RSS", _downsample(rss_series), "#34d399")], "MiB", "按进程加总的内存占用；PSS 摊共享内存、RSS 为独占物理内存。"))
+        parts.append(_svg_line_chart("内存占用率（PSS / 总内存）", [("占用率", _downsample(memory_percent_series), "#34d399")], "%", "整机 PSS 占物理内存比例；接近 100% 说明系统内存压力大（可能触发回收）。"))
         parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "#f4b942")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
         parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "#7dd3fc")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
         parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "#fb7185")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。"))
