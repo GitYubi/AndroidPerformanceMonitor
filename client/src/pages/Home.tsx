@@ -343,9 +343,25 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
     renderFpsHeld: isFramePipeline ? renderFpsHeld[index] : undefined,
   }));
   const latest = points.at(-1);
-  const latestText = isFramePipeline
-    ? `R ${formatValue(latest?.app_render_fps, " fps")} · P ${formatValue(latest?.fps, " fps")} · J ${formatValue(latest?.jank_pct, "%")}`
-    : displayMetricValue(metric, latest?.[dataKey] as number | null);
+  // 内存曲线头部：已用 / 总计 / 当前占用百分比（内存独立降频，总计取最近非空值）
+  let latestText: string;
+  if (isFramePipeline) {
+    latestText = `R ${formatValue(latest?.app_render_fps, " fps")} · P ${formatValue(latest?.fps, " fps")} · J ${formatValue(latest?.jank_pct, "%")}`;
+  } else if (metric === "memory") {
+    const totalRamKb = (() => {
+      for (let index = points.length - 1; index >= 0; index -= 1) {
+        if (points[index].total_ram_kb != null) return points[index].total_ram_kb;
+      }
+      return null;
+    })();
+    if (latest?.pss_kb != null && totalRamKb) {
+      latestText = `已用 ${(latest.pss_kb / 1024).toFixed(0)} MiB · 共 ${(totalRamKb / 1024).toFixed(0)} MiB · ${((latest.pss_kb / totalRamKb) * 100).toFixed(1)}%`;
+    } else {
+      latestText = displayMetricValue(metric, latest?.[dataKey] as number | null);
+    }
+  } else {
+    latestText = displayMetricValue(metric, latest?.[dataKey] as number | null);
+  }
   return (
     <section className="telemetry-panel relative min-h-0 overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80" style={{ height }}>
       <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-cyan-200/50 to-transparent" />
