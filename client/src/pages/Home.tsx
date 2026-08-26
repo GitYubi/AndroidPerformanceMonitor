@@ -222,7 +222,7 @@ function Countdown({ startedAtMs, durationSeconds, running }: { startedAtMs: num
   );
 }
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
-  cpu: { label: "CPU 整体占用（逻辑核归一）", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
+  cpu: { label: "CPU 整体占用", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
   memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
   fps: { label: "帧链路：渲染 / 呈现", unit: "fps", color: "#F4B942", icon: Gauge, apiKey: "fps" },
 };
