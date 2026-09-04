@@ -276,7 +276,7 @@ class SessionStore:
         finally:
             connection.close()
 
-    def get_series(self, session_id: str, limit: int = 180) -> list[dict[str, Any]]:
+    def _read_series(self, session_id: str, limit: int | None) -> list[dict[str, Any]]:
         path = self.database_path(session_id)
         if not path.exists():
             return []
@@ -284,22 +284,30 @@ class SessionStore:
         try:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sample)").fetchall()}
             column = lambda name: name if name in columns else f"NULL AS {name}"  # noqa: E731
+            select = f"""SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {column("total_ram_kb")},
+                                {column("app_render_fps")}, {column("app_jank_pct")}, fps,
+                                {column("frame_source")}, {column("frame_count")}, {column("jank_count")},
+                                {column("jank_pct")}, {column("avg_frame_time_ms")}, {column("p95_frame_time_ms")},
+                                {column("p99_frame_time_ms")}, {column("input_latency_ms")}
+                         FROM sample"""
+            if limit is None:
+                rows = connection.execute(f"{select} ORDER BY id ASC").fetchall()
+                return [dict(row) for row in rows]
             rows = connection.execute(
-                f"""SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {column("total_ram_kb")},
-                           {column("app_render_fps")}, {column("app_jank_pct")}, fps,
-                           {column("frame_source")}, {column("frame_count")}, {column("jank_count")},
-                           {column("jank_pct")}, {column("avg_frame_time_ms")}, {column("p95_frame_time_ms")},
-                           {column("p99_frame_time_ms")}, {column("input_latency_ms")}
-                    FROM sample ORDER BY id DESC LIMIT ?""",
+                f"{select} ORDER BY id DESC LIMIT ?",
                 (max(1, min(limit, 1000)),),
             ).fetchall()
             return [dict(row) for row in reversed(rows)]
         finally:
             connection.close()
 
+    def get_series(self, session_id: str, limit: int = 180) -> list[dict[str, Any]]:
+        return self._read_series(session_id, limit)
+
     def get_all_samples(self, session_id: str) -> list[dict[str, Any]]:
         """全量采样点（报告生成用，不做行数限制）。"""
-        return self.get_series(session_id, limit=1_000_000)
+        return self._read_series(session_id, None)
+
     def get_processes(self, session_id: str, metric: str, limit: int = 10) -> list[dict[str, Any]]:
         column = {"cpu": "cpu_pct", "pss": "pss_kb", "rss": "rss_kb"}.get(metric)
         if column is None:
@@ -456,4 +464,3 @@ class SessionStore:
                 encoding="utf-8",
             )
         return session_id
-

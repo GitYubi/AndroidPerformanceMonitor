@@ -65,6 +65,32 @@ def test_database_path_resolves_by_session_id() -> None:
     assert store.get_series(session_id, limit=10)[0]["cpu_total_pct"] == 10.0
 
 
+def test_get_all_samples_is_not_limited_to_live_window() -> None:
+    store, _ = _make_store()
+    session_id = str(uuid.uuid4())
+    writer = store.create_session(
+        session_id,
+        {
+            "session_id": session_id,
+            "serial": "full-series-device",
+            "created_at_ms": 1,
+            "duration_seconds": 60,
+            "interval_ms": 500,
+            "enabled_metrics": {"cpu": True, "memory": False, "fps": False},
+            "surface_layer": None,
+        },
+    )
+    for index in range(1005):
+        writer.write_sample(SamplePayload(ts_ms=index, cpu_total_pct=float(index)))
+    writer.finish("completed")
+
+    assert len(store.get_series(session_id, limit=1000)) == 1000
+    all_samples = store.get_all_samples(session_id)
+    assert len(all_samples) == 1005
+    assert all_samples[0]["ts_ms"] == 0
+    assert all_samples[-1]["ts_ms"] == 1004
+
+
 def test_database_path_legacy_uuid_dir_still_works() -> None:
     store, _ = _make_store()
     session_id = "legacy-uuid-dir"

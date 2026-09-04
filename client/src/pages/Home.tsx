@@ -3,6 +3,7 @@
  */
 import { Button } from "@/components/ui/button";
 import { InteractionDiagnostic } from "@/components/InteractionDiagnostic";
+import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
 import {
   Activity,
@@ -99,6 +100,7 @@ const FRAME_SOURCE_LABELS: Record<string, string> = {
 // 应用渲染 R 线低于该值时视为“无有效渲染（空闲）”：曲线以虚线呈现并保持
 // 最后一次有效值，避免空闲期的低频读数与操作期连线形成剧烈起伏。
 const RENDER_IDLE_FPS = 5;
+const CHART_WINDOW_POINTS = 180;
 
 function frameSourceLabel(source: string | null | undefined): string {
   return source ? FRAME_SOURCE_LABELS[source] || source : "—";
@@ -411,9 +413,11 @@ export default function Home() {
   const [logPaths, setLogPaths] = useState(() => loadJsonStorage(LOG_PATHS_STORAGE_KEY, DEFAULT_LOG_PATHS));
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => loadJsonStorage(COLLAPSED_STORAGE_KEY, {}));
   const prevSessionState = useRef<string | null>(null);
+  const activeSessionIdRef = useRef<string | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [session, setSession] = useState<MonitorSession | null>(null);
   const [points, setPoints] = useState<SessionPoint[]>([]);
+  const [timelineStart, setTimelineStart] = useState(0);
   const [processMetric, setProcessMetric] = useState<ProcessMetric>("cpu");
   const [processes, setProcesses] = useState<ProcessRow[]>([]);
   const [events, setEvents] = useState<MonitorEvent[]>([]);
@@ -427,6 +431,16 @@ export default function Home() {
   const chartHeight = enabledMetrics.length === 1 ? 400 : enabledMetrics.length === 2 ? 278 : 202;
   const selectedDevice = devices.find((device) => device.serial === selectedSerial);
   const running = session?.state === "running";
+  const maxTimelineStart = Math.max(0, points.length - CHART_WINDOW_POINTS);
+  const visiblePoints = useMemo(
+    () => running ? points : points.slice(timelineStart, timelineStart + CHART_WINDOW_POINTS),
+    [points, running, timelineStart],
+  );
+  const activateSession = useCallback((nextSession: MonitorSession) => {
+    activeSessionIdRef.current = nextSession.session_id;
+    setActiveSessionId(nextSession.session_id);
+    setSession(nextSession);
+  }, []);
   // 内存采样独立降频后 total_ram 仅在有内存采样的周期出现，取最近非空值
   const totalRamKb = (() => {
     for (let index = points.length - 1; index >= 0; index -= 1) {
@@ -447,8 +461,7 @@ export default function Home() {
       setSelectedSerial((current) => current || devicePayload.find((device) => device.state === "device")?.serial || "");
       // 后端可能仍有正在运行的采样会话（例如前端刷新）：恢复接管，而不是显示“未开始”状态。
       if (activePayload) {
-        setActiveSessionId(activePayload.session_id);
-        setSession(activePayload);
+        activateSession(activePayload);
       }
       setApiError("");
     } catch (error) {
@@ -456,15 +469,16 @@ export default function Home() {
       setHealth({ status: "degraded", adb: "unavailable", device_count: 0, active_sessions: 0, detail: message });
       setApiError(message);
     }
-  }, []);
+  }, [activateSession]);
 
   // 快速轮询（1s）：会话状态 + 曲线核心；检测运行结束并弹日志导出 toast
   const refreshCore = useCallback(async (sessionId: string) => {
     try {
-      const [sessionPayload, seriesPayload] = await Promise.all([
-        requestApi<MonitorSession>(`/api/sessions/${sessionId}`),
-        requestApi<{ points: SessionPoint[] }>(`/api/sessions/${sessionId}/series?limit=180`),
-      ]);
+      const sessionPayload = await requestApi<MonitorSession>(`/api/sessions/${sessionId}`);
+      if (activeSessionIdRef.current !== sessionId) return;
+      const seriesQuery = sessionPayload.state === "running" ? `limit=${CHART_WINDOW_POINTS}` : "full=true";
+      const seriesPayload = await requestApi<{ points: SessionPoint[] }>(`/api/sessions/${sessionId}/series?${seriesQuery}`);
+      if (activeSessionIdRef.current !== sessionId) return;
       setSession(sessionPayload);
       setPoints(seriesPayload.points);
       const previousState = prevSessionState.current;
@@ -472,10 +486,12 @@ export default function Home() {
       if (previousState === "running" && sessionPayload.state !== "running") {
         try {
           const eventPayload = await requestApi<{ events: MonitorEvent[] }>(`/api/sessions/${sessionId}/events`);
+          if (activeSessionIdRef.current !== sessionId) return;
           notifyLogExport(eventPayload.events);
         } catch { /* toast 失败不影响状态 */ }
       }
     } catch (error) {
+      if (activeSessionIdRef.current !== sessionId) return;
       setApiError(error instanceof Error ? error.message : "刷新会话失败");
     }
   }, []);
@@ -487,6 +503,7 @@ export default function Home() {
         requestApi<{ processes: ProcessRow[] }>(`/api/sessions/${sessionId}/processes?metric=${processMetric}&limit=10`),
         requestApi<{ events: MonitorEvent[] }>(`/api/sessions/${sessionId}/events`),
       ]);
+      if (activeSessionIdRef.current !== sessionId) return;
       setProcesses(processPayload.processes);
       setEvents(eventPayload.events);
     } catch { /* 慢速轮询失败静默，下轮重试 */ }
@@ -518,10 +535,12 @@ export default function Home() {
     }
   }, []);
 
-  const viewHistorySession = async (sessionId: string) => {
+  const viewHistorySession = (historySession: MonitorSession) => {
     setHistoryOpen(false);
-    setActiveSessionId(sessionId);
-    await Promise.all([refreshCore(sessionId), refreshSlow(sessionId)]);
+    activateSession(historySession);
+    setPoints([]);
+    setProcesses([]);
+    setEvents([]);
     toast.info("正在查看历史会话", { description: "历史数据仅保存在本机 data/ 目录；开始新采样会切换到新会话。" });
   };
 
@@ -562,16 +581,22 @@ export default function Home() {
   useEffect(() => {
     if (!activeSessionId) return;
     void refreshCore(activeSessionId);
+    if (session && session.state !== "running") return;
     const timer = window.setInterval(() => { void refreshCore(activeSessionId); }, 1000);
     return () => window.clearInterval(timer);
-  }, [activeSessionId, refreshCore]);
+  }, [activeSessionId, refreshCore, session?.state]);
+
+  useEffect(() => {
+    setTimelineStart(running ? 0 : maxTimelineStart);
+  }, [activeSessionId, maxTimelineStart, running]);
 
   useEffect(() => {
     if (!activeSessionId) return;
     void refreshSlow(activeSessionId);
+    if (session && session.state !== "running") return;
     const timer = window.setInterval(() => { void refreshSlow(activeSessionId); }, 3000);
     return () => window.clearInterval(timer);
-  }, [activeSessionId, refreshSlow]);
+  }, [activeSessionId, refreshSlow, session?.state]);
 
   const startSession = async () => {
     if (!selectedSerial) {
@@ -598,8 +623,7 @@ export default function Home() {
           log_export_root: logPaths.exportRoot.trim() || null,
         }),
       });
-      setActiveSessionId(started.session_id);
-      setSession(started);
+      activateSession(started);
       setPoints([]);
       setProcesses([]);
       setEvents([]);
@@ -755,7 +779,7 @@ export default function Home() {
                 <div>
                   <p className="font-telemetry text-[10px] uppercase tracking-[0.18em] text-slate-500">Session status</p>
                   <h2 className="mt-0.5 text-lg font-semibold text-slate-100">{running ? "正在连续采样" : session ? `会话已${session.state === "completed" ? "完成" : session.state === "stopped" ? "停止" : session.state}` : "等待建立会话"}</h2>
-                  <p className="mt-1 text-xs text-slate-500">{running ? `目标 ${session?.serial} · ${session?.summary?.sample_count || 0} 个有效采样周期` : "数据仅保存于本机 data/ 会话目录，曲线窗口最多保留最近 180 点。"}</p>
+                  <p className="mt-1 text-xs text-slate-500">{running ? `目标 ${session?.serial} · ${session?.summary?.sample_count || 0} 个有效采样周期` : "数据仅保存于本机 data/ 会话目录；运行中显示最近 180 点，结束后可浏览全周期。"}</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2 xl:justify-end">
@@ -764,7 +788,7 @@ export default function Home() {
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Storage</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">SQLite · WAL</p></div>
                 {activeSessionId && <Button variant="outline" onClick={downloadCsv} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><Download size={14} /> 导出 CSV</Button>}
                 {activeSessionId && <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${activeSessionId}/report`, "_blank", "noopener,noreferrer")} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={14} /> 生成报告</Button>}
-                <Button variant="outline" onClick={() => { void loadHistory(); setHistoryOpen(true); }} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><History size={14} /> 历史会话</Button>
+                <Button variant="outline" disabled={running || loading} onClick={() => { void loadHistory(); setHistoryOpen(true); }} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><History size={14} /> 历史会话</Button>
               </div>
             </div>
           </section>
@@ -785,8 +809,26 @@ export default function Home() {
           </section>
 
           <section className="space-y-3">
-            <div className="flex items-center justify-between px-1"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.18em] text-cyan-200">Telemetry bands</p><h2 className="mt-1 text-sm font-semibold">实时性能轨迹</h2></div><p className="font-telemetry text-[10px] text-slate-500">WINDOW · {points.length}/180</p></div>
-            {enabledMetrics.length > 0 ? enabledMetrics.map((metric) => <MetricChart key={metric} metric={metric} points={points} height={chartHeight} />) : <div className="grid h-48 place-items-center rounded-md border border-dashed border-slate-700 bg-slate-900/45 text-center"><div><SlidersHorizontal className="mx-auto mb-2 text-slate-600" size={20} /><p className="text-sm text-slate-400">请启用至少一个采样模块</p></div></div>}
+            <div className="flex items-center justify-between px-1"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.18em] text-cyan-200">Telemetry bands</p><h2 className="mt-1 text-sm font-semibold">{running ? "实时性能轨迹" : "会话性能轨迹"}</h2></div><p className="font-telemetry text-[10px] text-slate-500">WINDOW · {visiblePoints.length}/{points.length || CHART_WINDOW_POINTS}</p></div>
+            {!running && points.length > CHART_WINDOW_POINTS && (
+              <div className="rounded-sm border border-slate-700/70 bg-slate-900/65 px-4 py-3">
+                <div className="mb-2 grid grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 font-telemetry text-[10px] text-slate-500 sm:gap-4">
+                  <span className="whitespace-nowrap"><span className="hidden sm:inline">全周期 · </span>{formatTime(points[0].ts_ms)}</span>
+                  <span className="truncate text-center text-cyan-100">当前窗口 {formatTime(visiblePoints[0].ts_ms)} - {formatTime(visiblePoints.at(-1)!.ts_ms)}</span>
+                  <span className="whitespace-nowrap">{formatTime(points.at(-1)!.ts_ms)}</span>
+                </div>
+                <Slider
+                  aria-label="浏览完整采样周期"
+                  min={0}
+                  max={maxTimelineStart}
+                  step={1}
+                  value={[timelineStart]}
+                  onValueChange={([value]) => setTimelineStart(value)}
+                  className="[&_[data-slot=slider-track]]:bg-slate-700 [&_[data-slot=slider-range]]:bg-cyan-300 [&_[data-slot=slider-thumb]]:border-cyan-200 [&_[data-slot=slider-thumb]]:bg-slate-950"
+                />
+              </div>
+            )}
+            {enabledMetrics.length > 0 ? enabledMetrics.map((metric) => <MetricChart key={metric} metric={metric} points={visiblePoints} height={chartHeight} />) : <div className="grid h-48 place-items-center rounded-md border border-dashed border-slate-700 bg-slate-900/45 text-center"><div><SlidersHorizontal className="mx-auto mb-2 text-slate-600" size={20} /><p className="text-sm text-slate-400">请启用至少一个采样模块</p></div></div>}
           </section>
 
           <section className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_330px]">
@@ -839,7 +881,7 @@ export default function Home() {
                       <div className="flex shrink-0 items-center gap-2">
                         <span className={`rounded-sm border px-1.5 py-0.5 font-telemetry text-[10px] ${stateTone(item.state)}`}>{stateLabel(item.state)}</span>
                         <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${item.session_id}/report`, "_blank", "noopener,noreferrer")} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={12} /> 报告</Button>
-                        <Button variant="outline" onClick={() => void viewHistorySession(item.session_id)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
+                        <Button variant="outline" onClick={() => viewHistorySession(item)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
                       </div>
                     </div>
                   ))}

@@ -161,11 +161,17 @@ async def session_detail(session_id: str, request: Request) -> dict[str, object]
 
 
 @app.get("/api/sessions/{session_id}/series")
-async def session_series(session_id: str, request: Request, limit: int = Query(default=180, ge=1, le=1000)) -> dict[str, object]:
+async def session_series(
+    session_id: str,
+    request: Request,
+    limit: int = Query(default=180, ge=1, le=1000),
+    full: bool = Query(default=False),
+) -> dict[str, object]:
     store = manager_from(request).store
     if store.get_session(session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return {"points": store.get_series(session_id, limit)}
+    points = store.get_all_samples(session_id) if full else store.get_series(session_id, limit)
+    return {"points": points}
 
 
 @app.get("/api/sessions/{session_id}/processes")
