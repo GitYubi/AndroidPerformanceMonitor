@@ -53,15 +53,15 @@ class SessionWriter:
         )
         sample_id = cursor.lastrowid
         rows = [
-            (sample_id, item.process_name, item.pid, item.cpu_pct, item.pss_kb, item.rss_kb)
+            (sample_id, item.process_name, item.pid, item.cpu_pct, item.pss_kb, item.rss_kb, item.uss_kb)
             for item in payload.processes or []
-            if item.cpu_pct is not None or item.pss_kb is not None or item.rss_kb is not None
+            if item.cpu_pct is not None or item.pss_kb is not None or item.rss_kb is not None or item.uss_kb is not None
         ]
         if rows:
             self.connection.executemany(
                 """
-                INSERT INTO process_sample (sample_id, process_name, pid, cpu_pct, pss_kb, rss_kb)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO process_sample (sample_id, process_name, pid, cpu_pct, pss_kb, rss_kb, uss_kb)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -216,7 +216,8 @@ class SessionStore:
                 pid INTEGER,
                 cpu_pct REAL,
                 pss_kb INTEGER,
-                rss_kb INTEGER
+                rss_kb INTEGER,
+                uss_kb INTEGER
             );
             CREATE INDEX idx_process_sample_name ON process_sample(process_name);
             CREATE INDEX idx_sample_ts ON sample(ts_ms);
@@ -330,6 +331,28 @@ class SessionStore:
                 LIMIT ?
                 """,
                 (max(1, min(limit, 100)),),
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            connection.close()
+
+    def get_process_uss_series(self, session_id: str) -> list[dict[str, Any]]:
+        """返回真实内存快照时刻的应用 USS；旧会话没有该列时返回空列表。"""
+        path = self.database_path(session_id)
+        if not path.exists():
+            return []
+        connection = _connect(path)
+        try:
+            if not _column_exists(connection, "process_sample", "uss_kb"):
+                return []
+            rows = connection.execute(
+                """
+                SELECT sample.ts_ms, process_sample.process_name, process_sample.pid, process_sample.uss_kb
+                FROM process_sample
+                JOIN sample ON sample.id = process_sample.sample_id
+                WHERE process_sample.uss_kb IS NOT NULL
+                ORDER BY sample.ts_ms ASC, process_sample.process_name ASC
+                """
             ).fetchall()
             return [dict(row) for row in rows]
         finally:

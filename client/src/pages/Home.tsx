@@ -43,7 +43,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 type MetricKey = "cpu" | "memory" | "fps";
-type ProcessMetric = "cpu" | "pss" | "rss";
+type ProcessMetric = "cpu" | "pss";
 
 interface Device {
   serial: string;
@@ -308,7 +308,7 @@ function MetricToggle({ metric, checked, onCheckedChange }: { metric: MetricKey;
         <span className={`grid h-7 w-7 place-items-center rounded-sm ${checked ? "bg-cyan-300/14 text-cyan-200" : "bg-slate-800 text-slate-500"}`}><Icon size={15} /></span>
         <span>
           <span className="block text-xs font-medium text-slate-200">{meta.label}</span>
-          <span className="font-telemetry text-[10px] text-slate-500">{metric === "memory" ? "PSS + RSS" : meta.unit}</span>
+          <span className="font-telemetry text-[10px] text-slate-500">{metric === "memory" ? "PSS" : meta.unit}</span>
         </span>
       </span>
       <Switch checked={checked} onCheckedChange={onCheckedChange} aria-label={`启用${meta.label}`} />
@@ -799,7 +799,6 @@ export default function Home() {
             {[
               { label: "CPU 平均 / 峰值", metric: metricSummary(session, "cpu"), icon: Cpu, tone: "text-cyan-200", output: (item: SummaryMetric) => `${formatValue(item.average, "%")} / ${formatValue(item.peak, "%")}` },
               { label: "PSS 平均 / 峰值", metric: metricSummary(session, "memory_pss"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => formatMemorySummary(item, totalRamKb) },
-              { label: "RSS 平均 / 峰值", metric: metricSummary(session, "memory_rss"), icon: HardDrive, tone: "text-emerald-200", output: (item: SummaryMetric) => formatValue(item.average === null ? null : item.average / 1024, " MiB") + " / " + formatValue(item.peak === null ? null : item.peak / 1024, " MiB") },
               { label: "应用渲染 FPS 平均 / 最低", metric: metricSummary(session, "app_render_fps"), icon: Activity, tone: "text-sky-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "内容呈现 FPS 平均 / 最低", metric: metricSummary(session, "fps"), icon: Gauge, tone: "text-amber-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "渲染 Jank 平均 / 峰值", metric: metricSummary(session, "app_jank_pct"), icon: AlertTriangle, tone: "text-rose-200", output: (item: SummaryMetric) => formatValue(item.average, "%") + " / " + formatValue(item.peak, "%") },
@@ -833,7 +832,7 @@ export default function Home() {
 
           <section className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_330px]">
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">
-              <div className="flex items-center justify-between border-b border-slate-700/70 px-4 py-3"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-cyan-200">Process pressure</p><h2 className="mt-0.5 text-sm font-semibold">应用 / 进程聚合排行</h2></div><select value={processMetric} onChange={(event) => setProcessMetric(event.target.value as ProcessMetric)} className="rounded-sm border border-slate-700 bg-slate-950/30 px-2 py-1 text-[11px] text-slate-300 outline-none"><option value="cpu">CPU</option><option value="pss">PSS</option><option value="rss">RSS</option></select></div>
+              <div className="flex items-center justify-between border-b border-slate-700/70 px-4 py-3"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-cyan-200">Process pressure</p><h2 className="mt-0.5 text-sm font-semibold">应用 / 进程聚合排行</h2></div><select value={processMetric} onChange={(event) => setProcessMetric(event.target.value as ProcessMetric)} className="rounded-sm border border-slate-700 bg-slate-950/30 px-2 py-1 text-[11px] text-slate-300 outline-none"><option value="cpu">CPU</option><option value="pss">PSS</option></select></div>
               <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-left"><thead className="bg-slate-950/35 font-telemetry text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="px-4 py-2.5 font-medium">Process</th><th className="px-3 py-2.5 font-medium">PID</th><th className="px-3 py-2.5 font-medium">Average</th><th className="px-3 py-2.5 font-medium">Peak</th><th className="px-4 py-2.5 text-right font-medium">Samples</th></tr></thead><tbody>{processes.length ? processes.map((row, index) => <tr key={`${row.process_name}-${row.pid ?? index}`} className="border-t border-slate-800/85 text-xs text-slate-300"><td className="max-w-[260px] truncate px-4 py-3 font-medium text-slate-200">{row.process_name}</td><td className="font-telemetry px-3 py-3 text-slate-500">{row.pid ?? "—"}</td><td className="font-telemetry px-3 py-3 text-cyan-100">{formatProcessValue(row.average, processMetric)}</td><td className="font-telemetry px-3 py-3 text-amber-100">{formatProcessValue(row.peak, processMetric)}</td><td className="font-telemetry px-4 py-3 text-right text-slate-500">{row.samples}</td></tr>) : <tr><td colSpan={5} className="px-4 py-9 text-center text-xs text-slate-500">开始采样后，按所选指标显示进程的平均值与峰值。</td></tr>}</tbody></table></div>
             </article>
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">

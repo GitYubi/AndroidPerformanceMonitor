@@ -21,7 +21,7 @@
 | 指标 | 主命令 | 辅助命令 | 计算口径 | 兼容性与降级 |
 | --- | --- | --- | --- |
 | CPU 整体与进程 | `adb -s <serial> shell top -b -n 1` | `adb -s <serial> shell dumpsys cpuinfo` | 记录 `top` 总体 CPU 行（可用时）与进程 `%CPU`；`cpuinfo` 用于交叉校验进程视图。整体平均值与峰值只取有效样本。 | 自动识别 Toybox、procps 风格列头；无法读出总体行时，显示“整体 CPU 不可用”，仍保留进程数据。 |
-| Memory（系统与应用） | `adb -s <serial> shell dumpsys meminfo` | — | 系统总 PSS、总 RSS 与进程 PSS/RSS，统一以 KiB 存储、前端显示 MiB。 | 若 OEM 输出缺少 RSS，PSS 数据仍照常入库，RSS 标记为不可用。 |
+| Memory（系统与应用） | `adb -s <serial> shell dumpsys meminfo -a --local` | — | 系统总 PSS 与进程 USS，统一以 KiB 存储；USS 由 Private Dirty + Private Clean 计算。 | 若 OEM 输出缺少详细进程表，PSS 仍照常入库，USS 趋势标记为不可用。 |
 | 显示帧率与逐帧统计 | 多源自动降级：`dumpsys SurfaceFlinger --frametimeline -all` → `dumpsys gfxinfo <pkg> framestats` → `dumpsys SurfaceFlinger --latency <layer>` | `dumpsys SurfaceFlinger --list`、`dumpsys gfxinfo <pkg>` 计数器 | 呈现 FPS = 最近 present 时间戳间隔中位数换算；逐帧源额外给出 `frame_count`、`jank_count`、`jank_pct`（>2 倍帧间隔）、`avg/p95/p99_frame_time_ms` 与 `input_latency_ms`。 | 会话启动读取 SDK 版本；`GET /api/frame-capabilities` 预探测可用源；采样中失败自动降到下一优先级并写会话事件。 |
 
 SurfaceFlinger 负责合成并发送显示缓冲区，且围绕显示刷新节奏工作；因此帧率模块将其读数表述为“所选显示 layer 的已呈现帧率估计”，而不是应用渲染线程的完整性能结论。[3]
@@ -53,7 +53,7 @@ session (1) ──< event (N)
 | --- | --- | --- |
 | `session` | `id`, `serial`, `started_at`, `ended_at`, `duration_limit_s`, `enabled_metrics`, `state` | 会话基本信息与状态机。 |
 | `sample` | `id`, `session_id`, `ts_ms`, `cpu_total_pct`, `pss_kb`, `rss_kb`, `fps`, `frame_source`, `frame_count`, `jank_count`, `jank_pct`, `avg/p95/p99_frame_time_ms`, `input_latency_ms`, `raw_status` | 每秒一级指标点；逐帧统计仅在逐帧源可用时落盘。 |
-| `process_sample` | `sample_id`, `process_name`, `pid`, `cpu_pct`, `pss_kb`, `rss_kb` | 按进程保存指标明细，支持后续 Top-N 查询。 |
+| `process_sample` | `sample_id`, `process_name`, `pid`, `cpu_pct`, `pss_kb`, `rss_kb`, `uss_kb` | 按进程保存指标明细；内存列只在真实内存快照完成时写入，支持 Top-N 与 USS 趋势报告。 |
 | `event` | `session_id`, `ts_ms`, `severity`, `code`, `message` | 记录超时、权限不足、解析降级、数据源切换和用户停止。 |
 
 ## 4. 内存与文件管理

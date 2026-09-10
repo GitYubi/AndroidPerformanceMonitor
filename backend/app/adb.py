@@ -226,26 +226,43 @@ def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample
                     cpu_pct=item.cpu_pct,
                     pss_kb=item.pss_kb,
                     rss_kb=item.rss_kb,
+                    uss_kb=item.uss_kb,
                 )
                 continue
             if item.cpu_pct is not None:
                 existing.cpu_pct = item.cpu_pct if existing.cpu_pct is None else max(existing.cpu_pct, item.cpu_pct)
             existing.pss_kb = item.pss_kb if item.pss_kb is not None else existing.pss_kb
             existing.rss_kb = item.rss_kb if item.rss_kb is not None else existing.rss_kb
+            existing.uss_kb = item.uss_kb if item.uss_kb is not None else existing.uss_kb
     return list(merged.values())
 
 
-def parse_meminfo(output: str) -> tuple[int | None, int | None, list[ProcessSample]]:
-    """解析 dumpsys meminfo 的 Total PSS/RSS by process 段落。"""
+def parse_meminfo(output: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
+    """解析整机 PSS/RSS，并从详细进程块提取 USS。"""
     total_ram_match = re.search(r"^\s*Total RAM:\s*([\d,]+)K\b", output, flags=re.IGNORECASE | re.MULTILINE)
     total_ram_kb = _int(total_ram_match.group(1)) if total_ram_match else None
 
     process_map: dict[tuple[int | None, str], ProcessSample] = {}
     section: str | None = None
+    detail_key: tuple[int | None, str] | None = None
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
         upper = line.upper()
+        detail_match = re.match(r"^\*\* MEMINFO in pid (\d+) \[(.+)] \*\*$", line)
+        if detail_match:
+            detail_key = (_int(detail_match.group(1)), detail_match.group(2).strip())
+            process_map.setdefault(detail_key, ProcessSample(process_name=detail_key[1], pid=detail_key[0]))
+            section = None
+            continue
+        if detail_key is not None and re.match(r"^TOTAL\s+", line):
+            # 标准详细表列为 Pss Total/Clean、Shared/Private Dirty、
+            # Shared/Private Clean；USS = Private Dirty + Private Clean。
+            values = [_int(token) for token in line.split()[1:7]]
+            if len(values) == 6 and all(value is not None for value in values):
+                process_map[detail_key].uss_kb = int(values[3]) + int(values[5])  # type: ignore[arg-type]
+            detail_key = None
+            continue
         if "TOTAL PSS BY PROCESS" in upper:
             section = "pss"
             continue

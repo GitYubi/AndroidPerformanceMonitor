@@ -45,7 +45,7 @@ def _make_report_session(samples: int = 60) -> tuple[str, SessionStore]:
                 avg_frame_time_ms=14.0,
                 p95_frame_time_ms=24.0,
                 p99_frame_time_ms=40.0,
-                processes=[ProcessSample("com.example.nav", 123, cpu_pct=5.0, pss_kb=100_000, rss_kb=150_000)],
+                processes=[ProcessSample("com.example.nav:renderer" if index % 2 else "com.example.nav", 123, cpu_pct=5.0, pss_kb=100_000, rss_kb=150_000, uss_kb=60_000 + index * 100)],
             )
         )
     writer.add_event("info", "frame_source_switch", "帧率数据源切换为 framestats")
@@ -56,15 +56,16 @@ def _make_report_session(samples: int = 60) -> tuple[str, SessionStore]:
 def test_report_contains_overview_cards() -> None:
     session_id, store = _make_report_session()
     report = generate_report(session_id, store)
-    for label in ["CPU 平均 / 峰值", "PSS 平均 / 峰值", "RSS 平均 / 峰值", "呈现 FPS 平均 / 最低", "最大丢帧率"]:
+    for label in ["CPU 平均 / 峰值", "PSS 平均 / 峰值", "呈现 FPS 平均 / 最低", "最大丢帧率"]:
         assert label in report
+    assert "RSS 平均 / 峰值" not in report
     assert "Android 车机性能测试报告" in report
 
 
 def test_report_contains_charts() -> None:
     session_id, store = _make_report_session()
     report = generate_report(session_id, store)
-    for title in ["CPU 整体占用", "内存占用（PSS / RSS）", "呈现帧率（P）", "应用渲染帧率（R）", "逐帧 Jank", "帧耗时（avg / p95 / p99）"]:
+    for title in ["CPU 整体占用", "内存占用（PSS）", "呈现帧率（P）", "应用渲染帧率（R）", "逐帧 Jank", "帧耗时（avg / p95 / p99）", "各应用 USS 内存趋势", "com.example.nav · USS"]:
         assert title in report
     assert "<polyline" in report  # SVG 折线
 

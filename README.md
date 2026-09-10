@@ -172,7 +172,7 @@ http://127.0.0.1:8090/fps-probe
 | --- | --- | --- |
 | CPU 整体 | `top` 总体 CPU 行；多核总容量样式取总量减 idle | 各 OEM `top` 列和总览格式不同，界面会提示不可用，而非伪造数值。 |
 | CPU 进程 | `top` 进程列为主，`dumpsys cpuinfo` 补充 | 高并发短进程可能出现在相邻周期中的不同采样。 |
-| PSS/RSS | `dumpsys meminfo` 的按进程 PSS/RSS 段落加总 | PSS、RSS 的含义和可用列依车机 Android 版本与服务权限而异。 |
+| PSS/USS | `dumpsys meminfo -a --local` 的整机 PSS 汇总与进程 Private Dirty/Clean | 前台展示整机 PSS；报告按应用分别绘制 USS 趋势。旧系统或 OEM 裁剪输出时 USS 可能不可用。 |
 | 呈现 FPS | FrameTimeline 显示帧呈现时间 / framestats `DisplayPresentTime` / SF `--latency` present 时间戳 | 是显示 layer 的呈现速率估计，不等同于应用渲染线程耗时或全链路掉帧率。SurfaceFlinger 的职责是组合并发送显示 buffer，围绕显示刷新节奏工作。[3] |
 | 应用渲染 FPS | gfxinfo `Total frames rendered` 计数器增量 / 窗口时长 | 静态界面不重绘时计数器不增长，读数回落为 0（界面以虚线保持），属正常现象而非卡顿。 |
 | 逐帧 Jank | 逐帧源窗口内的卡顿帧占比（超过两倍帧间隔） | 是窗口内“卡顿密度”的估计；单次采样窗口内的帧数取决于采样间隔，0.5 秒间隔下每点约 15–60 帧。 |

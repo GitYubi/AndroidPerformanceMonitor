@@ -61,6 +61,7 @@ class RuntimeSession:
     # 异步内存采样：worker 完成后更新结果，不阻塞主采样循环
     memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
     memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
+    memory_detail_supported: bool | None = None
 
 
 # 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
@@ -212,21 +213,25 @@ class MonitorManager:
         # 主循环不等待——全量 meminfo 在部分车机耗时数秒，异步化后
         # CPU/FPS 周期严格按 interval 落点，内存值以最近一次完成结果更新。
         if runtime.request.metrics.memory:
-            if (
-                runtime.sample_cycle % runtime.request.memory_cycle_skip == 0
-                and (runtime.memory_task is None or runtime.memory_task.done())
-            ):
-                runtime.memory_task = asyncio.create_task(self._capture_memory(runtime.request.serial))
+            fresh_memory_processes: list[ProcessSample] | None = None
             if runtime.memory_task is not None and runtime.memory_task.done():
                 try:
                     runtime.memory_result = runtime.memory_task.result()
+                    fresh_memory_processes = runtime.memory_result[3]
                     statuses["memory"] = "ok"
                 except (AdbError, Exception) as exc:
                     self._record_error_once(runtime, "memory_adb", f"内存采样失败：{exc}")
                 runtime.memory_task = None
+            if runtime.sample_cycle % runtime.request.memory_cycle_skip == 0 and runtime.memory_task is None:
+                runtime.memory_task = asyncio.create_task(self._capture_memory(runtime))
             if runtime.memory_result is not None:
                 pss_kb, rss_kb, total_ram_kb, processes = runtime.memory_result
-                process_sets.append(processes)
+                # 一级内存值可沿用最近快照；进程明细只在快照实际完成时写一次，
+                # 避免同一结果随主循环重复入库。
+                if fresh_memory_processes is not None:
+                    process_sets.append(fresh_memory_processes)
+                    if not any(item.uss_kb is not None for item in fresh_memory_processes):
+                        self._record_error_once(runtime, "uss_unavailable", "当前设备未提供应用 USS 明细；整机 PSS 采样不受影响。")
         if runtime.request.metrics.fps:
             jobs.append(("fps", asyncio.create_task(self._capture_fps(runtime))))
             jobs.append(("render", asyncio.create_task(self._capture_app_render(runtime))))
@@ -323,10 +328,30 @@ class MonitorManager:
         total, top_processes = parse_top(top_output)
         return total, merge_processes(top_processes, parse_cpuinfo(cpuinfo_output))
 
-    async def _capture_memory(self, serial: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
+    async def _capture_memory(self, runtime: RuntimeSession) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
         # 内存已异步化，超时放宽到 15s（部分车机全量 meminfo 在负载下可达 8s+）；
         # worker 独立运行，不阻塞主采样循环。
-        output = await run_adb("shell", "dumpsys", "meminfo", serial=serial, timeout_seconds=15)
+        # --local 不回调各应用进程；详细表中的 Private Dirty + Private Clean
+        # 可计算 USS，同时仍保留整机 PSS 汇总。实测耗时与原命令接近。
+        if runtime.memory_detail_supported is False:
+            output = await run_adb("shell", "dumpsys", "meminfo", serial=runtime.request.serial, timeout_seconds=15)
+            return parse_meminfo(output)
+        try:
+            output = await run_adb(
+                "shell", "dumpsys", "meminfo", "-a", "--local",
+                serial=runtime.request.serial,
+                timeout_seconds=15,
+            )
+            parsed = parse_meminfo(output)
+            if parsed[0] is not None:
+                runtime.memory_detail_supported = True
+                return parsed
+        except AdbError:
+            if runtime.memory_detail_supported is True:
+                raise
+        # 旧系统或 OEM 不支持详细本地模式时只探测一次，之后沿用原 PSS 命令。
+        runtime.memory_detail_supported = False
+        output = await run_adb("shell", "dumpsys", "meminfo", serial=runtime.request.serial, timeout_seconds=15)
         return parse_meminfo(output)
     async def _capture_fps(self, runtime: RuntimeSession) -> FrameStats | None:
         """按版本与可用性自动选择逐帧数据源，全部失败时回退 SF --latency。"""

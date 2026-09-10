@@ -64,6 +64,7 @@ class ProcessSample:
     cpu_pct: float | None = None
     pss_kb: int | None = None
     rss_kb: int | None = None
+    uss_kb: int | None = None
 
 
 @dataclass(slots=True)
@@ -94,4 +95,3 @@ class SamplePayload:
         result = asdict(self)
         result["processes"] = [asdict(item) for item in self.processes or []]
         return result
-

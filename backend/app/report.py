@@ -3,10 +3,10 @@
 生成自包含 HTML（内嵌 SVG 折线图，离线可打开），数据来源可以是当前会话
 或任意历史会话。报告内容：
 
-- 总览卡片：CPU / PSS / RSS / 呈现 FPS / 丢帧率 的平均与峰值（用户指定项）
+- 总览卡片：CPU / PSS / 呈现 FPS / 丢帧率 的平均与峰值（用户指定项）
 - 补充总览：应用渲染 FPS、逐帧 Jank、P95 帧耗时、数据源分布、事件统计
-- 全周期折线图：CPU、PSS/RSS、呈现 FPS、应用渲染 FPS、逐帧 Jank、帧耗时
-- 进程排行（CPU / PSS / RSS Top-N）与会话事件列表
+- 全周期折线图：CPU、PSS、呈现 FPS、应用渲染 FPS、逐帧 Jank、帧耗时
+- 进程排行（CPU / PSS Top-N）、各应用 USS 趋势与会话事件列表
 """
 
 from __future__ import annotations
@@ -122,6 +122,55 @@ def _summary_metric(summary: dict[str, Any], key: str) -> dict[str, Any]:
     return summary.get("metrics", {}).get(key, {})
 
 
+def _build_app_uss_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """将同一应用的冒号子进程按快照求和，并计算简单线性趋势。"""
+    grouped: dict[str, dict[int, int]] = {}
+    for row in rows:
+        process_name = str(row["process_name"])
+        app_name = process_name.split(":", 1)[0]
+        ts_ms = int(row["ts_ms"])
+        snapshots = grouped.setdefault(app_name, {})
+        snapshots[ts_ms] = snapshots.get(ts_ms, 0) + int(row["uss_kb"])
+
+    trends: list[dict[str, Any]] = []
+    for app_name, snapshots in grouped.items():
+        points = sorted(snapshots.items())
+        if len(points) < 2:
+            continue
+        start_ts = points[0][0]
+        xs = [(ts - start_ts) / 60000 for ts, _ in points]
+        values_mib = [value / 1024 for _, value in points]
+        x_mean = statistics.fmean(xs)
+        y_mean = statistics.fmean(values_mib)
+        denominator = sum((value - x_mean) ** 2 for value in xs)
+        slope = 0.0 if denominator == 0 else sum(
+            (x_value - x_mean) * (y_value - y_mean)
+            for x_value, y_value in zip(xs, values_mib)
+        ) / denominator
+        delta = values_mib[-1] - values_mib[0]
+        duration_minutes = xs[-1]
+        if len(points) < 5 or duration_minutes < 5:
+            assessment = "样本不足"
+        elif slope >= 0.5 and delta >= 5:
+            assessment = "持续增长信号"
+        elif slope <= -0.5 and delta <= -5:
+            assessment = "下降"
+        else:
+            assessment = "基本稳定 / 波动"
+        trends.append({
+            "app_name": app_name,
+            "values": values_mib,
+            "samples": len(values_mib),
+            "duration_minutes": duration_minutes,
+            "average": statistics.fmean(values_mib),
+            "peak": max(values_mib),
+            "delta": delta,
+            "slope": slope,
+            "assessment": assessment,
+        })
+    return sorted(trends, key=lambda item: (item["slope"], item["delta"]), reverse=True)
+
+
 def generate_report(session_id: str, store: SessionStore) -> str:
     """生成会话的性能测试报告 HTML。"""
     session = store.get_session(session_id)
@@ -133,7 +182,7 @@ def generate_report(session_id: str, store: SessionStore) -> str:
     events = store.get_events(session_id, limit=200)
     processes_cpu = store.get_processes(session_id, "cpu", 10)
     processes_pss = store.get_processes(session_id, "pss", 10)
-    processes_rss = store.get_processes(session_id, "rss", 10)
+    app_uss_trends = _build_app_uss_trends(store.get_process_uss_series(session_id))
 
     # ---------- 折线图数据（按时间正序） ----------
     def series_of(key: str, convert=None) -> list[float | None]:
@@ -145,7 +194,6 @@ def generate_report(session_id: str, store: SessionStore) -> str:
 
     cpu_series = series_of("cpu_total_pct")
     pss_series = series_of("pss_kb", convert=_mi)
-    rss_series = series_of("rss_kb", convert=_mi)
     present_fps_series = series_of("fps")
     render_fps_series = series_of("app_render_fps")
     jank_series = series_of("jank_pct")
@@ -166,7 +214,6 @@ def generate_report(session_id: str, store: SessionStore) -> str:
     # ---------- 总览 ----------
     cpu = _summary_metric(summary, "cpu")
     pss = _summary_metric(summary, "memory_pss")
-    rss = _summary_metric(summary, "memory_rss")
     fps = _summary_metric(summary, "fps")
     render_fps = _summary_metric(summary, "app_render_fps")
     frame_jank = _summary_metric(summary, "frame_jank_pct")
@@ -236,7 +283,6 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     parts.append('<h2>测试总览</h2><div class="grid">')
     parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；平均=周期内每秒采样的均值，峰值=最高值。{cpu.get('valid_count', 0)} 个有效样本"))
     parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程查询的 PSS 总和。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
-    parts.append(_overview_card("RSS 平均 / 峰值", f'{_fmt(_mi(rss.get("average")))} / {_fmt(_mi(rss.get("peak")))} MiB', "整机所有进程查询的 RSS 总和。RSS 不摊共享页，总和会重复计算共享内存，数值可能超过物理内存，仅作参考"))
     if memory_percent_values:
         parts.append(_overview_card(
             "内存占用率 平均 / 峰值",
@@ -256,7 +302,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
     parts.append('<h2>测试周期曲线</h2>')
     if samples:
         parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "#39d6d3")], "%", "整机 CPU 利用率（多核归一），来源 top 总体行。接近 100% 说明系统资源吃紧。"))
-        parts.append(_svg_line_chart("内存占用（PSS / RSS）", [("PSS", _downsample(pss_series), "#88d66c"), ("RSS", _downsample(rss_series), "#34d399")], "MiB", "按进程加总的内存占用；PSS 摊共享内存、RSS 为独占物理内存。"))
+        parts.append(_svg_line_chart("内存占用（PSS）", [("PSS", _downsample(pss_series), "#88d66c")], "MiB", "按进程加总的内存占用；PSS 将共享内存按比例分摊，适合观察整机内存压力。"))
         parts.append(_svg_line_chart("内存占用率（PSS / 总内存）", [("占用率", _downsample(memory_percent_series), "#34d399")], "%", "整机 PSS 占物理内存比例；接近 100% 说明系统内存压力大（可能触发回收）。"))
         parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "#f4b942")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
         parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "#7dd3fc")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
@@ -267,7 +313,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
 
     # ---------- 进程排行 ----------
     def process_table(title: str, rows: list[dict[str, Any]], unit: str, scale: float = 1.0) -> str:
-        # get_processes 的 pss/rss 为 KiB，显示 MiB 时需除以 1024
+        # get_processes 的 PSS 为 KiB，显示 MiB 时需除以 1024。
         def scaled(value: float | None) -> float | None:
             return None if value is None else value / scale
 
@@ -283,14 +329,31 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
             f"{body}</table></div>"
         )
 
-    if processes_cpu or processes_pss or processes_rss:
+    if processes_cpu or processes_pss:
         parts.append('<h2>进程排行</h2>')
         if processes_cpu:
             parts.append(process_table("进程 CPU 占用排行", processes_cpu, "%", scale=1))
         if processes_pss:
             parts.append(process_table("进程 PSS 占用排行", processes_pss, "MiB", scale=1024))
-        if processes_rss:
-            parts.append(process_table("进程 RSS 占用排行", processes_rss, "MiB", scale=1024))
+
+    # ---------- 各应用 USS 趋势 ----------
+    if app_uss_trends:
+        parts.append('<h2>各应用 USS 内存趋势</h2>')
+        parts.append('<div class="chart"><p class="meaning">USS 为应用独占物理内存。至少 5 分钟、5 个快照，且线性趋势不低于 +0.5 MiB/min、首尾增长不低于 5 MiB 时标记为持续增长信号。缓存、页面切换、GC 和进程重启都会造成波动，不能仅凭该信号判定内存泄漏。</p><table>'
+                     '<tr><th>应用</th><th>平均</th><th>峰值</th><th>首尾变化</th><th>趋势</th><th>判断</th></tr>'
+                     + "".join(
+                         f"<tr><td>{_escape(item['app_name'])}</td><td>{_fmt(item['average'], 1)} MiB</td>"
+                         f"<td>{_fmt(item['peak'], 1)} MiB</td><td>{item['delta']:+.1f} MiB</td>"
+                         f"<td>{item['slope']:+.2f} MiB/min</td><td>{_escape(item['assessment'])}</td></tr>"
+                         for item in app_uss_trends
+                     ) + '</table></div>')
+        for item in app_uss_trends:
+            parts.append(_svg_line_chart(
+                f"{item['app_name']} · USS",
+                [("USS", _downsample(item["values"]), "#f4b942")],
+                "MiB",
+                f"{item['samples']} 个真实内存快照；线性趋势 {item['slope']:+.2f} MiB/min，首尾变化 {item['delta']:+.1f} MiB。",
+            ))
 
     # ---------- 事件 ----------
     if events:
@@ -305,11 +368,11 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
             )
         parts.append("</div>")
 
-    # ---------- 指标口径说明 ----------
+    # ---------- 各项指标说明 ----------
     meanings = [
         ("CPU 整体", "%", "整机 CPU 利用率，多核总容量归一到 0-100%", "top 总体行（总容量 − idle）"),
         ("PSS", "MiB", "整机所有进程 PSS 总和；共享内存按比例分摊，接近系统真实占用（可与系统 Used RAM 对比）", "dumpsys meminfo · TOTAL PSS BY PROCESS"),
-        ("RSS", "MiB", "整机所有进程 RSS 总和；RSS 不摊共享页，多进程加总会重复计算共享内存，总和超过物理内存属正常，仅作参考", "dumpsys meminfo · TOTAL RSS BY PROCESS"),
+        ("USS", "MiB", "应用独占物理内存（Private Dirty + Private Clean）；持续增长可作为泄漏排查线索，但不是泄漏结论", "dumpsys meminfo -a --local · 进程 TOTAL"),
         ("呈现 FPS", "fps", "帧送上屏幕的呈现节奏；低于刷新率且持续说明显示链路吃紧", "FrameTimeline / framestats / SF latency 最优可用源"),
         ("应用渲染 FPS", "fps", "应用主动渲染帧率；静态界面回落 0 属正常", "gfxinfo 计数器增量"),
         ("逐帧 Jank", "%", "窗口内帧耗时超过两倍帧间隔的帧占比；越高掉帧越频繁", "framestats / FrameTimeline 逐帧时间戳"),
@@ -317,7 +380,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         ("丢帧率", "%", "窗口内卡顿帧占比峰值，衡量最差表现", "逐帧口径优先，回退 gfxinfo 计数"),
         ("警告 / 错误事件", "次", "采样与日志导出过程的异常记录数（权限、解析、降级等）", "会话事件表"),
     ]
-    parts.append('<h2>指标口径说明</h2><div class="chart"><table>'
+    parts.append('<h2>测试关键字说明</h2><div class="chart"><table>'
                  "<tr><th>指标</th><th>单位</th><th>含义</th><th>数据来源</th></tr>"
                  + "".join(
                      f"<tr><td>{_escape(name)}</td><td>{_escape(unit)}</td><td>{_escape(meaning)}</td><td>{_escape(source)}</td></tr>"

@@ -19,12 +19,25 @@ def test_parse_top_and_cpuinfo() -> None:
 
 
 def test_parse_meminfo_sections() -> None:
-    output = """Total RAM: 2,000,000K (status normal)\nTotal PSS by process:\n   100,000K: com.example.nav (pid 123 / activities)\n    20,000K: surfaceflinger (pid 456)\nTotal RSS by process:\n   140,000K: com.example.nav (pid 123 / activities)\n    40,000K: surfaceflinger (pid 456)\n"""
+    output = """** MEMINFO in pid 123 [com.example.nav] **
+                   Pss      Pss   Shared  Private   Shared  Private     Swap      Rss
+                 Total    Clean    Dirty    Dirty    Clean    Clean    Dirty    Total
+        TOTAL   100000     5000    20000    30000    40000    10000        0   140000
+Total PSS by process:
+   100,000K: com.example.nav (pid 123 / activities)
+    20,000K: surfaceflinger (pid 456)
+Total RSS by process:
+   140,000K: com.example.nav (pid 123 / activities)
+    40,000K: surfaceflinger (pid 456)
+Total RAM: 2,000,000K (status normal)
+"""
     pss, rss, total_ram, processes = parse_meminfo(output)
     assert pss == 120000
     assert rss == 180000
     assert total_ram == 2000000
     assert len(processes) == 2
+    nav = next(item for item in processes if item.process_name == "com.example.nav")
+    assert nav.uss_kb == 40000
 
 
 def test_parse_surface_latency() -> None:
