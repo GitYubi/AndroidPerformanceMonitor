@@ -62,6 +62,7 @@ class RuntimeSession:
     memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
     memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
     memory_detail_supported: bool | None = None
+    preserve_device_logs: bool = False
 
 
 # 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
@@ -74,6 +75,7 @@ class MonitorManager:
     def __init__(self, data_root: Path):
         self.store = SessionStore(data_root)
         self.active: dict[str, RuntimeSession] = {}
+        self.ui_manager = None
 
     async def start(self, request: StartSessionRequest) -> str:
         if self.active:
@@ -176,6 +178,14 @@ class MonitorManager:
 
     async def _export_device_logs(self, runtime: RuntimeSession) -> None:
         """会话结束（停止/自然到期）后拉取并清理车机日志。"""
+        if self.ui_manager:
+            async with self.ui_manager.device_lock(runtime.request.serial):
+                preserve = runtime.preserve_device_logs or self.ui_manager.has_active_device(runtime.request.serial)
+                await self._export_device_logs_impl(runtime, preserve)
+        else:
+            await self._export_device_logs_impl(runtime, False)
+
+    async def _export_device_logs_impl(self, runtime: RuntimeSession, preserve: bool) -> None:
         config = DeviceLogConfig(
             anr=runtime.request.anr_path,
             crash=runtime.request.crash_path,
@@ -187,6 +197,7 @@ class MonitorManager:
             config,
             PROJECT_ROOT,
             lambda code, severity, message: runtime.writer.add_event(severity, code, message),
+            preserve=preserve,
         )
     async def _capture_once(self, runtime: RuntimeSession) -> SamplePayload:
         statuses: dict[str, str] = {}

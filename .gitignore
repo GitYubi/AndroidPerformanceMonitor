@@ -114,3 +114,8 @@ client/public/__manus__/version.json
 
 # Device log exports
 /DevicesLogs/
+/backend/ui-data/
+**/midscene_run/
+
+# Local design preview depends on an external personal canvas
+/tools/ui-navigation-preview/

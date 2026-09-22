@@ -57,6 +57,7 @@ async def export_and_clean_device_logs(
     config: DeviceLogConfig,
     project_root: Path,
     on_event: EventSink,
+    preserve: bool = False,
 ) -> dict[str, object]:
     """执行全部已配置类型的日志导出与清理，返回各类型结果摘要。"""
     results: dict[str, object] = {}
@@ -96,14 +97,15 @@ async def export_and_clean_device_logs(
                 failed_files.append(f"{name}（{exc}）")
         if exported:
             try:
-                await run_adb("shell", "rm", "-f", f"{device_path}/*", serial=serial, timeout_seconds=30)
-                cleaned = True
+                if not preserve:
+                    await run_adb("shell", "rm", "-f", f"{device_path}/*", serial=serial, timeout_seconds=30)
+                cleaned = not preserve
             except AdbError as exc:
                 cleaned = False
                 on_event(code, "warning", f"{kind}：日志已导出但车机清理失败：{exc}")
             message = (
                 f"{kind}：已导出 {exported} 个文件到 {target_dir}；"
-                + ("车机日志已清理（保留目录）。" if cleaned else "车机日志清理失败。")
+                + ("与 UI 测试有关联，保留车机原始日志。" if preserve else "车机日志已清理（保留目录）。" if cleaned else "车机日志清理失败。")
                 + (f" 失败 {len(failed_files)} 个：" + "；".join(failed_files[:3]) if failed_files else "")
             )
             on_event(code, "info", message)

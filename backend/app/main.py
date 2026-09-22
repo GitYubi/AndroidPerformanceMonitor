@@ -18,6 +18,9 @@ from .models import StartSessionRequest
 from .monitor import MonitorManager
 from .interaction import InteractionError, InteractionTraceManager
 from .report import generate_report
+from .ui_testing import UIManager, router as ui_router
+from .ui_map import MapStore, router as map_router
+from .ui_stream import router as stream_router
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
@@ -29,10 +32,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     manager.store.recover_interrupted_sessions()
     app.state.manager = manager
     app.state.interactions = InteractionTraceManager(DATA_ROOT)
-    yield
+    app.state.ui = UIManager(DATA_ROOT.parent / 'ui-data', manager)
+    app.state.ui_drafts = {}
+    app.state.ui_map = MapStore(DATA_ROOT.parent / 'ui-data')
+    manager.ui_manager = app.state.ui
+    try:
+        yield
+    finally:
+        await app.state.ui.close()
 
 
 app = FastAPI(title="Android 车机性能监测 API", version="0.1.0", lifespan=lifespan)
+app.include_router(ui_router)
+app.include_router(map_router)
+app.include_router(stream_router)
 app.add_middleware(
     CORSMiddleware,
     # 前端 dev server 可能落在 localhost 任意端口（3000 被占用时自动顺延），
@@ -89,7 +102,12 @@ async def frame_capabilities(serial: str = Query(min_length=1, max_length=128)) 
 async def start_session(payload: StartSessionRequest, request: Request) -> dict[str, object]:
     manager = manager_from(request)
     try:
-        session_id = await manager.start(payload)
+        ui = request.app.state.ui
+        async with ui.device_lock(payload.serial):
+            session_id = await manager.start(payload)
+            if ui.has_active_device(payload.serial):
+                manager.active[session_id].preserve_device_logs = True
+                ui.link_performance(payload.serial, session_id)
     except (AdbError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "running"}
