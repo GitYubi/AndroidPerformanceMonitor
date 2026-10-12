@@ -1,0 +1,38 @@
+Android 车机性能监测工具 · Windows 便携版
+
+适用：Windows 10 / 11，64 位 Intel / AMD 电脑。
+
+1. 将 ZIP 完整解压到可写的文件夹，例如 D:\CarMonitor。
+2. 双击 Start.cmd，保留打开的运行窗口，浏览器会自动打开工具。
+3. 连接车机，开启 USB 调试，在车机上允许此电脑调试。
+4. 在页面选择设备并开始采样；UI 自动化也在同一页面内。
+5. 停止采样后，在运行窗口按 Ctrl+C 退出。关闭浏览器不会停止后端。
+
+已经包含 Python、Node.js、ADB、scrcpy server 和运行依赖。
+启动时无需安装依赖或联网下载。AI 驱动的 UI 用例仍需联网、配置模型 API Key。
+建议使用新版 Edge / Chrome，以支持设备画面所需的 WebCodecs。
+USB 驱动取决于车机厂商；若设备不出现，请安装厂商驱动并检查授权。
+
+默认地址：http://127.0.0.1:8090。
+端口被占用时自动尝试后续 19 个端口，以运行窗口显示的地址为准。
+重复双击 Start.cmd 会打开当前实例，不会重复启动采样后端。
+也可以在命令行运行 Start.cmd --port 8190 或 Start.cmd --no-browser。
+运行环境自检：Start.cmd --check。
+
+数据都保存在解压目录：
+  backend\data       性能会话与历史数据
+  backend\ui-data    UI 用例、页面地图、配置与报告
+  DevicesLogs        车机日志导出（未指定其他目录时）
+  logs\launcher.log  启动诊断日志
+
+升级时先停止旧版本，将 backend\data、backend\ui-data、DevicesLogs 复制到新版本。
+UI 配置可能包含 API Key，备份和分享这些数据时请自行妥善保管。
+可直接复制整个文件夹到其他电脑；本包不包含开发机历史数据或密钥。
+
+如果启动失败：确保已经完整解压，目录可写，系统为 Windows x64；
+查看运行窗口及 logs\launcher.log。遇到缺少系统 DLL 时请先完成 Windows 更新。
+
+本包在 macOS 上交叉组装；在 Windows 上运行 Start.cmd --check 可验证目标电脑的
+Python、ADB、Node、Midscene 和 Sharp 原生依赖。实际 USB 采样仍需连接车机验证。
+
+第三方组件许可见 THIRD_PARTY_NOTICES.txt、runtime 内的许可文件及各依赖的 LICENSE。

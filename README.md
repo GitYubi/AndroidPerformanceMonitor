@@ -26,6 +26,9 @@ android-car-performance-monitor/
 
 ## 环境要求
 
+如果使用 Windows 10 / 11 x64，可以直接使用便携包，无需安装下面的开发运行时。
+参见“Windows 免安装便携包”。
+
 当前工程已在 MacOS 通过 Python 3.12、Node 22、ADB Platform-Tools 的构建和解析测试。运行前，需要在**实际连接车机的主机**上安装以下运行时。
 
 | 依赖 | 建议版本 | 用途 |
@@ -61,6 +64,35 @@ pnpm install
 $env:VITE_BACKEND_URL = "http://127.0.0.1:8090"
 pnpm dev --host 127.0.0.1
 ```
+
+## Windows 免安装便携包
+
+打包产物为 `release/AndroidCarMonitor-Windows-x64.zip`。把 ZIP **完整解压**到可写目录，
+双击 `Start.cmd`，浏览器会自动打开工具；保留运行窗口，先停止采样，再按 `Ctrl+C` 退出。
+包内含 Windows x64 的 Python、Node.js、ADB、scrcpy server、后端依赖和 UI 自动化依赖。
+正常启动无需联网安装依赖；AI UI 用例仍需模型服务与 API Key，USB 连接可能需要厂商驱动。
+
+默认使用 `http://127.0.0.1:8090`，被占用时自动尝试后续端口；前端与 API 共用地址。
+重复双击会打开当前实例。可执行 `Start.cmd --port 8190` 指定端口，
+`Start.cmd --no-browser` 禁止自动打开浏览器，`Start.cmd --check` 检查 Windows 原生运行时与依赖。
+
+历史会话保存在解压目录的 `backend/data/`，UI 数据保存在 `backend/ui-data/`，
+默认车机日志保存在 `DevicesLogs/`，启动日志在 `logs/launcher.log`。
+升级时先退出旧版本，再把上述数据目录复制到新版本；运行包不会带入开发机的历史数据或密钥。
+
+开发者可在 macOS、Linux 或 Windows 上组装此包（需要 Python 3.12+、pip、Node 22+、pnpm、npm）：
+
+```bash
+pnpm install
+python3 tools/windows/build.py
+python3 tools/windows/smoke.py
+```
+
+Windows 构建主机可将 `python3` 换成 `py -3.12`。打包脚本从官方源下载并校验固定版本的运行时，
+安装 Windows x64 wheel 与 Node 原生依赖，校验 PE 架构，并生成文件清单及 ZIP 的 SHA-256。
+跨平台组装不等于 Windows 实机验证：`smoke.py` 在 Windows 使用包内 Python，检查 Node / ADB /
+Midscene / Sharp 后启动服务；在其他系统使用开发虚拟环境，仅验证服务与启动行为。
+实际 USB 采样需在 Windows 测试机上连接车机验证。用户操作说明也包含在 ZIP 中。
 
 ## 配置方式
 

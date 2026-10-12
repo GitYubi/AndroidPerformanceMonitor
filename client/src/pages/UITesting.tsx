@@ -1,3 +1,4 @@
+import { BACKEND_URL } from "@/lib/backend";
 import PageMapWorkbench from "@/components/PageMapWorkbench";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -25,7 +26,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
-const API = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090";
+const API = BACKEND_URL;
 type StepType =
   | "action"
   | "tap"

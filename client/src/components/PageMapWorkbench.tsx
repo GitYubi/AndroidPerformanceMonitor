@@ -1,7 +1,8 @@
+import { BACKEND_URL } from "@/lib/backend";
 import ScrcpyScreen, { type ScrcpyHandle } from "./ScrcpyScreen";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
-const API = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090";
+const API = BACKEND_URL;
 type Node = {
   index: number;
   parent: number | null;

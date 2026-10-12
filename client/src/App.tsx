@@ -1,3 +1,4 @@
+import { BACKEND_URL } from "@/lib/backend";
 /**
  * 设计提示：驾驶舱遥测仪。深色工业基底、遥测青状态色与紧凑等宽数据标签。
  */
@@ -18,8 +19,7 @@ function WorkspaceNav() {
     let disposed = false;
     const refresh = async () => {
       try {
-        const base =
-          import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090";
+        const base = BACKEND_URL;
         const [perf, ui] = await Promise.all([
           fetch(`${base}/api/sessions/active`).then(r =>
             r.ok ? r.json() : null

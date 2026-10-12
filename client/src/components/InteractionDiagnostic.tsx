@@ -1,3 +1,4 @@
+import { BACKEND_URL } from "@/lib/backend";
 import { useEffect, useState } from "react";
 import { Download, Play, Radio } from "lucide-react";
 import { toast } from "sonner";
@@ -17,7 +18,7 @@ type InteractionRecord = {
   notice: string;
 };
 
-const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
+const API_BASE = (BACKEND_URL).replace(/\/$/, "");
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {

@@ -1,3 +1,4 @@
+import { BACKEND_URL } from "@/lib/backend";
 /**
  * 设计提示：驾驶舱遥测仪。左侧为会话骨架，右侧为随启用模块数弹性重排的时间轨迹带；不使用虚构性能数据填充空态。
  */
@@ -143,7 +144,7 @@ interface MonitorEvent {
   message: string;
 }
 
-const API_BASE = (import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090").replace(/\/$/, "");
+const API_BASE = (BACKEND_URL).replace(/\/$/, "");
 
 const LOG_PATHS_STORAGE_KEY = "acpm.logPaths.v1";
 const COLLAPSED_STORAGE_KEY = "acpm.collapsed.v1";

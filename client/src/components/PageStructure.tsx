@@ -1,7 +1,8 @@
+import { BACKEND_URL } from "@/lib/backend";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-const API = import.meta.env.VITE_BACKEND_URL || "http://127.0.0.1:8090";
+const API = BACKEND_URL;
 async function request(path: string, body?: unknown) {
   const response = await fetch(
     `${API}/api${path}`,

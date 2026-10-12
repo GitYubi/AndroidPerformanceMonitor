@@ -5,6 +5,9 @@
 # Build outputs
 dist/
 build/
+/release/
+**/__pycache__/
+*.py[cod]
 *.dist
 
 # Environment variables
