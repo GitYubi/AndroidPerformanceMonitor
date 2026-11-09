@@ -14,9 +14,60 @@ from __future__ import annotations
 import html
 import statistics
 import time
-from typing import Any
+from typing import Any, Literal, get_args
 
 from .storage import SessionStore
+
+ReportMetric = Literal["cpu", "memory", "process_memory", "fps", "frames", "events"]
+ReportTheme = Literal["light", "dark"]
+
+
+_REPORT_PALETTES = {
+    "dark": {
+        "report-page": "#0f172a",
+        "report-text": "#e2e8f0",
+        "report-panel": "#1e293b",
+        "report-border": "#334155",
+        "report-accent": "#7dd3fc",
+        "report-muted": "#94a3b8",
+        "report-note": "#64748b",
+        "report-value": "#cbd5e1",
+        "report-axis": "#475569",
+        "report-warning": "#fbbf24",
+        "report-error": "#f87171",
+        "series-cpu": "#39d6d3",
+        "series-memory": "#34d399",
+        "series-pss": "#88d66c",
+        "series-fps": "#f4b942",
+        "series-render": "#7dd3fc",
+        "series-jank": "#fb7185",
+        "series-frame-avg": "#94a3b8",
+        "series-frame-p95": "#f472b6",
+        "series-frame-p99": "#f87171",
+    },
+    "light": {
+        "report-page": "#f4f7fb",
+        "report-text": "#0f172a",
+        "report-panel": "#fff",
+        "report-border": "#cbd5e1",
+        "report-accent": "#0369a1",
+        "report-muted": "#475569",
+        "report-note": "#475569",
+        "report-value": "#1e293b",
+        "report-axis": "#64748b",
+        "report-warning": "#92400e",
+        "report-error": "#b91c1c",
+        "series-cpu": "#0e7490",
+        "series-memory": "#047857",
+        "series-pss": "#3f6212",
+        "series-fps": "#92400e",
+        "series-render": "#0369a1",
+        "series-jank": "#be123c",
+        "series-frame-avg": "#475569",
+        "series-frame-p95": "#a21caf",
+        "series-frame-p99": "#b91c1c",
+    },
+}
 
 # 单图最多渲染点数（抽稀目标）
 _CHART_MAX_POINTS = 600
@@ -96,8 +147,8 @@ def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]
         grid_y = 12 + (_CHART_HEIGHT - 24) * ratio
         value = y_max - span * ratio
         grid += (
-            f'<line x1="44" y1="{grid_y:.1f}" x2="900" y2="{grid_y:.1f}" stroke="#334155" stroke-width="0.5"/>'
-            f'<text x="4" y="{grid_y + 3:.1f}" font-size="9" fill="#94a3b8">{value:.1f}</text>'
+            f'<line x1="44" y1="{grid_y:.1f}" x2="900" y2="{grid_y:.1f}" stroke="var(--report-border)" stroke-width="0.5"/>'
+            f'<text x="4" y="{grid_y + 3:.1f}" font-size="9" fill="var(--report-muted)">{value:.1f}</text>'
         )
     note = f'<p class="meaning">{_escape(description)}</p>' if description else ""
     return (
@@ -105,7 +156,7 @@ def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]
         f'<svg viewBox="0 0 {_CHART_WIDTH} {_CHART_HEIGHT}" preserveAspectRatio="xMidYMid meet" '
         f'width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">'
         f'{grid}{polylines}'
-        f'<line x1="44" y1="{_CHART_HEIGHT - 12}" x2="900" y2="{_CHART_HEIGHT - 12}" stroke="#475569" stroke-width="1"/>'
+        f'<line x1="44" y1="{_CHART_HEIGHT - 12}" x2="900" y2="{_CHART_HEIGHT - 12}" stroke="var(--report-axis)" stroke-width="1"/>'
         f'</svg>{note}</div>'
     )
 
@@ -171,18 +222,27 @@ def _build_app_uss_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(trends, key=lambda item: (item["slope"], item["delta"]), reverse=True)
 
 
-def generate_report(session_id: str, store: SessionStore) -> str:
+def generate_report(
+    session_id: str,
+    store: SessionStore,
+    *,
+    metrics: list[ReportMetric] | None = None,
+    theme: ReportTheme = "dark",
+) -> str:
     """生成会话的性能测试报告 HTML。"""
     session = store.get_session(session_id)
     if session is None:
         raise ValueError("会话不存在")
     summary = session.get("summary", {})
-    metrics = summary.get("metrics", {})
+    included = set(get_args(ReportMetric) if metrics is None else metrics)
     samples = store.get_all_samples(session_id)
-    events = store.get_events(session_id, limit=200)
-    processes_cpu = store.get_processes(session_id, "cpu", 10)
-    processes_pss = store.get_processes(session_id, "pss", 10)
-    app_uss_trends = _build_app_uss_trends(store.get_process_uss_series(session_id))
+    events = store.get_events(session_id, limit=200) if "events" in included else []
+    processes_cpu = store.get_processes(session_id, "cpu", 10) if "cpu" in included else []
+    processes_pss = store.get_processes(session_id, "pss", 10) if "process_memory" in included else []
+    app_uss_trends = (
+        _build_app_uss_trends(store.get_process_uss_series(session_id))
+        if "process_memory" in included else []
+    )
 
     # ---------- 折线图数据（按时间正序） ----------
     def series_of(key: str, convert=None) -> list[float | None]:
@@ -201,19 +261,21 @@ def generate_report(session_id: str, store: SessionStore) -> str:
     p95_frame_series = series_of("p95_frame_time_ms")
     p99_frame_series = series_of("p99_frame_time_ms")
 
-    # 内存占用率 = PSS / Total RAM（total_ram 独立降频，取最近非空值，与前端一致）
-    memory_percent_series: list[float | None] = []
+    # PSS accounting is retained separately from kernel availability accounting.
+    pss_percent_series: list[float | None] = []
     last_total_ram: int | None = None
     for sample in samples:
         if sample.get("total_ram_kb"):
             last_total_ram = sample["total_ram_kb"]
         pss = sample.get("pss_kb")
-        memory_percent_series.append((pss / last_total_ram * 100) if (pss is not None and last_total_ram) else None)
-    memory_percent_values = [value for value in memory_percent_series if value is not None]
+        pss_percent_series.append((pss / last_total_ram * 100) if (pss is not None and last_total_ram) else None)
+    pss_percent_values = [value for value in pss_percent_series if value is not None]
+    system_memory_series = series_of("memory_used_pct")
 
     # ---------- 总览 ----------
     cpu = _summary_metric(summary, "cpu")
     pss = _summary_metric(summary, "memory_pss")
+    system_memory = _summary_metric(summary, "memory_used_pct")
     fps = _summary_metric(summary, "fps")
     render_fps = _summary_metric(summary, "app_render_fps")
     frame_jank = _summary_metric(summary, "frame_jank_pct")
@@ -238,34 +300,41 @@ def generate_report(session_id: str, store: SessionStore) -> str:
     # ---------- 拼装 HTML ----------
     state = _STATE_LABELS.get(session.get("state", ""), session.get("state", "未知"))
     parts: list[str] = []
+    palette = _REPORT_PALETTES[theme]
+    palette_css = ";".join(f"--{key}:{value}" for key, value in palette.items())
 
     parts.append(
         f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"/>
 <title>性能测试报告 · {_escape(session.get("serial", ""))}</title>
 <style>
-body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:32px 16px;}}
+:root,.wrap{{{palette_css};color-scheme:{theme};}}
+body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--report-page);color:var(--report-text);margin:0;padding:32px 16px;}}
 .wrap{{max-width:960px;margin:0 auto;}}
-header{{border-bottom:1px solid #334155;padding-bottom:16px;margin-bottom:24px;}}
-h1{{font-size:20px;margin:0 0 8px;}} h2{{font-size:15px;color:#7dd3fc;margin:28px 0 12px;}} h3{{font-size:13px;margin:0 0 8px;color:#e2e8f0;}}
-.meta{{color:#94a3b8;font-size:12px;line-height:1.8;}}
+header{{border-bottom:1px solid var(--report-border);padding-bottom:16px;margin-bottom:24px;}}
+h1{{font-size:20px;margin:0 0 8px;}} h2{{font-size:15px;color:var(--report-accent);margin:28px 0 12px;}} h3{{font-size:13px;margin:0 0 8px;color:var(--report-text);}}
+.meta{{color:var(--report-muted);font-size:12px;line-height:1.8;}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;}}
-.card{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px 14px;}}
-.card-label{{color:#94a3b8;font-size:11px;}} .card-value{{font-size:18px;font-weight:600;margin:4px 0;}}
-.card-sub{{color:#64748b;font-size:10px;}} .unit{{color:#64748b;font-size:10px;font-weight:400;}}
-.chart{{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:12px 14px;margin-bottom:14px;}}
-.empty{{color:#64748b;font-size:12px;}}
-.meaning{{color:#64748b;font-size:10px;line-height:1.6;margin:6px 0 0;}}
+.card{{background:var(--report-panel);border:1px solid var(--report-border);border-radius:8px;padding:12px 14px;}}
+.card-label{{color:var(--report-muted);font-size:11px;}} .card-value{{font-size:18px;font-weight:600;margin:4px 0;}}
+.card-sub{{color:var(--report-note);font-size:10px;}} .unit{{color:var(--report-note);font-size:10px;font-weight:400;}}
+.chart{{background:var(--report-panel);border:1px solid var(--report-border);border-radius:8px;padding:12px 14px;margin-bottom:14px;}}
+.uss-link{{color:var(--report-accent);text-decoration:none;}} .uss-link:hover{{text-decoration:underline;}}
+.uss-chart{{background:var(--report-panel);border:1px solid var(--report-border);border-radius:8px;margin-bottom:10px;scroll-margin-top:16px;}}
+.uss-chart summary{{cursor:pointer;color:var(--report-accent);padding:12px 14px;font-size:13px;}}
+.uss-chart .chart{{border:0;margin:0;padding-top:0;}}
+.empty{{color:var(--report-note);font-size:12px;}}
+.meaning{{color:var(--report-note);font-size:10px;line-height:1.6;margin:6px 0 0;}}
 table{{width:100%;border-collapse:collapse;font-size:12px;}}
-th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #1e293b;}}
-th{{color:#94a3b8;font-weight:500;}} td{{color:#cbd5e1;}}
+th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--report-panel);}}
+th{{color:var(--report-muted);font-weight:500;}} td{{color:var(--report-value);}}
 .section-title{{display:flex;justify-content:space-between;align-items:center;}}
-.badge{{background:#0f172a;border:1px solid #334155;color:#94a3b8;border-radius:4px;padding:2px 8px;font-size:11px;}}
-.event{{padding:4px 0;font-size:12px;color:#94a3b8;}} .event .code{{color:#cbd5e1;font-family:monospace;}}
-.warn{{color:#fbbf24;}} .err{{color:#f87171;}}
-footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#64748b;font-size:11px;}}
-.capture-btn{{position:fixed;top:16px;right:16px;background:#1e293b;border:1px solid #334155;color:#7dd3fc;border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;z-index:10;font-family:inherit;}}
-.capture-btn:hover{{background:#334155;}}
+.badge{{background:var(--report-page);border:1px solid var(--report-border);color:var(--report-muted);border-radius:4px;padding:2px 8px;font-size:11px;}}
+.event{{padding:4px 0;font-size:12px;color:var(--report-muted);}} .event .code{{color:var(--report-value);font-family:monospace;}}
+.warn{{color:var(--report-warning);}} .err{{color:var(--report-error);}}
+footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12px;color:var(--report-note);font-size:11px;}}
+.capture-btn{{position:fixed;top:16px;right:16px;background:var(--report-panel);border:1px solid var(--report-border);color:var(--report-accent);border-radius:8px;padding:8px 14px;font-size:12px;cursor:pointer;z-index:10;font-family:inherit;}}
+.capture-btn:hover{{background:var(--report-border);}}
 </style></head><body>
 <button class="capture-btn" data-capture-btn onclick="capturePNG()">保存为图片 (PNG)</button>
 <div class="wrap">
@@ -281,35 +350,57 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
 
     # ---------- 总览卡片 ----------
     parts.append('<h2>测试总览</h2><div class="grid">')
-    parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；平均=周期内每秒采样的均值，峰值=最高值。{cpu.get('valid_count', 0)} 个有效样本"))
-    parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程查询的 PSS 总和。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
-    if memory_percent_values:
+    if "cpu" in included:
+        parts.append(_overview_card("CPU 平均 / 峰值", f'{_fmt(cpu.get("average"))}% / {_fmt(cpu.get("peak"))}%', f"整机 CPU 利用率（多核归一 0-100%）；峰值为已采样值的最高值。{cpu.get('valid_count', 0)} 个有效样本"))
+    if "process_memory" in included:
+        parts.append(_overview_card("PSS 平均 / 峰值", f'{_fmt(_mi(pss.get("average")))} / {_fmt(_mi(pss.get("peak")))} MiB', "按进程查询的 PSS 总和。PSS=共享内存按比例分摊后的进程占用，更接近应用实际内存开销"))
+    if "memory" in included:
+        parts.append(_overview_card("系统内存占用率 平均 / 峰值", f'{_fmt(system_memory.get("average"))}% / {_fmt(system_memory.get("peak"))}%', "(MemTotal - MemAvailable) / MemTotal × 100%，来自同一份 /proc/meminfo 快照；MemAvailable 包含可回收缓存的可用内存估计。未采集时显示 —，不使用 PSS / MemFree 替代。"))
+    pss_percent_summary = _summary_metric(summary, "memory_pss_pct")
+    if "process_memory" in included and pss_percent_values:
+        pss_average = pss_percent_summary.get("average") if pss_percent_summary.get("average") is not None else sum(pss_percent_values) / len(pss_percent_values)
+        pss_peak = pss_percent_summary.get("peak") if pss_percent_summary.get("peak") is not None else max(pss_percent_values)
         parts.append(_overview_card(
-            "内存占用率 平均 / 峰值",
-            f'{_fmt(sum(memory_percent_values) / len(memory_percent_values))}% / {_fmt(max(memory_percent_values))}%',
-            "整机 PSS 占物理内存（Total RAM）比例，反映系统整体内存压力",
+            "PSS / RAM 平均 / 峰值",
+            f'{_fmt(pss_average)}% / {_fmt(pss_peak)}%',
+            "已采到进程的 PSS 总和占 Total RAM 的比例，用于进程内存分析，不等于系统内存占用率。",
         ))
-    parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "屏幕呈现节奏（帧送上屏的速率）；平均=均值，最低=周期内最差表现。来自 FrameTimeline / framestats / SF latency 中最优可用源"))
-    parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "窗口内卡顿帧占比的峰值（帧耗时超过两倍帧间隔）；逐帧口径，无则用 gfxinfo 计数口径"))
-    parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "应用主动渲染帧率（gfxinfo 计数器增量）；静态界面不重绘时回落 0 属正常，非卡顿"))
-    parts.append(_overview_card("逐帧 Jank 平均 / 峰值", f'{_fmt(frame_jank.get("average"))}% / {_fmt(frame_jank.get("peak"))}%', "窗口内帧耗时超过两倍帧间隔的帧占比；越高说明掉帧越频繁"))
-    parts.append(_overview_card("逐帧 P95 帧耗时", f'{_fmt(frame_p95.get("average"))} ms', "帧耗时分布的 95 分位：95% 的帧在此耗时以内。60Hz 下超过 16.7ms 即可能掉帧"))
-    parts.append(_overview_card("警告 / 错误事件", str(warning_count), "采样与日志导出过程中的异常记录数（权限不足、解析失败、数据源降级等）"))
-    parts.append(_overview_card("帧率数据源", " / ".join(f"{k}×{v}" for k, v in sorted(source_counts.items())) or "未启用帧率", "按采样点统计实际使用的数据源（FrameTimeline / framestats / SF latency）"))
+    if "fps" in included:
+        parts.append(_overview_card("呈现 FPS 平均 / 最低", f'{_fmt(fps.get("average"))} / {_fmt(fps.get("peak"))}', "屏幕呈现节奏（帧送上屏的速率）；平均=均值，最低=周期内最差表现。来自 FrameTimeline / framestats / SF latency 中最优可用源"))
+    if "frames" in included:
+        parts.append(_overview_card("最大丢帧率", f'{_fmt(peak_jank)}%', "窗口内卡顿帧占比的峰值（帧耗时超过两倍帧间隔）；逐帧口径，无则用 gfxinfo 计数口径"))
+    if "fps" in included:
+        parts.append(_overview_card("应用渲染 FPS 平均 / 最低", f'{_fmt(render_fps.get("average"))} / {_fmt(render_fps.get("peak"))}', "应用主动渲染帧率（gfxinfo 计数器增量）；静态界面不重绘时回落 0 属正常，非卡顿"))
+    if "frames" in included:
+        parts.append(_overview_card("逐帧 Jank 平均 / 峰值", f'{_fmt(frame_jank.get("average"))}% / {_fmt(frame_jank.get("peak"))}%', "窗口内帧耗时超过两倍帧间隔的帧占比；越高说明掉帧越频繁"))
+        parts.append(_overview_card("逐帧 P95 帧耗时", f'{_fmt(frame_p95.get("average"))} ms', "帧耗时分布的 95 分位：95% 的帧在此耗时以内。60Hz 下超过 16.7ms 即可能掉帧"))
+    if "events" in included:
+        parts.append(_overview_card("警告 / 错误事件", str(warning_count), "采样与日志导出过程中的异常记录数（权限不足、解析失败、数据源降级等）"))
+    if "fps" in included:
+        parts.append(_overview_card("帧率数据源", " / ".join(f"{k}×{v}" for k, v in sorted(source_counts.items())) or "无可用帧率数据", ("按图表抽稀采样点统计" if getattr(store, "report_notice", None) else "按采样点统计") + "实际使用的数据源（FrameTimeline / framestats / SF latency）"))
     parts.append("</div>")
 
     # ---------- 折线图 ----------
-    parts.append('<h2>测试周期曲线</h2>')
-    if samples:
-        parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "#39d6d3")], "%", "整机 CPU 利用率（多核归一），来源 top 总体行。接近 100% 说明系统资源吃紧。"))
-        parts.append(_svg_line_chart("内存占用（PSS）", [("PSS", _downsample(pss_series), "#88d66c")], "MiB", "按进程加总的内存占用；PSS 将共享内存按比例分摊，适合观察整机内存压力。"))
-        parts.append(_svg_line_chart("内存占用率（PSS / 总内存）", [("占用率", _downsample(memory_percent_series), "#34d399")], "%", "整机 PSS 占物理内存比例；接近 100% 说明系统内存压力大（可能触发回收）。"))
-        parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "#f4b942")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
-        parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "#7dd3fc")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
-        parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "#fb7185")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。"))
-        parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", _downsample(avg_frame_series), "#94a3b8"), ("p95", _downsample(p95_frame_series), "#f472b6"), ("p99", _downsample(p99_frame_series), "#f87171")], "ms", "每秒窗口内帧耗时均值与分位数。60Hz 下帧耗时超过 16.7ms 意味着错过 vsync、可能出现掉帧；p95/p99 衡量尾延迟。"))
-    else:
-        parts.append('<p class="empty">该会话没有采样数据。</p>')
+    if included - {"events"}:
+        parts.append('<h2>测试周期曲线</h2>')
+        if getattr(store, "report_notice", None):
+            parts.append('<p class="meaning">长时间曲线可能抽稀。完整采样见合并 CSV 和 SQLite。</p>')
+        if samples:
+            if "cpu" in included:
+                parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "var(--series-cpu)")], "%", "整机 CPU 利用率（多核归一），来自 /proc/stat 差值；设备不支持时回退 top。"))
+            if "memory" in included:
+                parts.append(_svg_line_chart("系统内存占用率（基于 MemAvailable）", [("系统内存率", _downsample(system_memory_series), "var(--series-memory)")], "%", "(MemTotal - MemAvailable) / MemTotal × 100%；缺失时不绘制有效曲线。"))
+            if "process_memory" in included:
+                parts.append(_svg_line_chart("内存占用（PSS）", [("PSS", _downsample(pss_series), "var(--series-pss)")], "MiB", "按已采到进程加总的 PSS，共享内存按比例分摊，用于分析进程内存开销。"))
+                parts.append(_svg_line_chart("进程 PSS / RAM 比例", [("PSS / RAM", _downsample(pss_percent_series), "var(--series-pss)")], "%", "PSS 占 Total RAM 的比例，不等同于系统内存占用率。"))
+            if "fps" in included:
+                parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "var(--series-fps)")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
+                parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "var(--series-render)")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
+            if "frames" in included:
+                parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "var(--series-jank)")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。"))
+                parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", _downsample(avg_frame_series), "var(--series-frame-avg)"), ("p95", _downsample(p95_frame_series), "var(--series-frame-p95)"), ("p99", _downsample(p99_frame_series), "var(--series-frame-p99)")], "ms", "每秒窗口内帧耗时均值与分位数。60Hz 下帧耗时超过 16.7ms 意味着错过 vsync、可能出现掉帧；p95/p99 衡量尾延迟。"))
+        else:
+            parts.append('<p class="empty">该会话没有采样数据。</p>')
 
     # ---------- 进程排行 ----------
     def process_table(title: str, rows: list[dict[str, Any]], unit: str, scale: float = 1.0) -> str:
@@ -342,18 +433,20 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         parts.append('<div class="chart"><p class="meaning">USS 为应用独占物理内存。至少 5 分钟、5 个快照，且线性趋势不低于 +0.5 MiB/min、首尾增长不低于 5 MiB 时标记为持续增长信号。缓存、页面切换、GC 和进程重启都会造成波动，不能仅凭该信号判定内存泄漏。</p><table>'
                      '<tr><th>应用</th><th>平均</th><th>峰值</th><th>首尾变化</th><th>趋势</th><th>判断</th></tr>'
                      + "".join(
-                         f"<tr><td>{_escape(item['app_name'])}</td><td>{_fmt(item['average'], 1)} MiB</td>"
+                         f"<tr><td><a class=\"uss-link\" href=\"#uss-{index}\" onclick=\"openUssTrend(event, 'uss-{index}')\">{_escape(item['app_name'])}</a></td><td>{_fmt(item['average'], 1)} MiB</td>"
                          f"<td>{_fmt(item['peak'], 1)} MiB</td><td>{item['delta']:+.1f} MiB</td>"
                          f"<td>{item['slope']:+.2f} MiB/min</td><td>{_escape(item['assessment'])}</td></tr>"
-                         for item in app_uss_trends
+                         for index, item in enumerate(app_uss_trends)
                      ) + '</table></div>')
-        for item in app_uss_trends:
+        for index, item in enumerate(app_uss_trends):
+            parts.append(f'<details class="uss-chart" id="uss-{index}"><summary>{_escape(item["app_name"])} · USS 折线图</summary>')
             parts.append(_svg_line_chart(
                 f"{item['app_name']} · USS",
-                [("USS", _downsample(item["values"]), "#f4b942")],
+                [("USS", _downsample(item["values"]), "var(--series-fps)")],
                 "MiB",
                 f"{item['samples']} 个真实内存快照；线性趋势 {item['slope']:+.2f} MiB/min，首尾变化 {item['delta']:+.1f} MiB。",
             ))
+            parts.append('</details>')
 
     # ---------- 事件 ----------
     if events:
@@ -364,27 +457,28 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
                 f'<div class="event"><span class="code">{_escape(event["code"])}</span> '
                 f'<span class="{tone}">[{_escape(event["severity"])}]</span> '
                 f'{_escape(event["message"])}'
-                f' <span style="color:#475569">{time.strftime("%H:%M:%S", time.localtime(event["ts_ms"] / 1000))}</span></div>'
+                f' <span style="color:var(--report-axis)">{time.strftime("%H:%M:%S", time.localtime(event["ts_ms"] / 1000))}</span></div>'
             )
         parts.append("</div>")
 
     # ---------- 各项指标说明 ----------
     meanings = [
-        ("CPU 整体", "%", "整机 CPU 利用率，多核总容量归一到 0-100%", "top 总体行（总容量 − idle）"),
-        ("PSS", "MiB", "整机所有进程 PSS 总和；共享内存按比例分摊，接近系统真实占用（可与系统 Used RAM 对比）", "dumpsys meminfo · TOTAL PSS BY PROCESS"),
-        ("USS", "MiB", "应用独占物理内存（Private Dirty + Private Clean）；持续增长可作为泄漏排查线索，但不是泄漏结论", "dumpsys meminfo -a --local · 进程 TOTAL"),
-        ("呈现 FPS", "fps", "帧送上屏幕的呈现节奏；低于刷新率且持续说明显示链路吃紧", "FrameTimeline / framestats / SF latency 最优可用源"),
-        ("应用渲染 FPS", "fps", "应用主动渲染帧率；静态界面回落 0 属正常", "gfxinfo 计数器增量"),
-        ("逐帧 Jank", "%", "窗口内帧耗时超过两倍帧间隔的帧占比；越高掉帧越频繁", "framestats / FrameTimeline 逐帧时间戳"),
-        ("P95 / P99 帧耗时", "ms", "帧耗时分布分位数；60Hz 下超 16.7ms 意味着错过 vsync、可能掉帧", "逐帧时间戳计算"),
-        ("丢帧率", "%", "窗口内卡顿帧占比峰值，衡量最差表现", "逐帧口径优先，回退 gfxinfo 计数"),
-        ("警告 / 错误事件", "次", "采样与日志导出过程的异常记录数（权限、解析、降级等）", "会话事件表"),
+        ("cpu", "CPU 整体", "%", "整机 CPU 利用率，多核总容量归一到 0-100%", "/proc/stat 差值；不支持时回退 top"),
+        ("memory", "系统内存占用率", "%", "(MemTotal - MemAvailable) / MemTotal × 100%；总内存为内核可管理内存，不以 PSS 或 MemFree 替代", "cat /proc/meminfo · MemTotal / MemAvailable"),
+        ("process_memory", "PSS", "MiB", "已采到进程 PSS 总和；共享内存按比例分摊，用于进程内存分析，不等于系统已用内存", "dumpsys meminfo · TOTAL PSS BY PROCESS"),
+        ("process_memory", "USS", "MiB", "应用独占物理内存（Private Dirty + Private Clean）；持续增长可作为泄漏排查线索，但不是泄漏结论", "dumpsys meminfo -a --local · 进程 TOTAL"),
+        ("fps", "呈现 FPS", "fps", "帧送上屏幕的呈现节奏；低于刷新率且持续说明显示链路吃紧", "FrameTimeline / framestats / SF latency 最优可用源"),
+        ("fps", "应用渲染 FPS", "fps", "应用主动渲染帧率；静态界面回落 0 属正常", "gfxinfo 计数器增量"),
+        ("frames", "逐帧 Jank", "%", "窗口内帧耗时超过两倍帧间隔的帧占比；越高掉帧越频繁", "framestats / FrameTimeline 逐帧时间戳"),
+        ("frames", "P95 / P99 帧耗时", "ms", "帧耗时分布分位数；60Hz 下超 16.7ms 意味着错过 vsync、可能掉帧", "逐帧时间戳计算"),
+        ("frames", "丢帧率", "%", "窗口内卡顿帧占比峰值，衡量最差表现", "逐帧口径优先，回退 gfxinfo 计数"),
+        ("events", "警告 / 错误事件", "次", "采样与日志导出过程的异常记录数（权限、解析、降级等）", "会话事件表"),
     ]
     parts.append('<h2>测试关键字说明</h2><div class="chart"><table>'
                  "<tr><th>指标</th><th>单位</th><th>含义</th><th>数据来源</th></tr>"
                  + "".join(
                      f"<tr><td>{_escape(name)}</td><td>{_escape(unit)}</td><td>{_escape(meaning)}</td><td>{_escape(source)}</td></tr>"
-                     for name, unit, meaning, source in meanings
+                     for group, name, unit, meaning, source in meanings if group in included
                  )
                  + "</table></div>")
 
@@ -392,6 +486,10 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         f'<footer>生成时间：{time.strftime("%Y-%m-%d %H:%M:%S")} ｜ 会话 {_escape(session_id)} ｜ Android 车机性能监测工具</footer>'
         "</div>"
         "<script>"
+        "function openUssTrend(event,id){"
+        "var chart=document.getElementById(id);if(!chart)return;"
+        "event.preventDefault();chart.open=true;chart.scrollIntoView({behavior:'smooth',block:'start'});"
+        "}"
         "function capturePNG(){"
         "var wrap=document.querySelector('.wrap');"
         "var width=wrap.scrollWidth,height=wrap.scrollHeight;"
@@ -399,6 +497,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         "for(var i=0;i<document.styleSheets.length;i++){try{var rules=document.styleSheets[i].cssRules;"
         "for(var j=0;j<rules.length;j++){cssText+=rules[j].cssText;}}catch(e){}}"
         "var clone=wrap.cloneNode(true);"
+        "var inherited=getComputedStyle(wrap);clone.style.color=inherited.color;clone.style.fontFamily=inherited.fontFamily;"
         "var btn=clone.querySelector('[data-capture-btn]');if(btn){btn.remove();}"
         "var svg='<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"'+width+'\" height=\"'+height+'\">'"
         "+'<foreignObject width=\"100%\" height=\"100%\">'"
@@ -408,7 +507,7 @@ footer{{margin-top:32px;border-top:1px solid #334155;padding-top:12px;color:#647
         "img.onload=function(){"
         "var canvas=document.createElement('canvas');canvas.width=width;canvas.height=height;"
         "var ctx=canvas.getContext('2d');"
-        "ctx.fillStyle='#0f172a';ctx.fillRect(0,0,width,height);"
+        "ctx.fillStyle=getComputedStyle(document.body).backgroundColor;ctx.fillRect(0,0,width,height);"
         "ctx.drawImage(img,0,0);"
         "canvas.toBlob(function(blob){"
         "var a=document.createElement('a');a.href=URL.createObjectURL(blob);"

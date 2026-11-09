@@ -24,7 +24,7 @@ class StartSessionRequest(BaseModel):
 
     serial: str = Field(min_length=1, max_length=128)
     duration_seconds: int = Field(default=900, ge=1, le=3600)
-    interval_ms: int = Field(default=1000, ge=500, le=5000)
+    interval_ms: int = Field(default=2000, ge=500, le=5000)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     surface_layer: str | None = Field(default=None, max_length=256)
     # 内存采样独立降频：每 N 个采样周期采一次内存（dumpsys meminfo 全量
@@ -68,6 +68,16 @@ class ProcessSample:
 
 
 @dataclass(slots=True)
+class SystemMemorySample:
+    """Kernel availability accounting; independent of process PSS accounting."""
+
+    mem_total_kb: int | None = None
+    mem_available_kb: int | None = None
+    mem_used_kb: int | None = None
+    memory_used_pct: float | None = None
+
+
+@dataclass(slots=True)
 class SamplePayload:
     """一个采样周期的一组一级指标和进程明细。"""
 
@@ -76,6 +86,10 @@ class SamplePayload:
     pss_kb: int | None = None
     rss_kb: int | None = None
     total_ram_kb: int | None = None
+    mem_total_kb: int | None = None
+    mem_available_kb: int | None = None
+    mem_used_kb: int | None = None
+    memory_used_pct: float | None = None
     fps: float | None = None
     app_render_fps: float | None = None
     app_jank_pct: float | None = None

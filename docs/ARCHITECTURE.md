@@ -20,7 +20,7 @@
 
 | 指标 | 主命令 | 辅助命令 | 计算口径 | 兼容性与降级 |
 | --- | --- | --- | --- |
-| CPU 整体与进程 | `adb -s <serial> shell top -b -n 1` | `adb -s <serial> shell dumpsys cpuinfo` | 记录 `top` 总体 CPU 行（可用时）与进程 `%CPU`；`cpuinfo` 用于交叉校验进程视图。整体平均值与峰值只取有效样本。 | 自动识别 Toybox、procps 风格列头；无法读出总体行时，显示“整体 CPU 不可用”，仍保留进程数据。 |
+| CPU 整体与进程 | `adb -s <serial> shell cat /proc/stat` | `adb -s <serial> shell dumpsys cpuinfo` | 整体 CPU 使用相邻累计计数差值，进程 CPU 使用 `cpuinfo`。首个整体 CPU 点建立基线，不计入均值。 | 无法读取 `/proc/stat` 时回退 `top`；进程命令失败不影响整体 CPU。 |
 | Memory（系统与应用） | `adb -s <serial> shell dumpsys meminfo -a --local` | — | 系统总 PSS 与进程 USS，统一以 KiB 存储；USS 由 Private Dirty + Private Clean 计算。 | 若 OEM 输出缺少详细进程表，PSS 仍照常入库，USS 趋势标记为不可用。 |
 | 显示帧率与逐帧统计 | 多源自动降级：`dumpsys SurfaceFlinger --frametimeline -all` → `dumpsys gfxinfo <pkg> framestats` → `dumpsys SurfaceFlinger --latency <layer>` | `dumpsys SurfaceFlinger --list`、`dumpsys gfxinfo <pkg>` 计数器 | 呈现 FPS = 最近 present 时间戳间隔中位数换算；逐帧源额外给出 `frame_count`、`jank_count`、`jank_pct`（>2 倍帧间隔）、`avg/p95/p99_frame_time_ms` 与 `input_latency_ms`。 | 会话启动读取 SDK 版本；`GET /api/frame-capabilities` 预探测可用源；采样中失败自动降到下一优先级并写会话事件。 |
 
@@ -40,6 +40,8 @@ SurfaceFlinger 负责合成并发送显示缓冲区，且围绕显示刷新节�
 每个采样点写入 `frame_source` 列标明实际数据源；切换时产生 `frame_source_switch` 会话事件。`GET /api/frame-capabilities?serial=<id>` 返回只读探测结果供界面展示。
 
 ## 3. 会话与数据模型
+
+系统内存占用率从 `cat /proc/meminfo` 的同一份快照计算：`(MemTotal - MemAvailable) / MemTotal × 100%`，落盘为 `mem_total_kb`、`mem_available_kb`、`mem_used_kb`、`memory_used_pct`。这条轻量采样链路遵循内存降频节奏，与 PSS 的 `dumpsys meminfo` 任务独立，各自最多一个在途请求。缺少 `MemAvailable`、总量非正、可用量越界或权限不足时不计算百分比，不使用 PSS 或 MemFree 兜底。实时曲线和 Monkey 内存区间统计采用此口径；PSS 与进程明细仍保留用于归因。读取旧会话时为缺失列返回 NULL，旧、新 Monkey 片段可合并且不会把未知历史内存率补为 0。
 
 一次测试会话由 UUID 标识，最长运行 60 分钟。每一个采样周期有唯一时间戳；CPU、Memory、FPS 模块可独立启用或关闭。采样周期默认 1 秒，可在 500–5,000 ms 内配置；所有 ADB 子进程均设置超时且不经 shell 拼接用户输入，避免阻塞和命令注入。
 

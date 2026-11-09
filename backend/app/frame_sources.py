@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 
 from .adb import (
     AdbError,
@@ -142,6 +143,7 @@ async def capture_frame_metrics(
     package: str | None,
     sdk_version: int | None,
     cooldowns: dict[str, int] | None = None,
+    on_framestats: Callable[[str], None] | None = None,
 ) -> FrameStats | None:
     """按优先级尝试逐帧数据源，返回第一个成功解析的结果；全部失败返回 None。
 
@@ -164,6 +166,8 @@ async def capture_frame_metrics(
                 if not package:
                     continue
                 output = await run_adb("shell", "dumpsys", "gfxinfo", package, "framestats", serial=serial, timeout_seconds=7)
+                if on_framestats is not None:
+                    on_framestats(output)
                 stats = parse_framestats(output)
             else:
                 stats = None

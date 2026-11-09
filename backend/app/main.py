@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Annotated, AsyncIterator
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -17,10 +17,11 @@ from .frame_sources import probe_frame_capabilities
 from .models import StartSessionRequest
 from .monitor import MonitorManager
 from .interaction import InteractionError, InteractionTraceManager
-from .report import generate_report
+from .report import ReportMetric, ReportTheme, generate_report
 from .ui_testing import UIManager, router as ui_router
 from .ui_map import MapStore, router as map_router
 from .ui_stream import router as stream_router
+from .monkey import MonkeyManager, router as monkey_router
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
@@ -36,9 +37,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.ui_drafts = {}
     app.state.ui_map = MapStore(DATA_ROOT.parent / 'ui-data')
     manager.ui_manager = app.state.ui
+    app.state.monkey = MonkeyManager(DATA_ROOT.parent / 'monkey-data', manager, app.state.ui, app.state.interactions)
+    await app.state.monkey.recover()
     try:
         yield
     finally:
+        await app.state.monkey.close()
+        await manager.close()
         await app.state.ui.close()
 
 
@@ -46,6 +51,7 @@ app = FastAPI(title="Android 车机性能监测 API", version="0.1.0", lifespan=
 app.include_router(ui_router)
 app.include_router(map_router)
 app.include_router(stream_router)
+app.include_router(monkey_router)
 app.add_middleware(
     CORSMiddleware,
     # 前端 dev server 可能落在 localhost 任意端口（3000 被占用时自动顺延），
@@ -167,6 +173,8 @@ async def stop_session(session_id: str, request: Request) -> dict[str, object]:
         await manager.stop(session_id)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "stopped"}
 
 
@@ -218,6 +226,8 @@ async def session_report(
     session_id: str,
     request: Request,
     download: int = Query(default=0, ge=0, le=1),
+    metrics: Annotated[list[ReportMetric] | None, Query()] = None,
+    theme: ReportTheme = "dark",
 ) -> HTMLResponse:
     """生成会话的 HTML 性能测试报告（当前或历史会话均可）。"""
     store = manager_from(request).store
@@ -225,7 +235,7 @@ async def session_report(
     if session is None:
         raise HTTPException(status_code=404, detail="会话不存在")
     try:
-        content = generate_report(session_id, store)
+        content = generate_report(session_id, store, metrics=metrics, theme=theme)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"报告生成失败：{exc}") from exc
     headers = {}
@@ -259,7 +269,10 @@ async def start_interaction(payload: dict[str, object], request: Request) -> dic
         raise HTTPException(status_code=422, detail="duration_seconds 必须为整数")
     manager = interactions_from(request)
     try:
-        interaction_id = await manager.start(serial.strip(), duration)
+        async with request.app.state.ui.device_lock(serial.strip()):
+            if serial.strip() in request.app.state.ui.external_busy:
+                raise InteractionError("设备正在运行 Monkey，请先停止任务")
+            interaction_id = await manager.start(serial.strip(), duration)
     except (InteractionError, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.get(interaction_id) or {"interaction_id": interaction_id, "state": "queued"}

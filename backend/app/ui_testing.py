@@ -239,13 +239,14 @@ class UIManager:
         self.cancelled: set[str] = set()
         self.lock = asyncio.Lock()
         self.device_locks: dict[str, asyncio.Lock] = {}
+        self.external_busy: dict[str, str] = {}
         self.store.recover()
 
     def device_lock(self, serial):
         return self.device_locks.setdefault(serial, asyncio.Lock())
 
     def has_active_device(self, serial):
-        return any(self.store.get('runs', key)['serial'] == serial for key in self.tasks)
+        return serial in self.external_busy or any(self.store.get('runs', key)['serial'] == serial for key in self.tasks)
 
     def link_performance(self, serial, session_id):
         for key in self.tasks:

@@ -47,6 +47,15 @@
 
 :root,
 .dark {
+  color-scheme: dark;
+  --console-background: #101928;
+  --chart-grid: #314158;
+  --chart-tick: #94a3b8;
+  --chart-cpu: #39d6d3;
+  --chart-memory: #88d66c;
+  --chart-fps: #f4b942;
+  --chart-render: #7dd3fc;
+  --chart-jank: #fb7185;
   --primary: oklch(0.81 0.12 191);
   --primary-foreground: oklch(0.16 0.018 252);
   --sidebar-primary: oklch(0.81 0.12 191);
@@ -80,6 +89,87 @@
   --sidebar-accent-foreground: oklch(0.96 0.01 220);
   --sidebar-border: oklch(0.36 0.018 240 / 72%);
   --sidebar-ring: oklch(0.81 0.12 191);
+}
+
+:root:not(.dark) {
+  color-scheme: light;
+  --console-background: #f4f7fb;
+  --background: #f8fafc;
+  --foreground: #0f172a;
+  --card: #fff;
+  --card-foreground: #0f172a;
+  --popover: #fff;
+  --popover-foreground: #0f172a;
+  --primary: #0e7490;
+  --primary-foreground: #fff;
+  --secondary: #e2e8f0;
+  --secondary-foreground: #1e293b;
+  --muted: #eef2f7;
+  --muted-foreground: #475569;
+  --accent: #e0f2fe;
+  --accent-foreground: #164e63;
+  --destructive: #b91c1c;
+  --border: #cbd5e1;
+  --input: #cbd5e1;
+  --ring: #0e7490;
+  --sidebar: #f8fafc;
+  --sidebar-foreground: #1e293b;
+  --sidebar-primary: #0e7490;
+  --sidebar-primary-foreground: #fff;
+  --sidebar-accent: #e0f2fe;
+  --sidebar-accent-foreground: #164e63;
+  --sidebar-border: #cbd5e1;
+  --sidebar-ring: #0e7490;
+  --chart-grid: #cbd5e1;
+  --chart-tick: #475569;
+  --chart-cpu: #0e7490;
+  --chart-memory: #3f6212;
+  --chart-fps: #92400e;
+  --chart-render: #0369a1;
+  --chart-jank: #be123c;
+
+  /* The existing telemetry panels share these palette slots for surfaces and text. */
+  --color-slate-50: #0f172a;
+  --color-slate-100: #0f172a;
+  --color-slate-200: #1e293b;
+  --color-slate-300: #334155;
+  --color-slate-400: #475569;
+  --color-slate-500: #475569;
+  --color-slate-600: #64748b;
+  --color-slate-700: #b6c4d5;
+  --color-slate-800: #e2e8f0;
+  --color-slate-900: #fff;
+  --color-slate-950: #eff4fa;
+  --color-cyan-100: #164e63;
+  --color-cyan-200: #155e75;
+  --color-cyan-300: #0e7490;
+  --color-cyan-400: #0e7490;
+  --color-cyan-500: #0891b2;
+  --color-cyan-950: #ecfeff;
+  --color-sky-200: #075985;
+  --color-sky-300: #0369a1;
+  --color-amber-50: #451a03;
+  --color-amber-100: #78350f;
+  --color-amber-200: #78350f;
+  --color-amber-300: #92400e;
+  --color-amber-400: #a16207;
+  --color-emerald-200: #065f46;
+  --color-emerald-300: #047857;
+  --color-emerald-400: #047857;
+  --color-rose-200: #9f1239;
+  --color-rose-300: #be123c;
+  --color-rose-400: #be123c;
+  --color-rose-800: #fda4af;
+  --color-rose-900: #fda4af;
+  --color-rose-950: #ffe4e6;
+  --color-red-300: #991b1b;
+  --color-red-400: #b91c1c;
+  --color-red-950: #fff1f2;
+  --color-violet-200: #5b21b6;
+}
+
+:root:not(.dark) .telemetry-panel {
+  box-shadow: 0 8px 24px rgb(15 23 42 / 7%);
 }
 
 @layer base {

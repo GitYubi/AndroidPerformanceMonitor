@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import time
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
 
 from app.models import ProcessSample, SamplePayload
@@ -70,11 +71,48 @@ def test_report_contains_charts() -> None:
     assert "<polyline" in report  # SVG 折线
 
 
+def test_uss_links_point_to_initially_collapsed_charts() -> None:
+    session_id, store = _make_report_session()
+    report = generate_report(session_id, store)
+
+    class Parser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.links = []
+            self.details = []
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            if tag == "a" and attributes.get("class") == "uss-link":
+                self.links.append(attributes)
+            if tag == "details" and attributes.get("class") == "uss-chart":
+                self.details.append(attributes)
+
+    parser = Parser()
+    parser.feed(report)
+    assert len(parser.links) == len(parser.details) == 1
+    assert parser.links[0]["href"] == "#" + parser.details[0]["id"]
+    assert "open" not in parser.details[0]
+    assert "chart.open=true" in report and "chart.scrollIntoView" in report
+
+
 def test_report_contains_processes_and_events() -> None:
     session_id, store = _make_report_session()
     report = generate_report(session_id, store)
     assert "com.example.nav" in report
     assert "frame_source_switch" in report
+
+
+def test_selected_metrics_filter_summary_charts_rankings_and_event_details() -> None:
+    session_id, store = _make_report_session()
+    report = generate_report(session_id, store, metrics=["cpu", "memory"], theme="light")
+
+    for title in ("CPU 平均 / 峰值", "系统内存占用率 平均 / 峰值", "CPU 整体占用", "进程 CPU 占用排行"):
+        assert title in report
+    for title in ("PSS 平均 / 峰值", "进程 PSS 占用排行", "各应用 USS 内存趋势",
+                  "呈现帧率（P）", "帧耗时（avg / p95 / p99）", "frame_source_switch", "<td>USS</td>"):
+        assert title not in report
+    assert "color-scheme:light" in report
 
 
 def test_report_unknown_session_raises() -> None:

@@ -1,3 +1,4 @@
+import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
 import { BACKEND_URL } from "@/lib/backend";
 /**
  * 设计提示：驾驶舱遥测仪。左侧为会话骨架，右侧为随启用模块数弹性重排的时间轨迹带；不使用虚构性能数据填充空态。
@@ -69,6 +70,10 @@ interface SessionPoint {
   pss_kb: number | null;
   rss_kb: number | null;
   total_ram_kb: number | null;
+  mem_total_kb: number | null;
+  mem_available_kb: number | null;
+  mem_used_kb: number | null;
+  memory_used_pct: number | null;
   fps: number | null;
   app_render_fps: number | null;
   app_jank_pct: number | null;
@@ -225,9 +230,9 @@ function Countdown({ startedAtMs, durationSeconds, running }: { startedAtMs: num
   );
 }
 const METRIC_META: Record<MetricKey, { label: string; unit: string; color: string; icon: typeof Cpu; apiKey: string }> = {
-  cpu: { label: "CPU 整体占用", unit: "%", color: "#39D6D3", icon: Cpu, apiKey: "cpu_total_pct" },
-  memory: { label: "Memory 占用", unit: "MiB", color: "#88D66C", icon: HardDrive, apiKey: "pss_kb" },
-  fps: { label: "帧链路：渲染 / 呈现", unit: "fps", color: "#F4B942", icon: Gauge, apiKey: "fps" },
+  cpu: { label: "CPU 整体占用", unit: "%", color: "var(--chart-cpu)", icon: Cpu, apiKey: "cpu_total_pct" },
+  memory: { label: "系统内存占用率", unit: "%", color: "var(--chart-memory)", icon: HardDrive, apiKey: "memory_used_pct" },
+  fps: { label: "帧链路：渲染 / 呈现", unit: "fps", color: "var(--chart-fps)", icon: Gauge, apiKey: "fps" },
 };
 
 async function requestApi<T>(path: string, options?: RequestInit): Promise<T> {
@@ -267,7 +272,6 @@ function formatValue(value: number | null | undefined, unit = "", fractionDigits
 }
 
 function displayMetricValue(metric: MetricKey, value: number | null | undefined): string {
-  if (metric === "memory" && value !== null && value !== undefined) return `${(value / 1024).toFixed(1)} MiB`;
   return formatValue(value, METRIC_META[metric].unit);
 }
 
@@ -277,13 +281,8 @@ function formatProcessValue(value: number | null | undefined, metric: ProcessMet
   return `${(value / 1024).toFixed(1)} MiB`;
 }
 
-function memoryPercent(value: number | null | undefined, totalRamKb: number | null | undefined): string {
-  if (value === null || value === undefined || !totalRamKb) return "—";
-  return (value / totalRamKb * 100).toFixed(1) + "%";
-}
-
-function formatMemorySummary(item: SummaryMetric, totalRamKb: number | null): string {
-  return [formatValue(item.average === null ? null : item.average / 1024, " MiB"), memoryPercent(item.average, totalRamKb), "/", formatValue(item.peak === null ? null : item.peak / 1024, " MiB"), memoryPercent(item.peak, totalRamKb)].join(" · ");
+function formatMemorySummary(item: SummaryMetric): string {
+  return `${formatValue(item.average == null ? null : item.average / 1024, " MiB")} / ${formatValue(item.peak == null ? null : item.peak / 1024, " MiB")}`;
 }
 
 function metricSummary(session: MonitorSession | null, key: string): SummaryMetric | undefined {
@@ -309,7 +308,7 @@ function MetricToggle({ metric, checked, onCheckedChange }: { metric: MetricKey;
         <span className={`grid h-7 w-7 place-items-center rounded-sm ${checked ? "bg-cyan-300/14 text-cyan-200" : "bg-slate-800 text-slate-500"}`}><Icon size={15} /></span>
         <span>
           <span className="block text-xs font-medium text-slate-200">{meta.label}</span>
-          <span className="font-telemetry text-[10px] text-slate-500">{metric === "memory" ? "PSS" : meta.unit}</span>
+          <span className="font-telemetry text-[10px] text-slate-500">{metric === "memory" ? "MemAvailable · 同时保留 PSS" : meta.unit}</span>
         </span>
       </span>
       <Switch checked={checked} onCheckedChange={onCheckedChange} aria-label={`启用${meta.label}`} />
@@ -323,7 +322,7 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
   const isFramePipeline = metric === "fps";
   const hasData = isFramePipeline
     ? points.some((point) => point.fps !== null || point.app_render_fps !== null || point.jank_pct !== null)
-    : points.some((point) => point[dataKey] !== null);
+    : points.some((point) => point[dataKey] != null);
   // 应用渲染 R 线拆分为两条：活跃期实线（真实值）与空闲期虚线（保持最后一次活跃值）。
   let lastRenderFps: number | null = null;
   const renderFpsActive: (number | null)[] = [];
@@ -341,26 +340,20 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
   }
   const chartData = points.map((point, index) => ({
     ...point,
-    viewValue: metric === "memory" && point.pss_kb !== null ? Number((point.pss_kb / 1024).toFixed(2)) : point[dataKey],
+    viewValue: point[dataKey],
     renderFpsActive: isFramePipeline ? renderFpsActive[index] : undefined,
     renderFpsHeld: isFramePipeline ? renderFpsHeld[index] : undefined,
   }));
   const latest = points.at(-1);
-  // 内存曲线头部：已用 / 总计 / 当前占用百分比（内存独立降频，总计取最近非空值）
+  // System totals and availability always come from the same /proc snapshot.
   let latestText: string;
   if (isFramePipeline) {
     latestText = `R ${formatValue(latest?.app_render_fps, " fps")} · P ${formatValue(latest?.fps, " fps")} · J ${formatValue(latest?.jank_pct, "%")}`;
   } else if (metric === "memory") {
-    const totalRamKb = (() => {
-      for (let index = points.length - 1; index >= 0; index -= 1) {
-        if (points[index].total_ram_kb != null) return points[index].total_ram_kb;
-      }
-      return null;
-    })();
-    if (latest?.pss_kb != null && totalRamKb) {
-      latestText = `已用 ${(latest.pss_kb / 1024).toFixed(0)} MiB · 共 ${(totalRamKb / 1024).toFixed(0)} MiB · ${((latest.pss_kb / totalRamKb) * 100).toFixed(1)}%`;
+    if (latest?.memory_used_pct != null && latest.mem_used_kb != null && latest.mem_total_kb && latest.mem_available_kb != null) {
+      latestText = `${latest.memory_used_pct.toFixed(1)}% · 已用 ${(latest.mem_used_kb / 1024).toFixed(0)} / 总计 ${(latest.mem_total_kb / 1024).toFixed(0)} MiB · 可用 ${(latest.mem_available_kb / 1024).toFixed(0)} MiB`;
     } else {
-      latestText = displayMetricValue(metric, latest?.[dataKey] as number | null);
+      latestText = "未记录有效的 MemAvailable";
     }
   } else {
     latestText = displayMetricValue(metric, latest?.[dataKey] as number | null);
@@ -373,30 +366,30 @@ function MetricChart({ metric, points, height }: { metric: MetricKey; points: Se
           <span className="h-2 w-2 rounded-full" style={{ backgroundColor: meta.color, boxShadow: `0 0 12px ${meta.color}` }} />
           <div>
             <h2 className="text-xs font-semibold tracking-[0.08em] text-slate-100">{meta.label}</h2>
-            <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">{isFramePipeline ? `LIVE TRACE · SOURCE ${frameSourceLabel(latest?.frame_source)} · RENDER / PRESENT / JANK` : `LIVE TRACE · ${meta.unit}`}</p>
+            <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">{isFramePipeline ? `LIVE TRACE · SOURCE ${frameSourceLabel(latest?.frame_source)} · RENDER / PRESENT / JANK` : metric === "memory" ? "(MemTotal − MemAvailable) / MemTotal · %" : `LIVE TRACE · ${meta.unit}`}</p>
           </div>
         </div>
-        <span className="font-telemetry text-[11px] text-slate-300">{hasData ? latestText : "等待首个采样点"}</span>
+        <span className="font-telemetry text-[11px] text-slate-300">{hasData ? latestText : metric === "memory" && points.length ? "未记录系统内存率" : "等待首个采样点"}</span>
       </div>
       <div className="h-[calc(100%-58px)] px-1 pb-2">
         {hasData ? (
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData} margin={{ top: 4, right: 20, left: -15, bottom: 0 }}>
-              <CartesianGrid stroke="#314158" strokeDasharray="2 5" vertical={false} />
-              <XAxis dataKey="ts_ms" tickFormatter={formatTime} minTickGap={46} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
-              <YAxis yAxisId="fps" width={44} tick={{ fill: "#718096", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
-              {isFramePipeline && <YAxis yAxisId="jank" orientation="right" width={36} domain={[0, 100]} tick={{ fill: "#fb7185", fontSize: 9, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} tickFormatter={(value: number) => `${value}%`} />}
-              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "#111b2b", border: "1px solid #3b4b62", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => {
-                const unit = name === "逐帧 Jank" ? "%" : isFramePipeline ? " fps" : metric === "memory" ? " MiB" : "%";
+              <CartesianGrid stroke="var(--chart-grid)" strokeDasharray="2 5" vertical={false} />
+              <XAxis dataKey="ts_ms" tickFormatter={formatTime} minTickGap={46} tick={{ fill: "var(--chart-tick)", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
+              <YAxis yAxisId="fps" width={44} domain={metric === "memory" ? [0, 100] : undefined} tick={{ fill: "var(--chart-tick)", fontSize: 10, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} />
+              {isFramePipeline && <YAxis yAxisId="jank" orientation="right" width={36} domain={[0, 100]} tick={{ fill: "var(--chart-jank)", fontSize: 9, fontFamily: "IBM Plex Mono" }} axisLine={false} tickLine={false} tickFormatter={(value: number) => `${value}%`} />}
+              <Tooltip cursor={{ stroke: "#64748b", strokeDasharray: "3 3" }} contentStyle={{ background: "var(--popover)", color: "var(--popover-foreground)", border: "1px solid var(--border)", borderRadius: 4, fontFamily: "IBM Plex Mono", fontSize: 11 }} labelFormatter={(label) => formatTime(Number(label))} formatter={(value: number, name: string) => {
+                const unit = name === "逐帧 Jank" ? "%" : isFramePipeline ? " fps" : "%";
                 return [formatValue(value, unit), name];
               }} />
-              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsActive" name="应用渲染" stroke="#7dd3fc" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "#7dd3fc", stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />}
-              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsHeld" name="渲染（空闲保持）" stroke="#7dd3fc" strokeWidth={1.5} strokeDasharray="5 4" dot={false} activeDot={false} isAnimationActive={false} connectNulls={false} opacity={0.65} />}
-              <Line yAxisId="fps" type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "#f4b942" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "#f4b942" : meta.color, stroke: "#101928", strokeWidth: 2 }} isAnimationActive={false} connectNulls />
-              {isFramePipeline && <Line yAxisId="jank" type="monotone" dataKey="jank_pct" name="逐帧 Jank" stroke="#fb7185" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls isAnimationActive={false} />}
+              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsActive" name="应用渲染" stroke="var(--chart-render)" strokeWidth={2} dot={false} activeDot={{ r: 3, fill: "var(--chart-render)", stroke: "var(--console-background)", strokeWidth: 2 }} isAnimationActive={false} connectNulls={false} />}
+              {isFramePipeline && <Line yAxisId="fps" type="monotone" dataKey="renderFpsHeld" name="渲染（空闲保持）" stroke="var(--chart-render)" strokeWidth={1.5} strokeDasharray="5 4" dot={false} activeDot={false} isAnimationActive={false} connectNulls={false} opacity={0.65} />}
+              <Line yAxisId="fps" type="monotone" dataKey={isFramePipeline ? "fps" : "viewValue"} name={isFramePipeline ? "内容呈现" : meta.label} stroke={isFramePipeline ? "var(--chart-fps)" : meta.color} strokeWidth={2} dot={false} activeDot={{ r: 3, fill: isFramePipeline ? "var(--chart-fps)" : meta.color, stroke: "var(--console-background)", strokeWidth: 2 }} isAnimationActive={false} connectNulls={metric !== "memory"} />
+              {isFramePipeline && <Line yAxisId="jank" type="monotone" dataKey="jank_pct" name="逐帧 Jank" stroke="var(--chart-jank)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} connectNulls isAnimationActive={false} />}
             </LineChart>
           </ResponsiveContainer>
-        ) : <div className="scanline-accent grid h-full place-items-center border-t border-dashed border-slate-700/60"><div className="text-center"><Activity className="mx-auto mb-2 text-slate-600" size={18} /><p className="font-telemetry text-[11px] tracking-wider text-slate-500">NO TELEMETRY YET</p></div></div>}
+        ) : <div className="scanline-accent grid h-full place-items-center border-t border-dashed border-slate-700/60"><div className="text-center"><Activity className="mx-auto mb-2 text-slate-600" size={18} /><p className="font-telemetry text-[11px] tracking-wider text-slate-500">{metric === "memory" && points.length ? "未采集有效 MemAvailable；PSS 可在汇总和进程排行查看" : "NO TELEMETRY YET"}</p></div></div>}
       </div>
     </section>
   );
@@ -406,7 +399,7 @@ export default function Home() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [selectedSerial, setSelectedSerial] = useState("");
   const [durationMinutes, setDurationMinutes] = useState(60);
-  const [intervalMs, setIntervalMs] = useState(500);
+  const [intervalMs, setIntervalMs] = useState(2000);
   const [metrics, setMetrics] = useState<Record<MetricKey, boolean>>({ cpu: true, memory: true, fps: true });
   const [surfaceLayer, setSurfaceLayer] = useState("");
   const [layers, setLayers] = useState<string[]>([]);
@@ -442,14 +435,6 @@ export default function Home() {
     setActiveSessionId(nextSession.session_id);
     setSession(nextSession);
   }, []);
-  // 内存采样独立降频后 total_ram 仅在有内存采样的周期出现，取最近非空值
-  const totalRamKb = (() => {
-    for (let index = points.length - 1; index >= 0; index -= 1) {
-      if (points[index].total_ram_kb != null) return points[index].total_ram_kb;
-    }
-    return null;
-  })();
-
   const refreshDevices = useCallback(async () => {
     try {
       const [healthPayload, devicePayload, activePayload] = await Promise.all([
@@ -656,10 +641,10 @@ export default function Home() {
   };
 
   return (
-    <div className="min-h-screen bg-[#101928] text-slate-100">
-      <header className="relative h-24 overflow-hidden border-b border-slate-700/70 bg-[#101928]">
-        <img src="/manus-storage/telemetry-hero_91d70b81.jpg" alt="" className="absolute inset-0 h-full w-full object-cover object-center opacity-45" />
-        <div className="absolute inset-0 bg-gradient-to-r from-[#101928] via-[#101928]/92 to-[#101928]/45" />
+    <div className="min-h-screen bg-[var(--console-background)] text-slate-100">
+      <header className="relative h-24 overflow-hidden border-b border-slate-700/70 bg-[var(--console-background)]">
+        <img src="/manus-storage/telemetry-hero_91d70b81.jpg" alt="" className="absolute inset-0 h-full w-full object-cover object-center opacity-20 dark:opacity-45" />
+        <div className="absolute inset-0 bg-gradient-to-r from-[var(--console-background)] via-[var(--console-background)]/92 to-[var(--console-background)]/45" />
         <div className="relative mx-auto flex h-full max-w-[1600px] items-center justify-between px-5 lg:px-8">
           <div className="flex items-center gap-3.5">
             <div className="grid h-11 w-11 place-items-center rounded-md border border-cyan-200/25 bg-cyan-200/8 p-2 shadow-[0_0_30px_rgba(57,214,211,0.14)]">
@@ -667,7 +652,7 @@ export default function Home() {
             </div>
             <div>
               <p className="font-telemetry text-[10px] uppercase tracking-[0.22em] text-cyan-200/80">Android Vehicle Lab</p>
-              <h1 className="text-lg font-semibold tracking-[0.08em] text-white sm:text-xl">车机性能遥测控制台</h1>
+              <h1 className="text-lg font-semibold tracking-[0.08em] text-foreground sm:text-xl">车机性能遥测控制台</h1>
             </div>
           </div>
           <div className="flex items-center gap-3">
@@ -708,7 +693,8 @@ export default function Home() {
               {!collapsed.window && <><div className="grid grid-cols-4 gap-1.5">
                 {[5, 15, 30, 60].map((minutes) => <button key={minutes} disabled={running} onClick={() => setDurationMinutes(minutes)} className={`rounded-sm border py-2 font-telemetry text-[11px] transition ${durationMinutes === minutes ? "border-cyan-300/45 bg-cyan-300/12 text-cyan-100" : "border-slate-700 bg-slate-950/30 text-slate-500 hover:border-slate-500"}`}>{minutes}m</button>)}
               </div>
-              <div className="mt-2 flex items-center justify-between rounded-sm border border-slate-700/60 bg-slate-950/30 px-2.5 py-2"><span className="text-[11px] text-slate-400">采样间隔</span><select value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))} disabled={running} className="bg-transparent font-telemetry text-[11px] text-cyan-100 outline-none"><option value={500}>0.5s</option><option value={1000}>1.0s</option><option value={2000}>2.0s</option><option value={5000}>5.0s</option></select></div></>}
+              <div className="mt-2 flex items-center justify-between rounded-sm border border-slate-700/60 bg-slate-950/30 px-2.5 py-2"><span className="text-[11px] text-slate-400">采样间隔</span><select value={intervalMs} onChange={(event) => setIntervalMs(Number(event.target.value))} disabled={running} className="bg-transparent font-telemetry text-[11px] text-cyan-100 outline-none"><option value={500}>0.5s</option><option value={1000}>1.0s</option><option value={2000}>2.0s</option><option value={5000}>5.0s</option></select></div>
+              {intervalMs < 2000 && <p className="mt-1 text-[10px] text-amber-300">高频采样会增加设备负载；长时测试建议使用 2 秒或更长间隔。</p>}</>}
             </section>
 
             <section>
@@ -788,7 +774,11 @@ export default function Home() {
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Window</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">{session ? `${Math.ceil(session.duration_seconds / 60)}m @ ${session.interval_ms / 1000}s` : `${durationMinutes}m @ ${intervalMs / 1000}s`}</p></div>
                 <div className="rounded-sm border border-slate-700 bg-slate-950/35 px-3 py-2"><p className="font-telemetry text-[9px] uppercase tracking-wider text-slate-500">Storage</p><p className="font-telemetry mt-0.5 text-xs text-slate-200">SQLite · WAL</p></div>
                 {activeSessionId && <Button variant="outline" onClick={downloadCsv} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><Download size={14} /> 导出 CSV</Button>}
-                {activeSessionId && <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${activeSessionId}/report`, "_blank", "noopener,noreferrer")} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={14} /> 生成报告</Button>}
+                {activeSessionId && (
+                  <PerformanceReportDialog url={`${API_BASE}/api/sessions/${activeSessionId}/report`} enabledMetrics={session?.enabled_metrics}>
+                    <Button variant="outline" className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={14} /> 生成报告</Button>
+                  </PerformanceReportDialog>
+                )}
                 <Button variant="outline" disabled={running || loading} onClick={() => { void loadHistory(); setHistoryOpen(true); }} className="h-auto border-slate-600 bg-slate-950/20 text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><History size={14} /> 历史会话</Button>
               </div>
             </div>
@@ -799,7 +789,8 @@ export default function Home() {
           <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             {[
               { label: "CPU 平均 / 峰值", metric: metricSummary(session, "cpu"), icon: Cpu, tone: "text-cyan-200", output: (item: SummaryMetric) => `${formatValue(item.average, "%")} / ${formatValue(item.peak, "%")}` },
-              { label: "PSS 平均 / 峰值", metric: metricSummary(session, "memory_pss"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => formatMemorySummary(item, totalRamKb) },
+              { label: "系统内存占用率 平均 / 峰值", metric: metricSummary(session, "memory_used_pct"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => `${formatValue(item.average, "%")} / ${formatValue(item.peak, "%")}` },
+              { label: "PSS 平均 / 峰值", metric: metricSummary(session, "memory_pss"), icon: HardDrive, tone: "text-lime-200", output: (item: SummaryMetric) => formatMemorySummary(item) },
               { label: "应用渲染 FPS 平均 / 最低", metric: metricSummary(session, "app_render_fps"), icon: Activity, tone: "text-sky-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "内容呈现 FPS 平均 / 最低", metric: metricSummary(session, "fps"), icon: Gauge, tone: "text-amber-200", output: (item: SummaryMetric) => formatValue(item.average, " fps") + " / " + formatValue(item.peak, " fps") },
               { label: "渲染 Jank 平均 / 峰值", metric: metricSummary(session, "app_jank_pct"), icon: AlertTriangle, tone: "text-rose-200", output: (item: SummaryMetric) => formatValue(item.average, "%") + " / " + formatValue(item.peak, "%") },
@@ -880,7 +871,9 @@ export default function Home() {
                       </div>
                       <div className="flex shrink-0 items-center gap-2">
                         <span className={`rounded-sm border px-1.5 py-0.5 font-telemetry text-[10px] ${stateTone(item.state)}`}>{stateLabel(item.state)}</span>
-                        <Button variant="outline" onClick={() => window.open(`${API_BASE}/api/sessions/${item.session_id}/report`, "_blank", "noopener,noreferrer")} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={12} /> 报告</Button>
+                        <PerformanceReportDialog url={`${API_BASE}/api/sessions/${item.session_id}/report`} enabledMetrics={item.enabled_metrics}>
+                          <Button variant="outline" className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={12} /> 报告</Button>
+                        </PerformanceReportDialog>
                         <Button variant="outline" onClick={() => viewHistorySession(item)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
                       </div>
                     </div>

@@ -67,6 +67,7 @@ def smoke(archive: Path):
                     assert chosen != port, "Port fallback did not run"
                     page = fetch(url + "/").decode()
                     assert fetch(url + "/ui").decode() == page
+                    assert fetch(url + "/monkey").decode() == page
                     assert "/umami" not in page
                     assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', page)
                     assert len(assets) >= 2

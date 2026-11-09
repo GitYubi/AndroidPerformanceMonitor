@@ -144,6 +144,7 @@ def build() -> None:
     shutil.copytree(ROOT / "backend/app", STAGING / "backend/app",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.bak"))
     shutil.copytree(ROOT / "backend/vendor", STAGING / "backend/vendor")
+    shutil.copytree(ROOT / "tools/monkey", STAGING / "tools/monkey")
     shutil.copytree(ROOT / "dist/public", STAGING / "dist/public",
                     ignore=shutil.ignore_patterns("__manus__", ".gitkeep"))
     index = STAGING / "dist/public/index.html"

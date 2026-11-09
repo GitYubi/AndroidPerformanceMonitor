@@ -20,6 +20,8 @@ from .adb import (
     parse_cpuinfo,
     parse_gfxinfo_summary,
     parse_meminfo,
+    parse_proc_stat_cpu,
+    parse_proc_meminfo,
     parse_surface_latency_stats,
     parse_top,
     run_adb,
@@ -32,7 +34,7 @@ from .frame_sources import (
     SOURCE_LABELS,
     capture_frame_metrics,
 )
-from .models import ProcessSample, SamplePayload, StartSessionRequest
+from .models import ProcessSample, SamplePayload, StartSessionRequest, SystemMemorySample
 from .storage import SessionStore, SessionWriter
 
 # 项目根目录（backend/app 的上级的上级）：设备日志默认导出到 <root>/DevicesLogs
@@ -61,8 +63,15 @@ class RuntimeSession:
     # 异步内存采样：worker 完成后更新结果，不阻塞主采样循环
     memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
     memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
+    memory_updated_monotonic: float = 0
+    system_memory_task: asyncio.Task[SystemMemorySample] | None = None
+    system_memory_result: SystemMemorySample | None = None
+    system_memory_updated_monotonic: float = 0
     memory_detail_supported: bool | None = None
+    cpu_baseline: tuple[int, int] | None = None
+    cpu_proc_supported: bool | None = None
     preserve_device_logs: bool = False
+    inflight: set[asyncio.Task] = field(default_factory=set)
 
 
 # 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
@@ -76,8 +85,21 @@ class MonitorManager:
         self.store = SessionStore(data_root)
         self.active: dict[str, RuntimeSession] = {}
         self.ui_manager = None
+        self.reserved_by: str | None = None
+        self.start_lock = asyncio.Lock()
 
-    async def start(self, request: StartSessionRequest) -> str:
+    def reserve(self, owner: str) -> None:
+        if self.active or self.reserved_by or self.start_lock.locked():
+            raise ValueError("已有性能采样或 Monkey 任务，请先停止当前任务")
+        self.reserved_by = owner
+
+    async def start(self, request: StartSessionRequest, *, owner: str | None = None) -> str:
+        async with self.start_lock:
+            if self.reserved_by and owner != self.reserved_by:
+                raise ValueError("性能采样由 Monkey 管理，请在 Monkey 页面停止任务")
+            return await self._start(request)
+
+    async def _start(self, request: StartSessionRequest) -> str:
         if self.active:
             raise ValueError("已有测试会话运行中；请先停止当前会话")
         devices = await list_devices()
@@ -101,6 +123,7 @@ class MonitorManager:
             "surface_layer": request.surface_layer,
             "sdk_version": sdk_version,
             "app_version": "0.2.0",
+            "owner": self.reserved_by,
         }
         writer = self.store.create_session(session_id, metadata)
         runtime = RuntimeSession(
@@ -116,7 +139,9 @@ class MonitorManager:
         runtime.task = asyncio.create_task(self._run(runtime), name=f"monitor-{session_id}")
         return session_id
 
-    async def stop(self, session_id: str) -> None:
+    async def stop(self, session_id: str, *, owner: str | None = None) -> None:
+        if self.reserved_by and owner != self.reserved_by:
+            raise ValueError("性能采样由 Monkey 管理，请在 Monkey 页面停止任务")
         runtime = self.active.get(session_id)
         if runtime is None:
             session = self.store.get_session(session_id)
@@ -151,7 +176,7 @@ class MonitorManager:
                 payload = await self._capture_once(runtime)
                 runtime.sample_cycle += 1
                 runtime.writer.write_sample(payload)
-                next_tick += interval_seconds
+                next_tick = max(next_tick + interval_seconds, time.monotonic() + min(0.1, interval_seconds / 10))
                 delay = max(0.0, next_tick - time.monotonic())
                 try:
                     await asyncio.wait_for(runtime.stop_event.wait(), timeout=delay)
@@ -166,8 +191,13 @@ class MonitorManager:
             final_state = "failed"
             runtime.writer.add_event("error", "runtime_failure", str(exc))
         finally:
-            if runtime.memory_task is not None and not runtime.memory_task.done():
-                runtime.memory_task.cancel()
+            pending = list(runtime.inflight)
+            for memory_task in [runtime.memory_task, runtime.system_memory_task]:
+                if memory_task is not None and memory_task not in pending:
+                    pending.append(memory_task)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
             if runtime.request.log_export_enabled():
                 try:
                     await self._export_device_logs(runtime)
@@ -175,6 +205,20 @@ class MonitorManager:
                     runtime.writer.add_event("warning", "log_export_failed", f"设备日志导出异常：{exc}")
             runtime.writer.finish(final_state)
             self.active.pop(runtime.session_id, None)
+
+    def _spawn(self, runtime: RuntimeSession, coroutine) -> asyncio.Task:
+        task = asyncio.create_task(coroutine)
+        runtime.inflight.add(task)
+        def settled(done):
+            runtime.inflight.discard(done)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(settled)
+        return task
+
+    async def close(self) -> None:
+        for session_id in list(self.active):
+            await self.stop(session_id, owner=self.reserved_by)
 
     async def _export_device_logs(self, runtime: RuntimeSession) -> None:
         """会话结束（停止/自然到期）后拉取并清理车机日志。"""
@@ -205,16 +249,17 @@ class MonitorManager:
         pss_kb: int | None = None
         rss_kb: int | None = None
         total_ram_kb: int | None = None
+        system_memory = SystemMemorySample()
         frame_stats: FrameStats | None = None
         app_render_fps: float | None = None
         app_jank_pct: float | None = None
         process_sets: list[list[ProcessSample]] = []
         jobs: list[tuple[str, asyncio.Task[object]]] = []
         if runtime.request.metrics.cpu:
-            jobs.append(("cpu", asyncio.create_task(self._capture_cpu(runtime.request.serial))))
+            jobs.append(("cpu", self._spawn(runtime, self._capture_cpu(runtime))))
         # 前台包名缓存刷新（dumpsys activity 每 FOREGROUND_REFRESH_CYCLES 周期一次；
         # 首周期立即刷新，避免缓存初始为 None 导致 render 链路误报）
-        if runtime.foreground_checked_cycle < 0 or runtime.sample_cycle - runtime.foreground_checked_cycle >= FOREGROUND_REFRESH_CYCLES:
+        if runtime.request.metrics.fps and (runtime.foreground_checked_cycle < 0 or runtime.sample_cycle - runtime.foreground_checked_cycle >= FOREGROUND_REFRESH_CYCLES):
             try:
                 runtime.foreground_package = await get_foreground_package(runtime.request.serial)
             except AdbError:
@@ -224,18 +269,35 @@ class MonitorManager:
         # 主循环不等待——全量 meminfo 在部分车机耗时数秒，异步化后
         # CPU/FPS 周期严格按 interval 落点，内存值以最近一次完成结果更新。
         if runtime.request.metrics.memory:
+            # Lightweight /proc sampling shares the configured memory cadence but
+            # completes independently of a slow or unsupported dumpsys meminfo.
+            if runtime.system_memory_task is not None and runtime.system_memory_task.done():
+                try:
+                    runtime.system_memory_result = runtime.system_memory_task.result()
+                    runtime.system_memory_updated_monotonic = time.monotonic()
+                    if runtime.system_memory_result.memory_used_pct is None:
+                        self._record_error_once(runtime, "mem_available_unavailable", "未取得有效的 MemTotal / MemAvailable；系统内存率不使用 PSS 或 MemFree 推算。")
+                except Exception as exc:
+                    self._record_error_once(runtime, "system_memory_adb", f"系统内存读取失败：{exc}")
+                runtime.system_memory_task = None
+            if runtime.sample_cycle % runtime.request.memory_cycle_skip == 0 and runtime.system_memory_task is None:
+                runtime.system_memory_task = self._spawn(runtime, self._capture_system_memory(runtime.request.serial))
+            if runtime.system_memory_result is not None and time.monotonic() - runtime.system_memory_updated_monotonic <= max(30, runtime.request.interval_ms / 1000 * runtime.request.memory_cycle_skip * 3):
+                system_memory = runtime.system_memory_result
+            statuses["system_memory"] = "ok" if system_memory.memory_used_pct is not None else "unavailable"
             fresh_memory_processes: list[ProcessSample] | None = None
             if runtime.memory_task is not None and runtime.memory_task.done():
                 try:
                     runtime.memory_result = runtime.memory_task.result()
+                    runtime.memory_updated_monotonic = time.monotonic()
                     fresh_memory_processes = runtime.memory_result[3]
                     statuses["memory"] = "ok"
                 except (AdbError, Exception) as exc:
                     self._record_error_once(runtime, "memory_adb", f"内存采样失败：{exc}")
                 runtime.memory_task = None
             if runtime.sample_cycle % runtime.request.memory_cycle_skip == 0 and runtime.memory_task is None:
-                runtime.memory_task = asyncio.create_task(self._capture_memory(runtime))
-            if runtime.memory_result is not None:
+                runtime.memory_task = self._spawn(runtime, self._capture_memory(runtime))
+            if runtime.memory_result is not None and time.monotonic() - runtime.memory_updated_monotonic <= max(30, runtime.request.interval_ms / 1000 * runtime.request.memory_cycle_skip * 3):
                 pss_kb, rss_kb, total_ram_kb, processes = runtime.memory_result
                 # 一级内存值可沿用最近快照；进程明细只在快照实际完成时写一次，
                 # 避免同一结果随主循环重复入库。
@@ -244,8 +306,10 @@ class MonitorManager:
                     if not any(item.uss_kb is not None for item in fresh_memory_processes):
                         self._record_error_once(runtime, "uss_unavailable", "当前设备未提供应用 USS 明细；整机 PSS 采样不受影响。")
         if runtime.request.metrics.fps:
-            jobs.append(("fps", asyncio.create_task(self._capture_fps(runtime))))
-            jobs.append(("render", asyncio.create_task(self._capture_app_render(runtime))))
+            frame_output: list[str] = []
+            fps_job = self._spawn(runtime, self._capture_fps(runtime, frame_output))
+            jobs.append(("fps", fps_job))
+            jobs.append(("render", self._spawn(runtime, self._capture_app_render(runtime, fps_job, frame_output))))
         for metric, job in jobs:
             try:
                 result = await job
@@ -280,6 +344,10 @@ class MonitorManager:
             pss_kb=pss_kb,
             rss_kb=rss_kb,
             total_ram_kb=total_ram_kb,
+            mem_total_kb=system_memory.mem_total_kb,
+            mem_available_kb=system_memory.mem_available_kb,
+            mem_used_kb=system_memory.mem_used_kb,
+            memory_used_pct=system_memory.memory_used_pct,
             fps=frame_stats.fps if frame_stats else None,
             app_render_fps=app_render_fps,
             app_jank_pct=app_jank_pct,
@@ -295,19 +363,28 @@ class MonitorManager:
             processes=merge_processes(*process_sets),
         )
 
-    async def _capture_app_render(self, runtime: RuntimeSession) -> tuple[float | None, float | None]:
+    async def _capture_app_render(self, runtime: RuntimeSession, fps_job: asyncio.Task | None = None, frame_output: list[str] | None = None) -> tuple[float | None, float | None]:
         package = runtime.foreground_package
         if not package:
             raise AdbError("无法识别当前前台应用包名")
         # 窗口起点取命令执行前：车机上 adb 命令耗时可达 1-2s，
         # 若取命令完成时刻会拉长窗口、低估渲染帧率。
         now = time.monotonic()
-        output = await run_adb("shell", "dumpsys", "gfxinfo", package, serial=runtime.request.serial, timeout_seconds=7)
-        counters = parse_gfxinfo_summary(output)
+        if fps_job is not None:
+            try:
+                await fps_job
+            except Exception:
+                pass  # 逐帧采集失败时仍独立尝试摘要。
+        counters = parse_gfxinfo_summary(frame_output[0]) if frame_output else None
+        if counters is None:
+            output = await run_adb("shell", "dumpsys", "gfxinfo", package, serial=runtime.request.serial, timeout_seconds=7)
+            counters = parse_gfxinfo_summary(output)
         if counters is None:
             return None, None
         total_frames, janky_frames = counters
         previous = runtime.render_baselines.get(package)
+        if previous is None and len(runtime.render_baselines) >= 64:
+            runtime.render_baselines.pop(next(iter(runtime.render_baselines)))
         runtime.render_baselines[package] = (total_frames, janky_frames, now)
         if previous is None:
             runtime.writer.add_event("info", "render_fps_warmup", f"开始采集 {package} 的 gfxinfo 增量帧统计")
@@ -331,13 +408,43 @@ class MonitorManager:
             runtime.writer.add_event("warning", code, message)
             runtime.reported_error_codes.add(code)
 
-    async def _capture_cpu(self, serial: str) -> tuple[float | None, list[ProcessSample]]:
-        top_output, cpuinfo_output = await asyncio.gather(
-            run_adb("shell", "top", "-b", "-n", "1", serial=serial, timeout_seconds=6),
+    async def _capture_cpu(self, runtime: RuntimeSession) -> tuple[float | None, list[ProcessSample]]:
+        serial = runtime.request.serial
+        if runtime.cpu_proc_supported is False:
+            top_output = await run_adb("shell", "top", "-b", "-n", "1", serial=serial, timeout_seconds=6)
+            return parse_top(top_output)
+
+        stat_output, cpuinfo_output = await asyncio.gather(
+            run_adb("shell", "cat", "/proc/stat", serial=serial, timeout_seconds=6),
             run_adb("shell", "dumpsys", "cpuinfo", serial=serial, timeout_seconds=6),
+            return_exceptions=True,
         )
-        total, top_processes = parse_top(top_output)
-        return total, merge_processes(top_processes, parse_cpuinfo(cpuinfo_output))
+        current = parse_proc_stat_cpu(stat_output) if isinstance(stat_output, str) else None
+        if current is None:
+            runtime.cpu_proc_supported = False
+            self._record_error_once(runtime, "cpu_proc_unavailable", "无法读取 /proc/stat，已回退到 top 采集 CPU。")
+            top_output = await run_adb("shell", "top", "-b", "-n", "1", serial=serial, timeout_seconds=6)
+            return parse_top(top_output)
+
+        runtime.cpu_proc_supported = True
+        previous = runtime.cpu_baseline
+        runtime.cpu_baseline = current
+        total = None
+        if previous is not None:
+            elapsed = current[0] - previous[0]
+            idle = current[1] - previous[1]
+            if elapsed > 0 and 0 <= idle <= elapsed:
+                total = round((elapsed - idle) / elapsed * 100, 2)
+        if isinstance(cpuinfo_output, str):
+            processes = parse_cpuinfo(cpuinfo_output)
+        else:
+            processes = []
+            self._record_error_once(runtime, "cpu_process_unavailable", "进程 CPU 采集失败，整机 CPU 仍使用 /proc/stat。")
+        return total, processes
+
+    async def _capture_system_memory(self, serial: str) -> SystemMemorySample:
+        output = await run_adb("shell", "cat", "/proc/meminfo", serial=serial, timeout_seconds=5)
+        return parse_proc_meminfo(output)
 
     async def _capture_memory(self, runtime: RuntimeSession) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:
         # 内存已异步化，超时放宽到 15s（部分车机全量 meminfo 在负载下可达 8s+）；
@@ -364,10 +471,11 @@ class MonitorManager:
         runtime.memory_detail_supported = False
         output = await run_adb("shell", "dumpsys", "meminfo", serial=runtime.request.serial, timeout_seconds=15)
         return parse_meminfo(output)
-    async def _capture_fps(self, runtime: RuntimeSession) -> FrameStats | None:
+    async def _capture_fps(self, runtime: RuntimeSession, frame_output: list[str] | None = None) -> FrameStats | None:
         """按版本与可用性自动选择逐帧数据源，全部失败时回退 SF --latency。"""
         package = runtime.foreground_package
-        per_frame = await capture_frame_metrics(runtime.request.serial, package, runtime.sdk_version, runtime.frame_source_cooldowns)
+        per_frame = await capture_frame_metrics(runtime.request.serial, package, runtime.sdk_version, runtime.frame_source_cooldowns,
+                                                on_framestats=frame_output.append if frame_output is not None else None)
         if per_frame is not None:
             self._switch_frame_source(runtime, per_frame.source)
             return per_frame

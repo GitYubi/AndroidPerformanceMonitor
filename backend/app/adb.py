@@ -13,7 +13,7 @@ import statistics
 from dataclasses import dataclass
 from typing import Iterable
 
-from .models import ProcessSample
+from .models import ProcessSample, SystemMemorySample
 
 
 class AdbError(RuntimeError):
@@ -84,6 +84,14 @@ async def run_adb(
             stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+    except asyncio.CancelledError:
+        if "process" in locals() and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            await process.communicate()
+        raise
     except TimeoutError as exc:
         if "process" in locals() and process.returncode is None:
             process.kill()
@@ -211,6 +219,20 @@ def parse_cpuinfo(output: str) -> list[ProcessSample]:
     return processes
 
 
+def parse_proc_stat_cpu(output: str) -> tuple[int, int] | None:
+    """返回 /proc/stat 的累计总 CPU 和空闲时钟，不重复计入 guest。"""
+    line = next((line for line in output.splitlines() if line.startswith("cpu ")), None)
+    if line is None:
+        return None
+    try:
+        counters = [int(value) for value in line.split()[1:]]
+    except ValueError:
+        return None
+    if len(counters) < 4 or any(value < 0 for value in counters):
+        return None
+    return sum(counters[:8]), counters[3] + (counters[4] if len(counters) > 4 else 0)
+
+
 def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample]:
     """按 PID/进程名合并多源采样，保留各指标中较可信的非空值。"""
 
@@ -235,6 +257,19 @@ def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample
             existing.rss_kb = item.rss_kb if item.rss_kb is not None else existing.rss_kb
             existing.uss_kb = item.uss_kb if item.uss_kb is not None else existing.uss_kb
     return list(merged.values())
+
+
+def parse_proc_meminfo(output: str) -> SystemMemorySample:
+    """Use one kernel snapshot and never substitute MemFree or PSS for MemAvailable."""
+    fields = {name: int(value) for name, value in re.findall(
+        r"^(MemTotal|MemAvailable):\s*(\d+)\s+kB\s*$", output, flags=re.MULTILINE)}
+    total, available = fields.get("MemTotal"), fields.get("MemAvailable")
+    result = SystemMemorySample(mem_total_kb=total if total and total > 0 else None,
+                                mem_available_kb=available)
+    if result.mem_total_kb is not None and available is not None and 0 <= available <= total:
+        result.mem_used_kb = total - available
+        result.memory_used_pct = result.mem_used_kb / total * 100
+    return result
 
 
 def parse_meminfo(output: str) -> tuple[int | None, int | None, int | None, list[ProcessSample]]:

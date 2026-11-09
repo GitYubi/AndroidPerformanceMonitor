@@ -14,6 +14,17 @@ from typing import Any
 
 from .models import SamplePayload
 
+SYSTEM_MEMORY_COLUMNS = {"mem_total_kb": "INTEGER", "mem_available_kb": "INTEGER",
+                         "mem_used_kb": "INTEGER", "memory_used_pct": "REAL"}
+
+
+def ensure_system_memory_columns(connection: sqlite3.Connection) -> None:
+    """Upgrade owned Monkey aggregate databases; historical values remain NULL."""
+    existing = {row[1] for row in connection.execute("PRAGMA table_info(sample)")}
+    for name, kind in SYSTEM_MEMORY_COLUMNS.items():
+        if name not in existing:
+            connection.execute(f"ALTER TABLE sample ADD COLUMN {name} {kind}")
+
 
 class SessionWriter:
     """运行中会话的单写入器；只保留 SQLite 连接，不缓存历史采样。"""
@@ -25,11 +36,12 @@ class SessionWriter:
     def write_sample(self, payload: SamplePayload) -> None:
         cursor = self.connection.execute(
             """
-            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, total_ram_kb, fps, app_render_fps,
+            INSERT INTO sample (ts_ms, cpu_total_pct, pss_kb, rss_kb, total_ram_kb,
+                                mem_total_kb, mem_available_kb, mem_used_kb, memory_used_pct, fps, app_render_fps,
                                 app_jank_pct, frame_source, frame_count, jank_count, jank_pct,
                                 avg_frame_time_ms, p95_frame_time_ms, p99_frame_time_ms, input_latency_ms,
                                 raw_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 payload.ts_ms,
@@ -37,6 +49,10 @@ class SessionWriter:
                 payload.pss_kb,
                 payload.rss_kb,
                 payload.total_ram_kb,
+                payload.mem_total_kb,
+                payload.mem_available_kb,
+                payload.mem_used_kb,
+                payload.memory_used_pct,
                 payload.fps,
                 payload.app_render_fps,
                 payload.app_jank_pct,
@@ -107,6 +123,9 @@ def _calculate_summary(connection: sqlite3.Connection) -> dict[str, Any]:
         "cpu": ("cpu_total_pct", "pct"),
         "memory_pss": ("pss_kb", "kb"),
         "memory_rss": ("rss_kb", "kb"),
+        "memory_used_pct": ("memory_used_pct", "pct"),
+        "memory_used": ("mem_used_kb", "kb"),
+        "memory_available": ("mem_available_kb", "kb"),
         "fps": ("fps", "fps"),
         "app_render_fps": ("app_render_fps", "fps"),
         "app_jank_pct": ("app_jank_pct", "pct"),
@@ -196,6 +215,10 @@ class SessionStore:
                 pss_kb INTEGER,
                 rss_kb INTEGER,
                 total_ram_kb INTEGER,
+                mem_total_kb INTEGER,
+                mem_available_kb INTEGER,
+                mem_used_kb INTEGER,
+                memory_used_pct REAL,
                 fps REAL,
                 app_render_fps REAL,
                 app_jank_pct REAL,
@@ -286,6 +309,7 @@ class SessionStore:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(sample)").fetchall()}
             column = lambda name: name if name in columns else f"NULL AS {name}"  # noqa: E731
             select = f"""SELECT ts_ms, cpu_total_pct, pss_kb, rss_kb, {column("total_ram_kb")},
+                                {column("mem_total_kb")}, {column("mem_available_kb")}, {column("mem_used_kb")}, {column("memory_used_pct")},
                                 {column("app_render_fps")}, {column("app_jank_pct")}, fps,
                                 {column("frame_source")}, {column("frame_count")}, {column("jank_count")},
                                 {column("jank_pct")}, {column("avg_frame_time_ms")}, {column("p95_frame_time_ms")},
@@ -377,6 +401,7 @@ class SessionStore:
         output = io.StringIO()
         fieldnames = [
             "ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "total_ram_kb",
+            "mem_total_kb", "mem_available_kb", "mem_used_kb", "memory_used_pct",
             "app_render_fps", "app_jank_pct", "fps",
             "frame_source", "frame_count", "jank_count", "jank_pct",
             "avg_frame_time_ms", "p95_frame_time_ms", "p99_frame_time_ms", "input_latency_ms",

@@ -22,10 +22,21 @@ USB 驱动取决于车机厂商；若设备不出现，请安装厂商驱动并�
 数据都保存在解压目录：
   backend\data       性能会话与历史数据
   backend\ui-data    UI 用例、页面地图、配置与报告
+  backend\monkey-data Monkey 任务、小时及全程 CSV、合并 SQLite、统计 JSON 与轮转日志
   DevicesLogs        车机日志导出（未指定其他目录时）
   logs\launcher.log  启动诊断日志
 
-升级时先停止旧版本，将 backend\data、backend\ui-data、DevicesLogs 复制到新版本。
+升级时先停止旧版本，将 backend\data、backend\ui-data、backend\monkey-data、DevicesLogs 复制到新版本。
+
+Monkey 压测：从顶部“Monkey 压测”进入，支持黑名单、白名单、无名单和事件比例配置。
+系统内存占用率使用 (MemTotal - MemAvailable) / MemTotal × 100%，保留 PSS 作进程分析。
+旧数据或设备没有可用的 MemAvailable 时显示未记录，不使用 PSS 推算系统内存率。
+时长支持持续执行、1–24 小时预设及自定义整小时；启动后自动采集 CPU 和内存。
+每小时导出一份 CSV，结束保存不足一小时的末段，生成全程 CSV、合并 SQLite 和 JSON 统计。
+结束后可点击“导出全程性能图”，在报告中保存 PNG；USS 曲线默认收起，点击包名可展开。
+性能报告按需生成。执行期间从 Monkey 页面停止任务。
+默认 CPU 每 2 秒、内存约每 10 秒读取一次，FPS 默认关闭；日志最多两份各 8 MiB。
+设备失去上位机心跳约 90 秒后会停止输入，低磁盘空间自动停止并保留原始数据。
 UI 配置可能包含 API Key，备份和分享这些数据时请自行妥善保管。
 可直接复制整个文件夹到其他电脑；本包不包含开发机历史数据或密钥。
 

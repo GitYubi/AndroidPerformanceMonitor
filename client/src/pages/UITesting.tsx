@@ -1,3 +1,4 @@
+import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
 import { BACKEND_URL } from "@/lib/backend";
 import PageMapWorkbench from "@/components/PageMapWorkbench";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -860,14 +861,9 @@ export default function UITesting() {
                     </p>
                   )}
                   {run.performanceSessionId && (
-                    <a
-                      className="block underline"
-                      target="_blank"
-                      rel="noreferrer"
-                      href={`${API}/api/sessions/${run.performanceSessionId}/report`}
-                    >
-                      查看关联性能报告
-                    </a>
+                    <PerformanceReportDialog url={`${API}/api/sessions/${run.performanceSessionId}/report`}>
+                      <button type="button" className="block underline">查看关联性能报告</button>
+                    </PerformanceReportDialog>
                   )}
                   {run.report && (
                     <a
