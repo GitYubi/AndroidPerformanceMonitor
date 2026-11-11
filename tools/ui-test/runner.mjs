@@ -1,8 +1,13 @@
-import { readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { readFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { execFileSync } from "node:child_process";
 import { loadConfig } from "./config.mjs";
-import { validateJob, executeStep, substitute } from "./protocol.mjs";
+import { captureElement } from "./element-capture.mjs";
+import {
+  validateJob,
+  executeStep,
+  requiresModel,
+  substitute,
+} from "./protocol.mjs";
 
 // stdout is exclusively JSONL. SDK diagnostics may contain prompts/credentials.
 const emit = event =>
@@ -46,15 +51,21 @@ try {
     },
     Math.min(3600, Math.max(10, job.timeoutSeconds || 900)) * 1000
   );
-  const needsModel = job.testCase.steps.some(
-    s =>
-      s.enabled !== false &&
-      (["action", "input", "wait", "assert"].includes(s.type) ||
-        (s.type === "tap" && !s.selector) ||
-        (s.type === "explore" && s.exploration?.visualAssertion))
-  );
+  const enabled = job.testCase.steps.filter(step => step.enabled !== false);
+  const needsModel = enabled.some(requiresModel);
   if (needsModel && !process.env.MIDSCENE_MODEL_API_KEY?.trim())
     throw new Error("缺少 MIDSCENE_MODEL_API_KEY，请在本机配置");
+  const baselineDir = job.baselineDir ? resolve(job.baselineDir) : null;
+  const baselinePath = id => resolve(baselineDir, `${id}.png`);
+  for (const step of enabled.filter(step => step.type === "image_assert")) {
+    const file =
+      baselineDir &&
+      statSync(baselinePath(step.options.baselineId), {
+        throwIfNoEntry: false,
+      });
+    if (!file || !file.isFile() || file.size > 8 * 1024 * 1024)
+      throw new Error("步骤图像断言缺少有效的 PNG 基准图");
+  }
   const root = resolve(job.outputDir || "midscene_run");
   mkdirSync(root, { recursive: true });
   process.chdir(root);
@@ -136,6 +147,28 @@ try {
         process.exit(124);
       }, step.timeoutMs);
       try {
+        let capturedImage;
+        let message;
+        const execute = () =>
+          executeStep(agent, step, job.parameters || {}, treeDevice, {
+            captureImage: async () =>
+              (capturedImage ??= await treeDevice.screenshot()),
+            captureElement: selector =>
+              captureElement(
+                job.pythonExecutable ||
+                  (process.platform === "win32" ? "python" : "python3"),
+                job.serial,
+                selector,
+                step.timeoutMs
+              ),
+            onImage: image => {
+              capturedImage = image;
+            },
+            loadBaseline: id => readFileSync(baselinePath(id)),
+            onResult: text => {
+              message = text;
+            },
+          });
         const result = ["explore", "scan"].includes(step.type)
           ? await exploreTree(agent, treeDevice, step, event => {
               const { tree, ...summary } = event;
@@ -151,33 +184,30 @@ try {
           : navigation && step.type === "action"
             ? await navigation.run(
                 substitute(step.prompt, job.parameters || {}),
-                () =>
-                  executeStep(agent, step, job.parameters || {}, treeDevice),
+                execute,
                 name =>
                   agent.aiBoolean(
                     `当前是否已到达用户要求的“${name}”页面？只检查当前画面，不执行操作。`
                   )
               )
-            : await executeStep(agent, step, job.parameters || {}, treeDevice);
+            : await execute();
         let screenshot;
-        if (!sensitive) {
+        if (!sensitive && (step.type !== "image_assert" || capturedImage)) {
           try {
             screenshot = `${step.id}.png`;
-            const png = execFileSync(
-              "adb",
-              ["-s", job.serial, "exec-out", "screencap", "-p"],
-              {
-                timeout: 10000,
-                maxBuffer: 32 * 1024 * 1024,
-                stdio: ["ignore", "pipe", "ignore"],
-              }
-            );
+            const png = capturedImage ?? (await treeDevice.screenshot());
             writeFileSync(resolve(root, screenshot), png);
           } catch {
             screenshot = undefined;
           }
         }
-        emit({ type: "step", stepId: step.id, state: result, screenshot });
+        emit({
+          type: "step",
+          stepId: step.id,
+          state: result,
+          screenshot,
+          message,
+        });
         return result;
       } catch {
         // Never echo SDK errors, which can include raw input or authorization headers.

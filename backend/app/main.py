@@ -22,6 +22,7 @@ from .ui_testing import UIManager, router as ui_router
 from .ui_map import MapStore, router as map_router
 from .ui_stream import router as stream_router
 from .monkey import MonkeyManager, router as monkey_router
+from .can_service import CanService, router as can_router
 
 
 DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
@@ -29,6 +30,7 @@ DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    app.state.can = CanService()
     manager = MonitorManager(DATA_ROOT)
     manager.store.recover_interrupted_sessions()
     app.state.manager = manager
@@ -42,6 +44,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await __import__("asyncio").to_thread(app.state.can.close)
         await app.state.monkey.close()
         await manager.close()
         await app.state.ui.close()
@@ -52,6 +55,7 @@ app.include_router(ui_router)
 app.include_router(map_router)
 app.include_router(stream_router)
 app.include_router(monkey_router)
+app.include_router(can_router)
 app.add_middleware(
     CORSMiddleware,
     # 前端 dev server 可能落在 localhost 任意端口（3000 被占用时自动顺延），

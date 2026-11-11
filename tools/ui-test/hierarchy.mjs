@@ -105,16 +105,21 @@ export function selectorFor(node) {
     label: node.label,
   };
 }
-export function resolveSelector(tree, selector) {
+export function matchingNodes(tree, selector) {
   const fields = ["package", "className", "resourceId", "label"];
   if (!fields.some(key => selector[key])) throw new Error("缺少结构定位条件");
-  const matches = tree.nodes.filter(
+  return tree.nodes.filter(node =>
+    fields.every(key => !selector[key] || node[key] === selector[key])
+  );
+}
+
+export function resolveSelector(tree, selector) {
+  const matches = matchingNodes(tree, selector).filter(
     n =>
       n.enabled &&
       n.bounds &&
       n.bounds[2] > n.bounds[0] &&
-      n.bounds[3] > n.bounds[1] &&
-      fields.every(key => !selector[key] || n[key] === selector[key])
+      n.bounds[3] > n.bounds[1]
   );
   if (matches.length !== 1) throw new Error("控件结构定位不唯一或控件已消失");
   return matches[0];
@@ -156,23 +161,39 @@ export function createTreeDevice(serial) {
     }
     throw new Error("页面结构尚未稳定");
   }
+  async function screenshot() {
+    const { stdout } = await exec(
+      "adb",
+      ["-s", serial, "exec-out", "screencap", "-p"],
+      { encoding: "buffer", timeout: 10000, maxBuffer: 32 * 1024 * 1024 }
+    );
+    if (
+      stdout.length < 33 ||
+      stdout.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a"
+    )
+      throw new Error("ADB 截图无效");
+    return stdout;
+  }
   return {
     read,
+    screenshot,
     async physicalSize() {
-      const { stdout } = await exec(
-        "adb",
-        ["-s", serial, "exec-out", "screencap", "-p"],
-        { encoding: "buffer", timeout: 10000, maxBuffer: 32 * 1024 * 1024 }
-      );
-      if (
-        stdout.length < 24 ||
-        stdout.subarray(0, 8).toString("hex") !== "89504e470d0a1a0a"
-      )
-        throw new Error("截图尺寸不可用");
+      const png = await screenshot();
       return {
-        width: stdout.readUInt32BE(16),
-        height: stdout.readUInt32BE(20),
+        width: png.readUInt32BE(16),
+        height: png.readUInt32BE(20),
       };
+    },
+    async tapCoordinates({ x, y }) {
+      await adb(["shell", "input", "tap", String(x), String(y)]);
+    },
+    async swipeCoordinates({ startX, startY, endX, endY, durationMs }) {
+      await adb([
+        "shell",
+        "input",
+        "swipe",
+        ...[startX, startY, endX, endY, durationMs].map(String),
+      ]);
     },
     async tap(selector, validate = () => {}) {
       const tree = await read();

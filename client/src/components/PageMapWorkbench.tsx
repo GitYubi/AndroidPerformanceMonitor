@@ -1,38 +1,13 @@
 import { BACKEND_URL } from "@/lib/backend";
+import {
+  nodesAtPoint,
+  type MapNode as Node,
+  type Observation,
+} from "@/lib/uiObservation";
 import ScrcpyScreen, { type ScrcpyHandle } from "./ScrcpyScreen";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 const API = BACKEND_URL;
-type Node = {
-  index: number;
-  parent: number | null;
-  children: number[];
-  label: string;
-  text: string;
-  description: string;
-  resourceId: string;
-  xpath: string;
-  className: string;
-  package: string;
-  bounds: number[] | null;
-  clickable: boolean;
-  enabled: boolean;
-  checkable: boolean;
-  checked: boolean;
-};
-type Observation = {
-  id: string;
-  serial: string;
-  image: string;
-  width: number;
-  height: number;
-  nodes: Node[];
-  capturedAt: number;
-  signature: string;
-  identity?: string;
-  geometry: string;
-  rotation: string;
-};
 type App = { id: string; name: string; package: string | null };
 type Page = {
   entry?: {
@@ -310,24 +285,7 @@ export default function PageMapWorkbench() {
       setFrame(o);
       const x = rx * o.width,
         y = ry * o.height;
-      const list = o.nodes
-        .filter(n => {
-          const b = n.bounds;
-          return (
-            b &&
-            b[2] > b[0] &&
-            b[3] > b[1] &&
-            x >= b[0] &&
-            x < b[2] &&
-            y >= b[1] &&
-            y < b[3]
-          );
-        })
-        .sort(
-          (a, b) =>
-            (a.bounds![2] - a.bounds![0]) * (a.bounds![3] - a.bounds![1]) -
-            (b.bounds![2] - b.bounds![0]) * (b.bounds![3] - b.bounds![1])
-        );
+      const list = nodesAtPoint(o, x, y);
       setCandidates(list);
       if (!list.length) {
         setPick(null);

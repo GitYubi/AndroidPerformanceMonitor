@@ -2,19 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
 import re
 import signal
 import sqlite3
+import struct
+import sys
 import time
 import uuid
 import zipfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -48,10 +51,68 @@ class Selector(BaseModel):
     label: str = Field(default='', max_length=2000)
 
 
+class TapCoordinates(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    x: int = Field(ge=0, le=32767, strict=True)
+    y: int = Field(ge=0, le=32767, strict=True)
+
+
+class SwipeCoordinates(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    startX: int = Field(ge=0, le=32767, strict=True)
+    startY: int = Field(ge=0, le=32767, strict=True)
+    endX: int = Field(ge=0, le=32767, strict=True)
+    endY: int = Field(ge=0, le=32767, strict=True)
+    durationMs: int = Field(default=300, ge=1, le=10000, strict=True)
+
+
+class ElementCheck(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected: Literal['exists', 'absent', 'enabled', 'disabled', 'checked', 'unchecked'] = 'exists'
+
+
+class ImageRegion(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    left: int = Field(ge=0, le=32767, strict=True)
+    top: int = Field(ge=0, le=32767, strict=True)
+    right: int = Field(ge=0, le=32767, strict=True)
+    bottom: int = Field(ge=0, le=32767, strict=True)
+
+    @model_validator(mode='after')
+    def validate_corners(self):
+        if self.left >= self.right or self.top >= self.bottom:
+            raise ValueError('ROI 右下角必须在左上角的右下方')
+        return self
+
+
+class ImageCheck(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    baselineId: str = Field(pattern=r'^[a-f0-9]{64}$')
+    minSimilarity: float = Field(default=99, ge=0, le=100)
+    pixelTolerance: int = Field(default=16, ge=0, le=255, strict=True)
+    mode: Literal['screen', 'element', 'roi'] = 'screen'
+    roi: ImageRegion | None = None
+
+    @model_validator(mode='after')
+    def validate_region(self):
+        if (self.mode == 'roi') != (self.roi is not None):
+            raise ValueError('ROI 模式需要填写截图区域的四个坐标')
+        return self
+
+
+STEP_OPTIONS = {
+    'adb_tap': TapCoordinates,
+    'adb_swipe': SwipeCoordinates,
+    'element_assert': ElementCheck,
+    'image_assert': ImageCheck,
+}
+
+
 class Step(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=NAME)
-    type: Literal['action', 'tap', 'input', 'wait', 'assert', 'screenshot', 'explore', 'scan', 'settings', 'back']
+    type: Literal['action', 'tap', 'input', 'wait', 'assert', 'screenshot', 'explore', 'scan', 'settings', 'back',
+                  'adb_tap', 'adb_swipe', 'element_assert', 'image_assert']
     prompt: str = Field(min_length=1, max_length=8000)
     value: str = Field(default='', max_length=8000)
     timeoutMs: int = Field(default=60000, ge=1000, le=300000)
@@ -59,11 +120,21 @@ class Step(BaseModel):
     onFailure: Literal['stop', 'continue'] = 'stop'
     exploration: ExploreScope | None = None
     selector: Selector | None = None
+    options: TapCoordinates | SwipeCoordinates | ElementCheck | ImageCheck | None = None
 
     @model_validator(mode='after')
-    def validate_exploration(self):
-        if self.selector and (self.type != 'tap' or not any(self.selector.model_dump().values())):
-            raise ValueError('结构定位条件仅用于点击步骤且不能为空')
+    def validate_step(self):
+        element_image = isinstance(self.options, ImageCheck) and self.options.mode == 'element'
+        if self.selector and (not (self.type in {'tap', 'element_assert'} or element_image)
+                              or not any(v.strip() for v in self.selector.model_dump().values())):
+            raise ValueError('结构定位条件不能为空且须适用于该步骤')
+        if (self.type == 'element_assert' or element_image) and self.selector is None:
+            raise ValueError('请至少填写一个元素定位条件')
+        options_model = STEP_OPTIONS.get(self.type)
+        if options_model and not isinstance(self.options, options_model):
+            raise ValueError('步骤缺少对应的参数')
+        if not options_model and self.options is not None:
+            raise ValueError('该步骤类型不使用结构化参数')
         if self.type in {'explore', 'scan'}:
             if not self.exploration or any(not name.strip() or len(name) > 200 for name in self.exploration.allowedControls):
                 raise ValueError('探索步骤需要有效的范围配置')
@@ -140,6 +211,7 @@ class UIStore:
         self.root = root
         root.mkdir(parents=True, exist_ok=True)
         self.db = root / 'ui.db'
+        self.baselines = root / 'baselines'
         with self.connect() as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
             conn.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
@@ -148,6 +220,12 @@ class UIStore:
 
     def connect(self):
         return sqlite3.connect(self.db, timeout=10)
+
+    def validate_baselines(self, test_case: TestCase):
+        for step in test_case.steps:
+            if isinstance(step.options, ImageCheck):
+                if not (self.baselines / f'{step.options.baselineId}.png').is_file():
+                    raise ValueError('图像断言的基准图不存在，请重新上传')
 
     def all(self, table: str):
         with self.connect() as conn:
@@ -312,6 +390,7 @@ class UIManager:
                 raise ValueError('请填写敏感参数')
             if any(len(v) > 8000 for v in parameters.values()):
                 raise ValueError('参数值过长')
+            self.store.validate_baselines(request.testCase)
             run_id = uuid.uuid4().hex
             settings = self.settings()
             output = (Path(settings['reportRoot']) if settings['reportRoot'] else self.store.root / 'runs') / run_id
@@ -333,6 +412,8 @@ class UIManager:
             }
             self.store.put('runs', run)
             job = {'serial': request.serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
+            job['baselineDir'] = str(self.store.baselines.resolve())
+            job['pythonExecutable'] = sys.executable
             if not run['sensitive']:
                 try:
                     job['navigation'] = self.navigation.load(request.serial)
@@ -508,9 +589,38 @@ async def cases_list(request: Request):
     return manager(request).store.all('cases')
 
 
+@router.post('/baselines', status_code=201)
+async def upload_baseline(request: Request, file: UploadFile = File(...)):
+    max_bytes = 8 * 1024 * 1024
+    data = await file.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise HTTPException(400, '基准 PNG 最大为 8 MB')
+    if len(data) < 33 or data[:16] != b'\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR':
+        raise HTTPException(400, '请选择 PNG 基准图')
+    width, height = struct.unpack('>II', data[16:24])
+    if not width or not height or width * height > 16_000_000:
+        raise HTTPException(400, '基准图尺寸无效或过大')
+    baseline_id = hashlib.sha256(data).hexdigest()
+    directory = manager(request).store.baselines
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f'{baseline_id}.png'
+    if not target.exists():
+        temporary = directory / f'{uuid.uuid4().hex}.tmp'
+        try:
+            temporary.write_bytes(data)
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return {'id': baseline_id, 'width': width, 'height': height}
+
+
 @router.post('/cases')
 async def case_save(value: TestCase, request: Request):
     store = manager(request).store
+    try:
+        store.validate_baselines(value)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
     body = value.model_dump()
     try:
         previous = store.get('cases', value.id)
@@ -557,14 +667,28 @@ async def scan_start(value: ScanRequest, request: Request):
 @router.post('/cases/export')
 async def cases_export(value: ExportRequest, request: Request):
     output = io.BytesIO()
+    store = manager(request).store
+    included_baselines = set()
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
         for key in dict.fromkeys(value.ids):
             try:
-                case = manager(request).store.get('cases', key)
+                case = store.get('cases', key)
             except KeyError:
                 raise HTTPException(404, '导出用例不存在')
             archive.writestr(f"cases/{case['id']}.json", json.dumps(case, ensure_ascii=False, indent=2))
             archive.writestr(f"parameters/{case['id']}.json", json.dumps({p['name']: '' if p['secret'] else p['default'] for p in case['parameters']}, ensure_ascii=False, indent=2))
+            for step in case['steps']:
+                baseline_id = (step.get('options') or {}).get('baselineId')
+                if not isinstance(baseline_id, str) or not re.fullmatch(r'[a-f0-9]{64}', baseline_id):
+                    continue
+                if baseline_id not in included_baselines:
+                    path = store.baselines / f'{baseline_id}.png'
+                    if not path.is_file():
+                        raise HTTPException(409, '用例的基准图缺失，请重新上传后导出')
+                    archive.write(path, f'baselines/{path.name}')
+                    included_baselines.add(baseline_id)
+        if included_baselines:
+            archive.writestr('baselines/README.txt', '运行带图像断言的用例时，在 runner 输入中设置 baselineDir 为解压后的 baselines 绝对路径。\n元素区域断言需要 Python 环境安装 uiautomator2。可通过 pythonExecutable 指定该 Python 的路径。\n')
         archive.writestr('README.txt', '格式版本 1。需要本项目 tools/ui-test 执行器及 npm ci 安装依赖。\n用例 JSON 作为 runner 输入的 testCase，参数 JSON 作为 parameters；另需指定 serial。\n密钥通过本机 .env 或环境变量配置。敏感参数默认留空。\n')
     return Response(output.getvalue(), media_type='application/zip', headers={'Content-Disposition': 'attachment; filename="ui-cases.zip"'})
 

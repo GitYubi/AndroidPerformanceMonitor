@@ -95,7 +95,10 @@ def audit_bundle(root: Path) -> None:
     for name in ["Start.cmd", "launcher.py", "dist/public/index.html",
                  "runtime/python/python.exe", "runtime/node/node.exe",
                  "runtime/platform-tools/adb.exe",
+                 "runtime/python/site-packages/uiautomator2/__init__.py",
                  "backend/vendor/scrcpy/scrcpy-server-v3.3.4",
+                 "backend/config/Example.dbc",
+                 "backend/app/ui_element_capture.py",
                  "tools/ui-test/node_modules/@midscene/android/package.json",
                  "tools/ui-test/node_modules/@midscene/test/package.json",
                  "tools/ui-test/node_modules/@img/sharp-win32-x64/package.json",
@@ -144,6 +147,9 @@ def build() -> None:
     shutil.copytree(ROOT / "backend/app", STAGING / "backend/app",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.bak"))
     shutil.copytree(ROOT / "backend/vendor", STAGING / "backend/vendor")
+    for name in ("zlg", "Functional", "config"):
+        shutil.copytree(ROOT / "backend" / name, STAGING / "backend" / name,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
     shutil.copytree(ROOT / "tools/monkey", STAGING / "tools/monkey")
     shutil.copytree(ROOT / "dist/public", STAGING / "dist/public",
                     ignore=shutil.ignore_patterns("__manus__", ".gitkeep"))
@@ -174,6 +180,10 @@ def build() -> None:
              "-r", str(SOURCE / "requirements.txt")])
     for directory in ["bin", "Scripts"]:
         shutil.rmtree(python / "site-packages" / directory, ignore_errors=True)
+    # adbutils uses the official platform-tools executable on the launcher's PATH.
+    bundled_adb = python / "site-packages" / "adbutils" / "binaries"
+    if bundled_adb.is_dir():
+        shutil.rmtree(bundled_adb)
     # Preserve frontend dependency licenses as well as licenses shipped with runtimes.
     notices = ["Third-party components: Python, Node.js, Android Platform-Tools, scrcpy.\n"
                "Runtime licenses are included in runtime/, backend/vendor/, and dependency directories.\n"]

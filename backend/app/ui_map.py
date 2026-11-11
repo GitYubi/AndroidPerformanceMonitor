@@ -416,6 +416,26 @@ async def frame(value: Serial, request: Request):
         return await Device(value.serial).frame()
 
 
+@router.post('/elements')
+async def current_elements(value: Serial, request: Request):
+    async with guard(request, value.serial):
+        tree = await Device(value.serial).tree()
+    elements = []
+    seen = set()
+    for node in tree['nodes']:
+        bounds = node['bounds']
+        label = node['text'] or node['description']
+        if not bounds or bounds[2] <= bounds[0] or bounds[3] <= bounds[1]:
+            continue
+        if not (node['resourceId'] or label):
+            continue
+        key = (node['resourceId'], label, node['className'], node['package'])
+        if key not in seen:
+            seen.add(key)
+            elements.append(dict(zip(('resourceId', 'label', 'className', 'package'), key)))
+    return {'elements': elements}
+
+
 @router.post('/save')
 async def save(value: ElementRequest, request: Request):
     async with guard(request, value.serial):

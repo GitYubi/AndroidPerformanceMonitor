@@ -1,0 +1,48 @@
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: Demo
+
+BO_ 6 TestClassicA: 8 Demo
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" Demo
+
+BO_ 5 TestClassicB: 8 Demo
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" Demo
+
+BO_ 771 TestClassicC: 8 Demo
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" Demo
+
+BO_ 743 TestNetwork: 12 Demo
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" Demo
+
+BO_ 453 TestSpeed: 8 Demo
+ SG_ DisplaySpeed : 0|16@1+ (0.1,0) [0|300] "km/h" Demo
+
+BO_ 560 TestFast: 8 Demo
+ SG_ Value : 0|8@1+ (1,0) [0|255] "" Demo
+
+BO_ 647 TestButtons: 8 Demo
+ SG_ PressA : 0|1@1+ (1,0) [0|1] "" Demo
+ SG_ PressB : 1|1@1+ (1,0) [0|1] "" Demo
+ SG_ HeldButton : 2|1@1+ (1,0) [0|1] "" Demo
+
+VAL_ 453 DisplaySpeed 65535 "Invalid";
+VAL_ 647 PressA 1 "Active" 0 "Inactive";
+VAL_ 647 PressB 1 "Active" 0 "Inactive";
+VAL_ 647 HeldButton 1 "Active" 0 "Inactive";
+
+BA_DEF_ BO_ "GenMsgCycleTime" INT 0 65535;
+BA_DEF_DEF_ "GenMsgCycleTime" 100;
+BA_ "GenMsgCycleTime" BO_ 453 20;
+BA_ "GenMsgCycleTime" BO_ 560 10;
+BA_ "GenMsgCycleTime" BO_ 647 50;
+
+BA_DEF_ BO_ "VFrameFormat" ENUM "StandardCAN","StandardCAN_FD";
+BA_DEF_DEF_ "VFrameFormat" "StandardCAN";
+BA_ "VFrameFormat" BO_ 743 1;
+BA_ "VFrameFormat" BO_ 453 1;
+BA_ "VFrameFormat" BO_ 560 1;
+BA_ "VFrameFormat" BO_ 647 1;

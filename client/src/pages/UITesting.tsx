@@ -1,5 +1,20 @@
 import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
 import { BACKEND_URL } from "@/lib/backend";
+import { getUiSection } from "@/lib/uiNavigation";
+import { UiStepFields } from "@/components/UiStepFields";
+import {
+  UiDevicePreview,
+  type UiDevicePreviewHandle,
+} from "@/components/UiDevicePreview";
+import {
+  changeStepType,
+  isAssertion,
+  stepGroups,
+  stepTypes,
+  type Selector,
+  type Step,
+  type StepType,
+} from "@/lib/uiSteps";
 import PageMapWorkbench from "@/components/PageMapWorkbench";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
@@ -26,26 +41,9 @@ import {
   FlaskConical,
 } from "lucide-react";
 import { toast } from "sonner";
+import { useLocation, useSearchParams } from "wouter";
 
 const API = BACKEND_URL;
-type StepType =
-  | "action"
-  | "tap"
-  | "input"
-  | "wait"
-  | "assert"
-  | "screenshot"
-  | "explore";
-type Step = {
-  id: string;
-  type: StepType;
-  prompt: string;
-  value: string;
-  timeoutMs: number;
-  enabled: boolean;
-  onFailure: "stop" | "continue";
-  exploration?: { allowedControls: string[]; maxActions: number } | null;
-};
 type Parameter = { name: string; secret: boolean; default: string };
 type Case = {
   schemaVersion: 1;
@@ -114,15 +112,6 @@ const states: Record<string, string> = {
   skipped: "已跳过",
   restored: "已恢复",
 };
-const stepTypes: Record<StepType, string> = {
-  action: "自然语言操作",
-  tap: "点击",
-  input: "输入",
-  wait: "等待条件",
-  assert: "结果断言",
-  screenshot: "记录截图",
-  explore: "单页开关探索",
-};
 const active = (run: Run) => ["queued", "running"].includes(run.state);
 const uid = () => crypto.randomUUID().replaceAll("-", "");
 const newStep = (type: StepType = "action", prompt = "", value = ""): Step => ({
@@ -145,7 +134,8 @@ const blank = (): Case => ({
   steps: [newStep()],
 });
 const selectClass =
-  "w-full rounded-md border border-input bg-background px-3 py-2 text-sm";
+  "h-8 w-full min-w-0 rounded-md border border-input bg-background px-2 text-sm";
+const compactInput = "h-8 px-2 shadow-none";
 
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(
@@ -217,13 +207,16 @@ function template(kind: string): Case {
 }
 
 export default function UITesting() {
-  const [tab, setTab] = useState<"execute" | "cases" | "reports" | "structure">(
-    "execute"
-  );
+  const [search] = useSearchParams();
+  const [, navigate] = useLocation();
+  const section = getUiSection(search);
   const [devices, setDevices] = useState<
     { serial: string; state: string; model?: string }[]
   >([]);
   const [serial, setSerial] = useState("");
+  const [rightPanel, setRightPanel] = useState<"device" | "records">("device");
+  const [pickStepId, setPickStepId] = useState("");
+  const devicePreview = useRef<UiDevicePreviewHandle>(null);
   const [draft, setDraft] = useState<Case>(blank);
   const [parameters, setParameters] = useState<Record<string, string>>({});
   const [cases, setCases] = useState<Case[]>([]);
@@ -243,6 +236,7 @@ export default function UITesting() {
     model: { keyConfigured: boolean };
     node: string;
   } | null>(null);
+  const stepList = useRef<HTMLDivElement>(null);
   const selection = useRef(runId);
   selection.current = runId;
 
@@ -314,13 +308,32 @@ export default function UITesting() {
   function load(test: Case) {
     setDraft(structuredClone(test));
     setParameters({});
-    setTab("execute");
+    showExecution();
   }
-  function patchStep(index: number, update: Partial<Step>) {
+  function showExecution() {
+    if (section !== "execute") navigate("/ui");
+  }
+  function addStep() {
+    const step = newStep();
+    setDraft(previous => ({ ...previous, steps: [...previous.steps, step] }));
+    window.requestAnimationFrame(() => {
+      const list = stepList.current;
+      if (list) list.scrollTop = list.scrollHeight;
+    });
+  }
+  function patchStep(
+    id: string,
+    update: Partial<Step> | ((current: Step) => Partial<Step>)
+  ) {
     setDraft(previous => ({
       ...previous,
-      steps: previous.steps.map((step, i) =>
-        i === index ? { ...step, ...update } : step
+      steps: previous.steps.map(step =>
+        step.id === id
+          ? {
+              ...step,
+              ...(typeof update === "function" ? update(step) : update),
+            }
+          : step
       ),
     }));
   }
@@ -334,7 +347,14 @@ export default function UITesting() {
       return { ...previous, steps };
     });
   }
+  async function showRecords(id?: string) {
+    await devicePreview.current?.stop();
+    if (id) setRunId(id);
+    showExecution();
+    setRightPanel("records");
+  }
   async function start() {
+    await devicePreview.current?.stop();
     const next = await api<Run>("/ui/runs", {
       serial,
       testCase: draft,
@@ -342,6 +362,7 @@ export default function UITesting() {
     });
     setRunId(next.id);
     setRun(next);
+    setRightPanel("records");
     setParameters({});
     await refresh();
   }
@@ -364,20 +385,56 @@ export default function UITesting() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   const activeRuns = runs.filter(active);
+  const deviceRunning =
+    activeRuns.some(item => item.serial === serial) ||
+    Boolean(run && run.serial === serial && active(run));
+  const pickTargets = draft.steps.flatMap((step, index) =>
+    step.type === "element_assert" ||
+    (step.type === "image_assert" && step.options?.mode === "element") ||
+    (step.type === "tap" && step.selector)
+      ? [
+          {
+            id: step.id,
+            label: `第 ${index + 1} 步 · ${step.type === "image_assert" ? "元素区域断言" : step.type === "tap" ? "结构点击" : "元素断言"}`,
+          },
+        ]
+      : []
+  );
+  const pickTarget = pickTargets.some(item => item.id === pickStepId)
+    ? pickStepId
+    : pickTargets.length === 1
+      ? pickTargets[0].id
+      : "";
+  function applyElement(selector: Selector) {
+    if (!pickTarget || !Object.values(selector).some(Boolean)) return;
+    patchStep(pickTarget, { selector });
+    toast.success("元素定位条件已回填到步骤");
+  }
 
   return (
-    <main className="min-h-screen bg-background text-foreground px-5 py-6 md:px-8">
-      <header className="flex flex-wrap items-center justify-between gap-4 border-b border-border pb-5 mb-5">
+    <main
+      className={`min-h-screen bg-background text-foreground ${section === "execute" ? "px-3 py-3 md:px-5" : "px-5 py-6 md:px-8"}`}
+    >
+      <header
+        className={`flex flex-wrap items-center justify-between gap-2 border-b border-border ${section === "execute" ? "mb-3 pb-2" : "mb-5 pb-5"}`}
+      >
         <div>
-          <div className="text-xs tracking-widest text-cyan-400 mb-2">
-            ANDROID / UI AUTOMATION
-          </div>
-          <h1 className="text-2xl font-semibold">UI 自动化测试</h1>
-          <p className="mt-2 text-sm text-muted-foreground">
-            用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
-          </p>
+          <h1
+            className={`font-semibold ${section === "execute" ? "text-lg" : "text-2xl"}`}
+          >
+            UI 自动化测试
+          </h1>
+          {section !== "execute" && (
+            <p className="mt-2 text-sm text-muted-foreground">
+              用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
+            </p>
+          )}
         </div>
-        <Button variant="outline" onClick={() => void perform(openSettings)}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void perform(openSettings)}
+        >
           <Settings className="size-4" />
           设置
         </Button>
@@ -397,40 +454,18 @@ export default function UITesting() {
             <button
               key={item.id}
               className="underline"
-              onClick={() => {
-                setRunId(item.id);
-                setTab("execute");
-              }}
+              onClick={() => void perform(() => showRecords(item.id))}
             >
               {item.testCase.name} · {item.serial}
             </button>
           ))}
         </div>
       )}
-      <nav aria-label="UI 测试功能" className="mb-6 flex gap-2">
-        {(
-          [
-            ["execute", "执行与编辑"],
-            ["cases", "用例库"],
-            ["reports", "测试报告"],
-            ["structure", "页面与元素"],
-          ] as const
-        ).map(([key, label]) => (
-          <Button
-            key={key}
-            variant={tab === key ? "default" : "ghost"}
-            onClick={() => setTab(key)}
-          >
-            {label}
-          </Button>
-        ))}
-      </nav>
-
-      {tab === "structure" && <PageMapWorkbench />}
-      {tab === "execute" && (
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.2fr)_minmax(340px,0.8fr)]">
-          <section className="min-w-0 space-y-5">
-            <div className="flex flex-wrap gap-2">
+      {section === "structure" && <PageMapWorkbench />}
+      {section === "execute" && (
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(300px,0.7fr)]">
+          <section className="@container min-w-0 space-y-2.5">
+            <div className="flex flex-wrap gap-1.5">
               <Button variant="outline" size="sm" onClick={() => load(blank())}>
                 <Plus className="size-4" />
                 新用例
@@ -451,15 +486,16 @@ export default function UITesting() {
                 </Button>
               ))}
             </div>
-            <div className="grid gap-3 md:grid-cols-2">
-              <label className="space-y-2 text-sm">
+            <div className="grid grid-cols-2 gap-x-2.5 gap-y-1.5 @min-[620px]:grid-cols-[minmax(0,1.25fr)_minmax(0,1.25fr)_minmax(0,0.75fr)_minmax(0,0.75fr)]">
+              <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
                 用例名称
                 <Input
+                  className={compactInput}
                   value={draft.name}
                   onChange={e => setDraft({ ...draft, name: e.target.value })}
                 />
               </label>
-              <label className="space-y-2 text-sm">
+              <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
                 目标设备
                 <select
                   className={selectClass}
@@ -479,17 +515,19 @@ export default function UITesting() {
                   ))}
                 </select>
               </label>
-              <label className="space-y-2 text-sm">
+              <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
                 分组
                 <Input
+                  className={compactInput}
                   value={draft.group}
                   onChange={e => setDraft({ ...draft, group: e.target.value })}
                   placeholder="例如：系统设置"
                 />
               </label>
-              <label className="space-y-2 text-sm">
+              <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
                 标签（逗号分隔）
                 <Input
+                  className={compactInput}
                   value={draft.tags.join(",")}
                   onChange={e =>
                     setDraft({ ...draft, tags: e.target.value.split(",") })
@@ -497,9 +535,9 @@ export default function UITesting() {
                 />
               </label>
             </div>
-            <div className="space-y-3">
+            <div className="space-y-1.5">
               <div className="flex items-center justify-between">
-                <h2 className="font-medium">执行参数</h2>
+                <h2 className="text-sm font-medium">执行参数</h2>
                 <Button
                   variant="ghost"
                   size="sm"
@@ -521,287 +559,271 @@ export default function UITesting() {
                   添加参数
                 </Button>
               </div>
-              <p className="text-xs text-muted-foreground">
-                步骤内使用 {"${参数名}"}{" "}
-                引用。敏感参数只在本次运行中使用；含敏感参数的任务暂不保存截图和
-                Midscene 原始报告。
-              </p>
-              {draft.parameters.map((param, i) => (
-                <div
-                  key={i}
-                  className="grid grid-cols-[1fr_1fr_auto_auto] items-center gap-2"
-                >
-                  <Input
-                    aria-label={`参数 ${i + 1} 名称`}
-                    value={param.name}
-                    onChange={e => {
-                      setParameters({});
-                      setDraft({
-                        ...draft,
-                        parameters: draft.parameters.map((p, j) =>
-                          j === i ? { ...p, name: e.target.value } : p
-                        ),
-                      });
-                    }}
-                  />
-                  <Input
-                    aria-label={`${param.name} 参数值`}
-                    type={param.secret ? "password" : "text"}
-                    autoComplete="off"
-                    placeholder={param.secret ? "仅本次使用" : "默认值"}
-                    value={
-                      param.secret
-                        ? parameters[param.name] || ""
-                        : param.default
-                    }
-                    onChange={e =>
-                      param.secret
-                        ? setParameters({
-                            ...parameters,
-                            [param.name]: e.target.value,
-                          })
-                        : setDraft({
+              {draft.parameters.length > 0 && (
+                <p className="text-xs text-muted-foreground">
+                  步骤内使用 {"${参数名}"}{" "}
+                  引用。敏感参数只在本次运行中使用；含敏感参数的任务暂不保存截图和
+                  Midscene 原始报告。
+                </p>
+              )}
+              {draft.parameters.length > 0 && (
+                <div className="max-h-32 space-y-1 overflow-y-auto overscroll-contain pr-1">
+                  {draft.parameters.map((param, i) => (
+                    <div
+                      key={i}
+                      className="grid grid-cols-[1fr_1fr_auto_auto] items-center gap-2"
+                    >
+                      <Input
+                        className={compactInput}
+                        aria-label={`参数 ${i + 1} 名称`}
+                        value={param.name}
+                        onChange={e => {
+                          setParameters({});
+                          setDraft({
                             ...draft,
                             parameters: draft.parameters.map((p, j) =>
-                              j === i ? { ...p, default: e.target.value } : p
+                              j === i ? { ...p, name: e.target.value } : p
+                            ),
+                          });
+                        }}
+                      />
+                      <Input
+                        className={compactInput}
+                        aria-label={`${param.name} 参数值`}
+                        type={param.secret ? "password" : "text"}
+                        autoComplete="off"
+                        placeholder={param.secret ? "仅本次使用" : "默认值"}
+                        value={
+                          param.secret
+                            ? parameters[param.name] || ""
+                            : param.default
+                        }
+                        onChange={e =>
+                          param.secret
+                            ? setParameters({
+                                ...parameters,
+                                [param.name]: e.target.value,
+                              })
+                            : setDraft({
+                                ...draft,
+                                parameters: draft.parameters.map((p, j) =>
+                                  j === i
+                                    ? { ...p, default: e.target.value }
+                                    : p
+                                ),
+                              })
+                        }
+                      />
+                      <label className="text-xs flex items-center gap-1">
+                        <input
+                          type="checkbox"
+                          checked={param.secret}
+                          onChange={e => {
+                            setParameters({});
+                            setDraft({
+                              ...draft,
+                              parameters: draft.parameters.map((p, j) =>
+                                j === i
+                                  ? {
+                                      ...p,
+                                      secret: e.target.checked,
+                                      default: "",
+                                    }
+                                  : p
+                              ),
+                            });
+                          }}
+                        />
+                        敏感
+                      </label>
+                      <Button
+                        aria-label="删除参数"
+                        size="icon-sm"
+                        variant="ghost"
+                        onClick={() =>
+                          setDraft({
+                            ...draft,
+                            parameters: draft.parameters.filter(
+                              (_, j) => j !== i
                             ),
                           })
-                    }
-                  />
-                  <label className="text-xs flex items-center gap-1">
-                    <input
-                      type="checkbox"
-                      checked={param.secret}
-                      onChange={e => {
-                        setParameters({});
-                        setDraft({
-                          ...draft,
-                          parameters: draft.parameters.map((p, j) =>
-                            j === i
-                              ? { ...p, secret: e.target.checked, default: "" }
-                              : p
-                          ),
-                        });
-                      }}
-                    />
-                    敏感
-                  </label>
-                  <Button
-                    aria-label="删除参数"
-                    size="icon"
-                    variant="ghost"
-                    onClick={() =>
-                      setDraft({
-                        ...draft,
-                        parameters: draft.parameters.filter((_, j) => j !== i),
-                      })
-                    }
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
+                        }
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
-            <div className="flex items-center justify-between">
-              <h2 className="font-medium">
+            <div className="flex items-center justify-between gap-2">
+              <h2 className="text-sm font-medium">
                 测试步骤{" "}
                 <span className="text-muted-foreground">
                   / {draft.steps.length}
                 </span>
               </h2>
-              <span className="text-xs text-muted-foreground">
-                按顺序执行 · v{draft.version}
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-muted-foreground">
+                  v{draft.version}
+                </span>
+                <Button variant="outline" size="sm" onClick={addStep}>
+                  <Plus className="size-3.5" />
+                  添加步骤
+                </Button>
+              </div>
             </div>
-            {draft.steps.map((step, i) => (
-              <article
-                key={step.id}
-                className={`rounded-lg border border-border p-4 space-y-3 ${!step.enabled ? "opacity-50" : ""}`}
-              >
-                <div className="flex items-center gap-2">
-                  <label className="flex items-center gap-2 text-sm">
-                    <input
-                      aria-label={`启用步骤 ${i + 1}`}
-                      type="checkbox"
-                      checked={step.enabled}
-                      onChange={e =>
-                        patchStep(i, { enabled: e.target.checked })
-                      }
-                    />
-                    {String(i + 1).padStart(2, "0")}
-                  </label>
-                  <select
-                    aria-label={`步骤 ${i + 1} 类型`}
-                    className={selectClass}
-                    value={step.type}
-                    onChange={e =>
-                      patchStep(i, {
-                        type: e.target.value as StepType,
-                        exploration:
-                          e.target.value === "explore"
-                            ? { allowedControls: [], maxActions: 6 }
-                            : null,
-                        timeoutMs:
-                          e.target.value === "explore"
-                            ? 300000
-                            : step.timeoutMs,
-                      })
-                    }
-                  >
-                    {Object.entries(stepTypes).map(([key, label]) => (
-                      <option key={key} value={key}>
-                        {label}
-                      </option>
-                    ))}
-                  </select>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    aria-label="上移步骤"
-                    disabled={i === 0}
-                    onClick={() => move(i, -1)}
-                  >
-                    <ArrowUp className="size-4" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    aria-label="下移步骤"
-                    disabled={i === draft.steps.length - 1}
-                    onClick={() => move(i, 1)}
-                  >
-                    <ArrowDown className="size-4" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    aria-label="删除步骤"
-                    disabled={draft.steps.length === 1}
-                    onClick={() =>
-                      setDraft({
-                        ...draft,
-                        steps: draft.steps.filter((_, j) => j !== i),
-                      })
-                    }
-                  >
-                    <Trash2 className="size-4" />
-                  </Button>
-                </div>
-                <Textarea
-                  aria-label={`步骤 ${i + 1} 描述`}
-                  value={step.prompt}
-                  onChange={e => patchStep(i, { prompt: e.target.value })}
-                  placeholder={
-                    step.type === "assert"
-                      ? "例如：Wi-Fi ${SSID} 显示已连接"
-                      : "描述操作目标或检查条件"
-                  }
-                />
-                {step.type === "explore" && (
-                  <div className="space-y-2 text-sm">
-                    <p className="text-xs text-muted-foreground">
-                      描述填写当前页面名称。只操作下方列出的可见开关，切换后恢复原状态；不自动进入子页面。
-                    </p>
-                    <label className="block">
-                      允许探索的开关（逗号分隔）
-                      <Input
-                        value={
-                          step.exploration?.allowedControls.join(",") || ""
-                        }
-                        onChange={e =>
-                          patchStep(i, {
-                            exploration: {
-                              allowedControls: e.target.value
-                                .split(",")
-                                .map(v => v.trim()),
-                              maxActions: step.exploration?.maxActions || 6,
-                            },
-                          })
-                        }
-                      />
-                    </label>
-                    <label className="block">
-                      最大点击次数（含恢复）
-                      <Input
-                        className="w-24"
-                        type="number"
-                        min={2}
-                        max={20}
-                        value={step.exploration?.maxActions || 6}
-                        onChange={e =>
-                          patchStep(i, {
-                            exploration: {
-                              allowedControls:
-                                step.exploration?.allowedControls || [],
-                              maxActions: Number(e.target.value),
-                            },
-                          })
-                        }
-                      />
-                    </label>
-                  </div>
-                )}
-                {step.type === "input" && (
-                  <Input
-                    aria-label={`步骤 ${i + 1} 输入内容`}
-                    placeholder="输入值，例如 ${PASSWORD}"
-                    value={step.value}
-                    onChange={e => patchStep(i, { value: e.target.value })}
-                  />
-                )}
-                <div className="flex flex-wrap gap-4 items-center text-xs text-muted-foreground">
-                  <label className="flex gap-2 items-center">
-                    超时（秒）
-                    <Input
-                      className="w-24"
-                      type="number"
-                      min={1}
-                      max={300}
-                      value={step.timeoutMs / 1000}
-                      onChange={e =>
-                        patchStep(i, {
-                          timeoutMs: Number(e.target.value) * 1000,
-                        })
-                      }
-                    />
-                  </label>
-                  {step.type === "assert" && (
-                    <label className="flex gap-2 items-center">
-                      <input
-                        type="checkbox"
-                        checked={step.onFailure === "continue"}
-                        onChange={e =>
-                          patchStep(i, {
-                            onFailure: e.target.checked ? "continue" : "stop",
-                          })
-                        }
-                      />
-                      断言失败后继续
-                    </label>
-                  )}
-                </div>
-              </article>
-            ))}
-            <Button
-              variant="outline"
-              onClick={() =>
-                setDraft({ ...draft, steps: [...draft.steps, newStep()] })
-              }
+            <div
+              ref={stepList}
+              aria-label="测试步骤列表"
+              className="max-h-[clamp(260px,calc(100dvh-255px),365px)] space-y-1.5 overflow-y-auto overscroll-contain p-0.5"
             >
-              <Plus className="size-4" />
-              添加步骤
-            </Button>
-            <div className="sticky bottom-0 flex flex-wrap gap-3 border-t border-border bg-background py-4">
+              {draft.steps.map((step, i) => (
+                <article
+                  key={step.id}
+                  className={`space-y-1.5 rounded-md border border-border bg-card p-1.5 text-card-foreground ${!step.enabled ? "opacity-50" : ""}`}
+                >
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <label className="flex shrink-0 items-center gap-1.5 font-mono text-xs">
+                      <input
+                        aria-label={`启用步骤 ${i + 1}`}
+                        type="checkbox"
+                        checked={step.enabled}
+                        onChange={e =>
+                          patchStep(step.id, { enabled: e.target.checked })
+                        }
+                      />
+                      {String(i + 1).padStart(2, "0")}
+                    </label>
+                    <select
+                      aria-label={`步骤 ${i + 1} 类型`}
+                      className={`${selectClass} h-7 min-w-28 flex-1`}
+                      value={
+                        step.type === "tap" && step.selector
+                          ? "structured_tap"
+                          : step.type
+                      }
+                      onChange={event =>
+                        patchStep(
+                          step.id,
+                          changeStepType(step, event.target.value as StepType)
+                        )
+                      }
+                    >
+                      {stepGroups.map(group => (
+                        <optgroup key={group.label} label={group.label}>
+                          {group.types.map(type => (
+                            <option key={type} value={type}>
+                              {stepTypes[type]}
+                            </option>
+                          ))}
+                          {group.label === "ADB 操作" &&
+                            step.type === "tap" &&
+                            step.selector && (
+                              <option value="structured_tap">结构点击</option>
+                            )}
+                        </optgroup>
+                      ))}
+                    </select>
+                    <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                      超时（秒）
+                      <Input
+                        className="h-7 w-14 px-1.5 shadow-none"
+                        aria-label={`步骤 ${i + 1} 超时（秒）`}
+                        type="number"
+                        min={1}
+                        max={300}
+                        value={step.timeoutMs / 1000}
+                        onChange={e =>
+                          patchStep(step.id, {
+                            timeoutMs: Number(e.target.value) * 1000,
+                          })
+                        }
+                      />
+                    </label>
+                    {isAssertion(step.type) && (
+                      <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          checked={step.onFailure === "continue"}
+                          onChange={e =>
+                            patchStep(step.id, {
+                              onFailure: e.target.checked ? "continue" : "stop",
+                            })
+                          }
+                        />
+                        断言失败后继续
+                      </label>
+                    )}
+                    <div className="ml-auto flex shrink-0 items-center gap-0.5">
+                      <Button
+                        size="icon-sm"
+                        className="size-7"
+                        variant="ghost"
+                        aria-label="上移步骤"
+                        disabled={i === 0}
+                        onClick={() => move(i, -1)}
+                      >
+                        <ArrowUp className="size-4" />
+                      </Button>
+                      <Button
+                        size="icon-sm"
+                        className="size-7"
+                        variant="ghost"
+                        aria-label="下移步骤"
+                        disabled={i === draft.steps.length - 1}
+                        onClick={() => move(i, 1)}
+                      >
+                        <ArrowDown className="size-4" />
+                      </Button>
+                      <Button
+                        size="icon-sm"
+                        className="size-7"
+                        variant="ghost"
+                        aria-label="删除步骤"
+                        disabled={draft.steps.length === 1}
+                        onClick={() =>
+                          setDraft({
+                            ...draft,
+                            steps: draft.steps.filter((_, j) => j !== i),
+                          })
+                        }
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  </div>
+                  <UiStepFields
+                    key={step.type}
+                    step={step}
+                    index={i}
+                    onPickElement={
+                      serial && !deviceRunning
+                        ? () => {
+                            setPickStepId(step.id);
+                            setRightPanel("device");
+                          }
+                        : undefined
+                    }
+                    pickingElement={
+                      rightPanel === "device" && pickTarget === step.id
+                    }
+                    onChange={patch => patchStep(step.id, patch)}
+                  />
+                </article>
+              ))}
+            </div>
+            <div className="sticky bottom-0 z-10 flex flex-wrap gap-2 border-t border-border bg-background py-2">
               <Button
-                disabled={
-                  busy || !serial || activeRuns.some(r => r.serial === serial)
-                }
+                size="sm"
+                disabled={busy || !serial || deviceRunning}
                 onClick={() => void perform(start)}
               >
                 <Play className="size-4" />
                 执行用例
               </Button>
               <Button
+                size="sm"
                 variant="outline"
                 disabled={busy}
                 onClick={() =>
@@ -818,235 +840,288 @@ export default function UITesting() {
               </Button>
             </div>
           </section>
-          <section className="min-w-0 xl:border-l xl:border-border xl:pl-6">
-            <div className="flex justify-between items-center mb-4">
-              <h2 className="font-medium">执行记录</h2>
-              {run && active(run) && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={busy}
-                  onClick={() =>
-                    void perform(async () => {
-                      setRun(await api<Run>(`/ui/runs/${run.id}/cancel`, {}));
-                      await refresh();
-                    })
-                  }
-                >
-                  <Square className="size-3" />
-                  取消执行
-                </Button>
-              )}
+          <section className="min-w-0 xl:border-l xl:border-border xl:pl-4">
+            <div aria-label="右侧面板" className="mb-3 flex gap-1.5">
+              <Button
+                type="button"
+                size="sm"
+                variant={rightPanel === "device" ? "secondary" : "ghost"}
+                aria-pressed={rightPanel === "device"}
+                onClick={() => setRightPanel("device")}
+              >
+                车机投屏
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant={rightPanel === "records" ? "secondary" : "ghost"}
+                aria-pressed={rightPanel === "records"}
+                disabled={busy}
+                onClick={() => void perform(() => showRecords())}
+              >
+                执行记录
+              </Button>
             </div>
-            {!run ? (
-              <div className="py-14 text-center text-muted-foreground">
-                <FlaskConical className="mx-auto mb-4 size-9" />
-                <p>选择设备并执行，步骤结果会显示在这里。</p>
-                <p className="mt-2 text-xs">首次接入可先运行“只读检查”。</p>
-              </div>
+            {rightPanel === "device" ? (
+              <UiDevicePreview
+                key={serial}
+                ref={devicePreview}
+                serial={serial}
+                disabled={busy}
+                running={deviceRunning}
+                targets={pickTargets}
+                target={pickTarget}
+                onTargetChange={setPickStepId}
+                onApply={applyElement}
+              />
             ) : (
               <>
-                <div className="mb-5 space-y-2 text-sm">
-                  <h3 className="font-medium">{run.testCase.name}</h3>
-                  <p className="text-cyan-400">
-                    {states[run.state] || run.state} · {run.serial}
-                  </p>
-                  <p className="text-xs text-muted-foreground">
-                    {new Date(run.createdAt).toLocaleString()} · 脚本 v
-                    {run.testCase.version}
-                  </p>
-                  {run.message && (
-                    <p role="alert" className="text-destructive">
-                      {run.message}
-                    </p>
-                  )}
-                  {run.performanceSessionId && (
-                    <PerformanceReportDialog url={`${API}/api/sessions/${run.performanceSessionId}/report`}>
-                      <button type="button" className="block underline">查看关联性能报告</button>
-                    </PerformanceReportDialog>
-                  )}
-                  {run.report && (
-                    <a
-                      className="block underline"
-                      target="_blank"
-                      rel="noreferrer"
-                      href={`${API}/api/ui/runs/${run.id}/artifacts/report.html`}
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="font-medium">执行记录</h2>
+                  {run && active(run) && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() =>
+                        void perform(async () => {
+                          setRun(
+                            await api<Run>(`/ui/runs/${run.id}/cancel`, {})
+                          );
+                          await refresh();
+                        })
+                      }
                     >
-                      打开 Midscene 原始报告
-                    </a>
+                      <Square className="size-3" />
+                      取消执行
+                    </Button>
                   )}
-                  <a
-                    className="block underline"
-                    href={`${API}/api/ui/runs/${run.id}/report`}
-                  >
-                    下载结构化报告
-                  </a>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={busy || active(run)}
-                    onClick={() =>
-                      void perform(async () => {
-                        const result = await api<{
-                          testCase: Case;
-                          warnings: string[];
-                        }>(`/ui/runs/${run.id}/draft`);
-                        load(result.testCase);
-                        result.warnings.forEach(warning => toast.info(warning));
-                      })
-                    }
-                  >
-                    从实际执行生成可编辑草稿
-                  </Button>
                 </div>
-                <ol className="space-y-4">
-                  {run.testCase.steps.map((step, i) => {
-                    const log = events.filter(
-                      e => e.type === "step" && e.stepId === step.id
-                    );
-                    const last = log.at(-1);
-                    const screenshot = [...log]
-                      .reverse()
-                      .find(e => e.screenshot)?.screenshot;
-                    return (
-                      <li
-                        key={step.id}
-                        className="border-l-2 border-border pl-4"
-                      >
-                        <div className="flex justify-between gap-3 text-sm">
-                          <span>
-                            {i + 1}. {stepTypes[step.type]}
-                          </span>
-                          <span
-                            className={
-                              last?.state === "passed"
-                                ? "text-emerald-400"
-                                : last?.state === "failed" ||
-                                    last?.state === "error"
-                                  ? "text-red-400"
-                                  : "text-muted-foreground"
-                            }
-                          >
-                            {last
-                              ? states[last.state] || last.state
-                              : active(run)
-                                ? "等待执行"
-                                : "未执行"}
-                          </span>
-                        </div>
-                        <p className="mt-2 text-sm break-words">
-                          {step.prompt.replace(
-                            /\$\{([a-zA-Z0-9_]+)\}/g,
-                            (placeholder, name: string) => {
-                              if (
-                                run.testCase.parameters.some(
-                                  p => p.name === name && p.secret
-                                )
-                              )
-                                return "[敏感参数]";
-                              return run.parameters &&
-                                Object.hasOwn(run.parameters, name)
-                                ? run.parameters[name]
-                                : placeholder;
-                            }
-                          )}
+                {!run ? (
+                  <div className="py-14 text-center text-muted-foreground">
+                    <FlaskConical className="mx-auto mb-4 size-9" />
+                    <p>选择设备并执行，步骤结果会显示在这里。</p>
+                    <p className="mt-2 text-xs">首次接入可先运行“只读检查”。</p>
+                  </div>
+                ) : (
+                  <>
+                    <div className="mb-5 space-y-2 text-sm">
+                      <h3 className="font-medium">{run.testCase.name}</h3>
+                      <p className="text-cyan-400">
+                        {states[run.state] || run.state} · {run.serial}
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        {new Date(run.createdAt).toLocaleString()} · 脚本 v
+                        {run.testCase.version}
+                      </p>
+                      {run.message && (
+                        <p role="alert" className="text-destructive">
+                          {run.message}
                         </p>
-                        {events
-                          .filter(
-                            e => e.type === "navigation" && e.stepId === step.id
-                          )
-                          .map(e => (
-                            <p
-                              key={e.seq}
-                              className="mt-1 text-xs text-muted-foreground"
-                            >
-                              {e.message} · 导航总耗时{" "}
-                              {((e.elapsedMs || 0) / 1000).toFixed(1)} 秒
-                            </p>
-                          ))}
-                        {events
-                          .filter(
-                            e => e.type === "action" && e.stepId === step.id
-                          )
-                          .map(e => (
-                            <p
-                              key={e.seq}
-                              className="mt-1 text-xs text-muted-foreground"
-                            >
-                              已执行：{e.action} · {e.target || "设备操作"}
-                            </p>
-                          ))}
-                        {events
-                          .filter(
-                            e =>
-                              e.type === "exploration" && e.stepId === step.id
-                          )
-                          .map(e => (
-                            <p
-                              key={e.seq}
-                              className="mt-1 text-xs text-muted-foreground"
-                            >
-                              {e.control}：{states[e.state] || e.state} ·{" "}
-                              {e.message}
-                            </p>
-                          ))}
-                        {last?.message && (
-                          <p className="mt-2 text-xs text-destructive">
-                            {last.message}
-                          </p>
-                        )}
-                        {metrics
-                          .filter(metric => metric.stepId === step.id)
-                          .map(metric => (
-                            <p
-                              key={metric.sessionId}
-                              className="mt-2 rounded bg-muted/40 p-2 text-xs text-muted-foreground"
-                            >
-                              步骤时间窗 · {metric.sampleCount} 个采样点
-                              <br />
-                              平均 CPU{" "}
-                              {metric.cpuAverage == null
-                                ? "—"
-                                : metric.cpuAverage.toFixed(1) + "%"}{" "}
-                              · 平均 PSS{" "}
-                              {metric.memoryAverageMb == null
-                                ? "—"
-                                : metric.memoryAverageMb.toFixed(1) +
-                                  " MiB"}{" "}
-                              · 平均呈现帧率{" "}
-                              {metric.fpsAverage == null
-                                ? "—"
-                                : metric.fpsAverage.toFixed(1) + " FPS"}
-                            </p>
-                          ))}
-                        {last && (
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            {new Date(last.time).toLocaleTimeString()}
-                          </p>
-                        )}
-                        {screenshot && (
-                          <a
-                            href={`${API}/api/ui/runs/${run.id}/artifacts/${screenshot}`}
-                            target="_blank"
-                            rel="noreferrer"
+                      )}
+                      {run.performanceSessionId && (
+                        <PerformanceReportDialog
+                          url={`${API}/api/sessions/${run.performanceSessionId}/report`}
+                        >
+                          <button type="button" className="block underline">
+                            查看关联性能报告
+                          </button>
+                        </PerformanceReportDialog>
+                      )}
+                      {run.report && (
+                        <a
+                          className="block underline"
+                          target="_blank"
+                          rel="noreferrer"
+                          href={`${API}/api/ui/runs/${run.id}/artifacts/report.html`}
+                        >
+                          打开 Midscene 原始报告
+                        </a>
+                      )}
+                      <a
+                        className="block underline"
+                        href={`${API}/api/ui/runs/${run.id}/report`}
+                      >
+                        下载结构化报告
+                      </a>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={busy || active(run)}
+                        onClick={() =>
+                          void perform(async () => {
+                            const result = await api<{
+                              testCase: Case;
+                              warnings: string[];
+                            }>(`/ui/runs/${run.id}/draft`);
+                            load(result.testCase);
+                            result.warnings.forEach(warning =>
+                              toast.info(warning)
+                            );
+                          })
+                        }
+                      >
+                        从实际执行生成可编辑草稿
+                      </Button>
+                    </div>
+                    <ol className="space-y-4">
+                      {run.testCase.steps.map((step, i) => {
+                        const log = events.filter(
+                          e => e.type === "step" && e.stepId === step.id
+                        );
+                        const last = log.at(-1);
+                        const screenshot = [...log]
+                          .reverse()
+                          .find(e => e.screenshot)?.screenshot;
+                        return (
+                          <li
+                            key={step.id}
+                            className="border-l-2 border-border pl-4"
                           >
-                            <img
-                              className="mt-3 max-h-64 rounded border border-border object-contain"
-                              src={`${API}/api/ui/runs/${run.id}/artifacts/${screenshot}`}
-                              alt={`步骤 ${i + 1} 执行后截图`}
-                            />
-                          </a>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ol>
+                            <div className="flex justify-between gap-3 text-sm">
+                              <span>
+                                {i + 1}.{" "}
+                                {step.type === "tap" && step.selector
+                                  ? "结构点击"
+                                  : stepTypes[step.type]}
+                              </span>
+                              <span
+                                className={
+                                  last?.state === "passed"
+                                    ? "text-emerald-400"
+                                    : last?.state === "failed" ||
+                                        last?.state === "error"
+                                      ? "text-red-400"
+                                      : "text-muted-foreground"
+                                }
+                              >
+                                {last
+                                  ? states[last.state] || last.state
+                                  : active(run)
+                                    ? "等待执行"
+                                    : "未执行"}
+                              </span>
+                            </div>
+                            <p className="mt-2 text-sm break-words">
+                              {step.prompt.replace(
+                                /\$\{([a-zA-Z0-9_]+)\}/g,
+                                (placeholder, name: string) => {
+                                  if (
+                                    run.testCase.parameters.some(
+                                      p => p.name === name && p.secret
+                                    )
+                                  )
+                                    return "[敏感参数]";
+                                  return run.parameters &&
+                                    Object.hasOwn(run.parameters, name)
+                                    ? run.parameters[name]
+                                    : placeholder;
+                                }
+                              )}
+                            </p>
+                            {events
+                              .filter(
+                                e =>
+                                  e.type === "navigation" &&
+                                  e.stepId === step.id
+                              )
+                              .map(e => (
+                                <p
+                                  key={e.seq}
+                                  className="mt-1 text-xs text-muted-foreground"
+                                >
+                                  {e.message} · 导航总耗时{" "}
+                                  {((e.elapsedMs || 0) / 1000).toFixed(1)} 秒
+                                </p>
+                              ))}
+                            {events
+                              .filter(
+                                e => e.type === "action" && e.stepId === step.id
+                              )
+                              .map(e => (
+                                <p
+                                  key={e.seq}
+                                  className="mt-1 text-xs text-muted-foreground"
+                                >
+                                  已执行：{e.action} · {e.target || "设备操作"}
+                                </p>
+                              ))}
+                            {events
+                              .filter(
+                                e =>
+                                  e.type === "exploration" &&
+                                  e.stepId === step.id
+                              )
+                              .map(e => (
+                                <p
+                                  key={e.seq}
+                                  className="mt-1 text-xs text-muted-foreground"
+                                >
+                                  {e.control}：{states[e.state] || e.state} ·{" "}
+                                  {e.message}
+                                </p>
+                              ))}
+                            {last?.message && (
+                              <p
+                                className={`mt-2 text-xs ${last.state === "passed" ? "text-muted-foreground" : "text-destructive"}`}
+                              >
+                                {last.message}
+                              </p>
+                            )}
+                            {metrics
+                              .filter(metric => metric.stepId === step.id)
+                              .map(metric => (
+                                <p
+                                  key={metric.sessionId}
+                                  className="mt-2 rounded bg-muted/40 p-2 text-xs text-muted-foreground"
+                                >
+                                  步骤时间窗 · {metric.sampleCount} 个采样点
+                                  <br />
+                                  平均 CPU{" "}
+                                  {metric.cpuAverage == null
+                                    ? "—"
+                                    : metric.cpuAverage.toFixed(1) + "%"}{" "}
+                                  · 平均 PSS{" "}
+                                  {metric.memoryAverageMb == null
+                                    ? "—"
+                                    : metric.memoryAverageMb.toFixed(1) +
+                                      " MiB"}{" "}
+                                  · 平均呈现帧率{" "}
+                                  {metric.fpsAverage == null
+                                    ? "—"
+                                    : metric.fpsAverage.toFixed(1) + " FPS"}
+                                </p>
+                              ))}
+                            {last && (
+                              <p className="mt-1 text-xs text-muted-foreground">
+                                {new Date(last.time).toLocaleTimeString()}
+                              </p>
+                            )}
+                            {screenshot && (
+                              <a
+                                href={`${API}/api/ui/runs/${run.id}/artifacts/${screenshot}`}
+                                target="_blank"
+                                rel="noreferrer"
+                              >
+                                <img
+                                  className="mt-3 max-h-64 rounded border border-border object-contain"
+                                  src={`${API}/api/ui/runs/${run.id}/artifacts/${screenshot}`}
+                                  alt={`步骤 ${i + 1} 执行后截图`}
+                                />
+                              </a>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ol>
+                  </>
+                )}
               </>
             )}
           </section>
         </div>
       )}
-      {tab === "cases" && (
+      {section === "cases" && (
         <section>
           <div className="flex justify-between items-center mb-5">
             <h2 className="font-medium">已保存用例 · {cases.length}</h2>
@@ -1115,7 +1190,7 @@ export default function UITesting() {
           </ul>
         </section>
       )}
-      {tab === "reports" && (
+      {section === "reports" && (
         <section>
           <h2 className="font-medium mb-5">运行历史 · {runs.length}</h2>
           {!runs.length && (
@@ -1146,10 +1221,7 @@ export default function UITesting() {
                 </div>
                 <Button
                   variant="outline"
-                  onClick={() => {
-                    setRunId(item.id);
-                    setTab("execute");
-                  }}
+                  onClick={() => void perform(() => showRecords(item.id))}
                 >
                   查看步骤与报告
                 </Button>

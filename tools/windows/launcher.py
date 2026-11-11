@@ -131,6 +131,7 @@ def check_runtime(root: Path) -> None:
 
     if os.name != "nt":
         return  # Native runtime checks are performed on Windows only.
+    import uiautomator2  # noqa: F401
     for tool, args in [("platform-tools/adb.exe", ["version"]), ("node/node.exe", ["--version"])]:
         executable = root / "runtime" / tool
         result = subprocess.run([str(executable), *args], capture_output=True, text=True,

@@ -14,9 +14,19 @@ export default forwardRef<
     api: string;
     serial: string;
     observationId?: string;
-    onDraft: (token: string) => void;
+    onDraft?: (token: string) => void;
+    liveMessage?: string;
   }
->(function ScrcpyScreen({ api, serial, observationId, onDraft }, ref) {
+>(function ScrcpyScreen(
+  {
+    api,
+    serial,
+    observationId,
+    onDraft,
+    liveMessage = "实时操作 · 切换到选择元素后保存",
+  },
+  ref
+) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const socket = useRef<WebSocket | null>(null);
   const closed = useRef<Promise<void>>(Promise.resolve());
@@ -72,7 +82,7 @@ export default forwardRef<
           }
           c.getContext("2d")?.drawImage(frame, 0, 0);
           setReady(true);
-          setMessage("实时操作 · 切换到选择元素后保存");
+          setMessage(liveMessage);
         }
         frame.close();
       },
@@ -90,7 +100,7 @@ export default forwardRef<
           setMessage(data.error);
           setReady(false);
         }
-        if (data.ready) draftCallback.current(data.token);
+        if (data.ready) draftCallback.current?.(data.token);
         return;
       }
       try {
@@ -160,7 +170,7 @@ export default forwardRef<
       active.current = false;
       if (!disposed) {
         setReady(false);
-        setMessage(m => (m.startsWith("实时操作") ? "操作连接已关闭" : m));
+        setMessage(m => (m === liveMessage ? "投屏连接已关闭" : m));
       }
     };
     return () => {
@@ -170,7 +180,7 @@ export default forwardRef<
       else ws.close();
       decoder.close();
     };
-  }, [api, serial, observationId]);
+  }, [api, serial, observationId, liveMessage]);
   function touch(e: React.PointerEvent<HTMLCanvasElement>, action: number) {
     const c = canvas.current,
       ws = socket.current;

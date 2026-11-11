@@ -177,3 +177,78 @@ def test_selector_cannot_silently_fall_back_to_model():
         ui.Step(id='tap', type='tap', prompt='点击', selector={})
     with pytest.raises(ValidationError, match='结构定位'):
         ui.Step(id='input', type='input', prompt='输入', selector={'label': '测试'})
+
+
+def test_new_step_schema_rejects_missing_coordinates_and_empty_selector():
+    with pytest.raises(ValidationError):
+        ui.Step(id='tap', type='adb_tap', prompt='ADB 点击', options={'x': 25})
+    with pytest.raises(ValidationError):
+        ui.Step(id='element', type='element_assert', prompt='元素断言', selector={}, options={'expected': 'exists'})
+    swipe = ui.Step(id='swipe', type='adb_swipe', prompt='ADB 滑动',
+                    options={'startX': 25, 'startY': 40, 'endX': 25, 'endY': 10})
+    assert swipe.options.durationMs == 300
+
+
+def test_image_baseline_is_local_and_included_in_case_export(tmp_path):
+    import base64
+    import io
+    import zipfile
+    from fastapi import UploadFile
+
+    data = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII=')
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+
+    async def scenario():
+        uploaded = await ui.upload_baseline(request, UploadFile(filename='reference.png', file=io.BytesIO(data)))
+        value = ui.TestCase(name='图像断言', steps=[ui.Step(id='image', type='image_assert', prompt='图像断言',
+                            options={'baselineId': uploaded['id']})])
+        await ui.case_save(value, request)
+        response = await ui.cases_export(ui.ExportRequest(ids=[value.id]), request)
+        with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+            assert archive.read(f"baselines/{uploaded['id']}.png") == data
+            saved = json.loads(archive.read(f'cases/{value.id}.json'))
+            assert saved['steps'][0]['options']['minSimilarity'] == 99
+
+    asyncio.run(scenario())
+
+
+def test_image_assertion_modes_validate_regions_and_preserve_legacy_default():
+    base = {'id': 'compare', 'type': 'image_assert', 'prompt': '图像断言'}
+    baseline = {'baselineId': 'a' * 64}
+    assert ui.Step(**base, options=baseline).options.mode == 'screen'
+    with pytest.raises(ValidationError):
+        ui.Step(**base, options={**baseline, 'mode': 'element'})
+    assert ui.Step(**base, selector={'label': '设置'}, options={**baseline, 'mode': 'element'}).selector.label == '设置'
+    with pytest.raises(ValidationError):
+        ui.Step(**base, options={**baseline, 'mode': 'roi', 'roi': {'left': 20, 'top': 10, 'right': 20, 'bottom': 50}})
+    step = ui.Step(**base, options={**baseline, 'mode': 'roi', 'roi': {'left': 20, 'top': 10, 'right': 40, 'bottom': 50}})
+    assert step.options.roi.right == 40
+
+
+def test_uiautomator2_element_capture_uses_exact_unique_bounds():
+    from PIL import Image
+    from uiautomator2.xpath import XPathEntry
+    from app.ui_element_capture import ElementNotFound, ElementNotUnique, capture_element
+
+    class FakeDevice:
+        wait_timeout = 5
+        node = '<node text="" content-desc="就绪" resource-id="demo:id/status" class="android.widget.TextView" package="demo" bounds="[1,1][4,3]" />'
+        def __init__(self):
+            self.xpath = XPathEntry(self)
+            self.nodes = self.node
+
+        def dump_hierarchy(self):
+            return '<hierarchy>' + self.nodes + '</hierarchy>'
+
+        def screenshot(self):
+            return Image.new('RGB', (8, 8), (1, 2, 3))
+
+    device = FakeDevice()
+    selector = {'resourceId': 'demo:id/status', 'label': '就绪', 'className': 'android.widget.TextView', 'package': 'demo'}
+    assert capture_element(device, selector).size == (3, 2)
+    with pytest.raises(ElementNotFound):
+        capture_element(device, {**selector, 'label': '不匹配'})
+    device.nodes *= 2
+    with pytest.raises(ElementNotUnique):
+        capture_element(device, selector)

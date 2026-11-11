@@ -1,4 +1,5 @@
 import { createCaseRunner, defineNode, z } from "@midscene/test";
+import { isAssertion } from "./protocol.mjs";
 
 // Midscene Test owns step sequencing and stop/continue policy. Only stable IDs
 // enter its result objects; resolved parameters stay inside the execution closure.
@@ -48,7 +49,7 @@ export async function runCase(testCase, execute, onSkip = () => {}) {
           $: {
             timeout: step.timeoutMs + 15000,
             "continue-on-error":
-              step.type === "assert" && step.onFailure === "continue",
+              isAssertion(step.type) && step.onFailure === "continue",
           },
         },
       })),
@@ -60,7 +61,9 @@ export async function runCase(testCase, execute, onSkip = () => {}) {
   if (
     state === "passed" &&
     !testCase.steps.some(
-      s => s.enabled !== false && ["assert", "explore", "scan"].includes(s.type)
+      s =>
+        s.enabled !== false &&
+        (isAssertion(s.type) || ["explore", "scan"].includes(s.type))
     )
   )
     return "needs_review";

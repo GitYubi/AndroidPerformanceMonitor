@@ -1,3 +1,5 @@
+import { matchingNodes } from "./hierarchy.mjs";
+
 export const STEP_TYPES = [
   "action",
   "tap",
@@ -9,7 +11,88 @@ export const STEP_TYPES = [
   "scan",
   "settings",
   "back",
+  "adb_tap",
+  "adb_swipe",
+  "element_assert",
+  "image_assert",
 ];
+export const isAssertion = type =>
+  ["assert", "element_assert", "image_assert"].includes(type);
+export const requiresModel = step =>
+  ["action", "input", "wait", "assert"].includes(step.type) ||
+  (step.type === "tap" && !step.selector) ||
+  (step.type === "explore" && Boolean(step.exploration?.visualAssertion));
+
+const validInteger = (value, min, max) =>
+  Number.isInteger(value) && value >= min && value <= max;
+const elementStates = [
+  "exists",
+  "absent",
+  "enabled",
+  "disabled",
+  "checked",
+  "unchecked",
+];
+
+function validateOptions(step) {
+  const options = step.options;
+  switch (step.type) {
+    case "adb_tap":
+      if (
+        !options ||
+        ![options.x, options.y].every(v => validInteger(v, 0, 32767))
+      )
+        throw new Error("步骤 ADB 点击需要非负整数像素坐标");
+      break;
+    case "adb_swipe":
+      if (
+        !options ||
+        ![options.startX, options.startY, options.endX, options.endY].every(v =>
+          validInteger(v, 0, 32767)
+        ) ||
+        !validInteger(options.durationMs, 1, 10000)
+      )
+        throw new Error("步骤 ADB 滑动坐标或时长无效");
+      break;
+    case "element_assert":
+      if (
+        !options ||
+        !elementStates.includes(options.expected) ||
+        !step.selector
+      )
+        throw new Error("步骤元素断言需要定位条件和预期状态");
+      break;
+    case "image_assert": {
+      if (
+        !options ||
+        !/^[a-f0-9]{64}$/.test(options.baselineId || "") ||
+        !Number.isFinite(options.minSimilarity) ||
+        options.minSimilarity < 0 ||
+        options.minSimilarity > 100 ||
+        !validInteger(options.pixelTolerance, 0, 255)
+      )
+        throw new Error("步骤图像断言的基准图或容差无效");
+      const mode = options.mode ?? "screen";
+      if (!["screen", "element", "roi"].includes(mode))
+        throw new Error("步骤图像断言的截图范围无效");
+      if (mode === "element" && !step.selector)
+        throw new Error("步骤元素区域断言需要定位条件");
+      if (mode === "roi") {
+        const region = options.roi;
+        if (
+          !region ||
+          ![region.left, region.top, region.right, region.bottom].every(value =>
+            validInteger(value, 0, 32767)
+          ) ||
+          region.left >= region.right ||
+          region.top >= region.bottom
+        )
+          throw new Error("步骤 ROI 四角坐标无效");
+      }
+      break;
+    }
+  }
+}
 const identifier = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export function validateJob(job) {
@@ -95,8 +178,13 @@ export function validateJob(job) {
     }
     if (
       step.selector &&
-      (step.type !== "tap" ||
-        !Object.values(step.selector).some(Boolean) ||
+      (!(
+        ["tap", "element_assert"].includes(step.type) ||
+        (step.type === "image_assert" && step.options?.mode === "element")
+      ) ||
+        !Object.values(step.selector).some(
+          value => typeof value === "string" && value.trim()
+        ) ||
         Object.entries(step.selector).some(
           ([key, value]) =>
             !["package", "className", "resourceId", "label"].includes(key) ||
@@ -104,6 +192,7 @@ export function validateJob(job) {
         ))
     )
       throw new Error("步骤结构定位条件无效");
+    validateOptions(step);
     if (step.enabled !== undefined && typeof step.enabled !== "boolean")
       throw new Error("enabled 必须为布尔值");
     if (
@@ -131,7 +220,19 @@ export function substitute(value, parameters) {
   });
 }
 
-export async function executeStep(agent, step, parameters, device) {
+export async function executeStep(
+  agent,
+  step,
+  parameters,
+  device,
+  {
+    captureImage = () => device.screenshot(),
+    captureElement,
+    loadBaseline,
+    onResult = () => {},
+    onImage = () => {},
+  } = {}
+) {
   const prompt = substitute(step.prompt, parameters);
   switch (step.type) {
     case "action":
@@ -156,6 +257,66 @@ export async function executeStep(agent, step, parameters, device) {
       if (typeof passed !== "boolean") throw new Error("模型未返回布尔判断");
       return passed ? "passed" : "failed";
     }
+    case "adb_tap":
+      await device.tapCoordinates(step.options);
+      break;
+    case "adb_swipe":
+      await device.swipeCoordinates(step.options);
+      break;
+    case "element_assert": {
+      const nodes = matchingNodes(await device.read(), step.selector);
+      const expected = step.options.expected;
+      const node = nodes.length === 1 ? nodes[0] : undefined;
+      const passed = {
+        exists: nodes.length > 0,
+        absent: nodes.length === 0,
+        enabled: node?.enabled === true,
+        disabled: node?.enabled === false,
+        checked: node?.checkable === true && node.checked,
+        unchecked: node?.checkable === true && !node.checked,
+      }[expected];
+      onResult(`匹配到 ${nodes.length} 个元素`);
+      return passed ? "passed" : "failed";
+    }
+    case "image_assert": {
+      const { compareScreenshots, cropScreenshot } = await import(
+        "./image-assertion.mjs"
+      );
+      const baseline = await loadBaseline(step.options.baselineId);
+      let actual;
+      if (step.options.mode === "element") {
+        const capture = await captureElement(step.selector);
+        if (!capture.image) {
+          onResult(capture.message);
+          return capture.state;
+        }
+        actual = capture.image;
+      } else {
+        actual = await captureImage();
+        if (step.options.mode === "roi") {
+          const cropped = await cropScreenshot(actual, step.options.roi);
+          if (!cropped.image) {
+            onImage(null);
+            onResult(cropped.message);
+            return "failed";
+          }
+          actual = cropped.image;
+        }
+      }
+      onImage(actual);
+      const { similarity, message } = await compareScreenshots(
+        actual,
+        baseline,
+        step.options.pixelTolerance
+      );
+      onResult(
+        message ||
+          `图像相似度 ${similarity.toFixed(2)}%，阈值 ${step.options.minSimilarity}%`
+      );
+      return similarity !== null && similarity >= step.options.minSimilarity
+        ? "passed"
+        : "failed";
+    }
     case "settings":
       await device.settings();
       break;
@@ -163,6 +324,7 @@ export async function executeStep(agent, step, parameters, device) {
       await device.back();
       break;
     case "screenshot":
+      await captureImage();
       await agent?.recordToReport(prompt);
       break;
   }
