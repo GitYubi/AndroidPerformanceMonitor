@@ -68,6 +68,7 @@ def smoke(archive: Path):
                     page = fetch(url + "/").decode()
                     assert fetch(url + "/ui").decode() == page
                     assert fetch(url + "/monkey").decode() == page
+                    assert fetch(url + "/can?section=trend").decode() == page
                     assert "/umami" not in page
                     assets = re.findall(r'(?:src|href)="(/assets/[^\"]+)"', page)
                     assert len(assets) >= 2

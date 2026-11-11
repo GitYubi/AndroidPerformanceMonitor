@@ -87,7 +87,7 @@ def create_app(root: Path):
         target = (public / path).resolve()
         if target.is_relative_to(public.resolve()) and target.is_file():
             return FileResponse(target)
-        if path in {"", "ui", "monkey"}:
+        if path in {"", "ui", "monkey", "can"}:
             return FileResponse(public / "index.html")
         raise HTTPException(status_code=404)
 
