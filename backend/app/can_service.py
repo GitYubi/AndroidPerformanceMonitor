@@ -175,6 +175,73 @@ class CanService:
             tasks = [{'channel': ch, 'name': name, 'signals': task['data'], 'active': task['func'].is_alive(), 'error': getattr(task['func'], 'error', None)} for (ch, name), task in d.thread_messages.items()]
         return {'open': True, 'channels': list(d.channels), 'recording': d.custom_log is not None, 'tasks': tasks, 'error': self.error or d.receive_error, 'hardware_periodic': d.hardware_periodic, 'wake_active': d.wake_active, 'dbc_path': str(self.dbc_path or '')}
 
+    def _ui_message(self, device, options):
+        if options['dbcKey'] != self.dbc_key:
+            raise ValueError('当前 DBC 与步骤配置不同，请在总线页面打开对应 DBC')
+        channel, name = options['channel'], options['message']
+        if channel not in device.channels:
+            raise ValueError(f'请先在总线页面打开通道 {channel}')
+        try:
+            return device.db.get_message_by_name(name)
+        except KeyError as exc:
+            raise ValueError(f'当前 DBC 中没有报文 {name}') from exc
+
+    def prepare_ui_run(self, steps):
+        with self.lock:
+            if not self.dbc_key:
+                raise ValueError('请先在总线页面打开 DBC')
+            if self.device is None or self.stop.is_set():
+                raise ValueError('请先在总线页面打开设备和通道')
+            device = self.device
+            with device._state_lock:
+                for _, options in steps:
+                    message = self._ui_message(device, options)
+                    for name, value in options.get('signals', {}).items():
+                        try:
+                            signal = message.get_signal_by_name(name)
+                        except KeyError as exc:
+                            raise ValueError(f'{message.name} 没有信号 {name}') from exc
+                        resolve_signal_value(signal, value, message.name)
+            return self.receive_session
+
+    def execute_ui_step(self, kind, options, session, owned):
+        with self.lock:
+            device = self.device
+            if device is None or self.stop.is_set() or session != self.receive_session:
+                raise ValueError('总线连接已改变，请重新执行用例')
+            with device._state_lock:
+                message = self._ui_message(device, options)
+                key = (options['channel'], message.name)
+                if kind == 'can_stop':
+                    self.break_msg_by_name(*key)
+                    owned.pop(key, None)
+                    return f'已停止通道 {key[0]} 的 {message.name}'
+                looping = kind == 'can_send_loop'
+                period = options['cycleMs'] if looping else None
+                period = period or message.cycle_time or 100
+                self.send_msg_by_name(*key, options['signals'], can_fd=message.is_fd,
+                                      cycle_time=period, send_count=-1 if looping else 1)
+                if looping:
+                    owned[key] = device.thread_messages[key]
+                    return f'已启动循环发送 · 通道 {key[0]} · {message.name} · {period} ms'
+                owned.pop(key, None)
+                return f'已发送 1 帧 · 通道 {key[0]} · {message.name}'
+
+    def stop_ui_sends(self, session, owned):
+        errors = []
+        with self.lock:
+            device = self.device
+            if device is None or session != self.receive_session:
+                return errors
+            with device._state_lock:
+                for key, task in owned.items():
+                    if device.thread_messages.get(key) is task:
+                        try:
+                            self.break_msg_by_name(*key)
+                        except (RuntimeError, OSError, ValueError) as exc:
+                            errors.append(f'通道 {key[0]} 的 {key[1]}：{exc}')
+        return errors
+
     def send_msg_by_name(self, channel, name, signals, can_fd=True, fd_brs=False, cycle_time=100, send_count=-1):
         d = self.require(); message = d.db.get_message_by_name(name)
         values = {key: resolve_signal_value(message.get_signal_by_name(key), value, name) for key, value in signals.items()}

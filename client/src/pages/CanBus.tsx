@@ -1,5 +1,11 @@
 import { useCallback, useEffect, useState, type SetStateAction } from "react";
 import { BACKEND_URL } from "@/lib/backend";
+import type {
+  CanCatalog as Catalog,
+  CanMessage as Message,
+  CanSignal as Signal,
+  CanValue as Value,
+} from "@/lib/canCatalog";
 import { getCanSection } from "@/lib/canNavigation";
 import { useSearchParams } from "wouter";
 import { toast } from "sonner";
@@ -7,7 +13,6 @@ import CanSignalTrend, {
   type SignalSelection,
 } from "@/components/CanSignalTrend";
 
-type Value = number | { raw: number };
 type Draft = {
   values: Record<string, string>;
   period: number;
@@ -16,32 +21,6 @@ type Draft = {
   brs: boolean;
 };
 type Profile = Record<string, Record<string, Value>>;
-type Signal = {
-  name: string;
-  minimum: number | null;
-  maximum: number | null;
-  scale: number;
-  unit: string | null;
-  comment: string | null;
-  choices: { raw: number; label: string }[];
-  multiplexer: string | null;
-  multiplexer_ids: number[] | null;
-};
-type Message = {
-  name: string;
-  id: number;
-  can_fd: boolean;
-  extended: boolean;
-  length: number;
-  cycle_time: number;
-  signals: Signal[];
-};
-type Catalog = {
-  path: string;
-  key: string;
-  messages: Message[];
-  message_count: number;
-};
 type Task = {
   channel: number;
   name: string;

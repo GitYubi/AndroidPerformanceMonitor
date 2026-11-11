@@ -35,7 +35,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     manager.store.recover_interrupted_sessions()
     app.state.manager = manager
     app.state.interactions = InteractionTraceManager(DATA_ROOT)
-    app.state.ui = UIManager(DATA_ROOT.parent / 'ui-data', manager)
+    app.state.ui = UIManager(DATA_ROOT.parent / 'ui-data', manager, app.state.can)
     app.state.ui_drafts = {}
     app.state.ui_map = MapStore(DATA_ROOT.parent / 'ui-data')
     manager.ui_manager = app.state.ui

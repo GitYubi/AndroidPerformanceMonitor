@@ -105,6 +105,104 @@ def test_cancel_and_abnormal_exit_have_terminal_state(monkeypatch, tmp_path):
     asyncio.run(scenario())
 
 
+def can_step(kind, key, message, signals=None, period=None):
+    options = {'dbcKey': key, 'channel': 0, 'message': message}
+    if signals is not None:
+        options['signals'] = signals
+    if period is not None:
+        options['cycleMs'] = period
+    return {'id': kind, 'type': kind, 'prompt': kind, 'options': options}
+
+
+def test_can_steps_use_selected_dbc_and_share_the_bus(monkeypatch, tmp_path):
+    if not (ui.RUNNER.parent / 'node_modules' / '@midscene' / 'test').is_dir():
+        pytest.skip('需要安装 UI 执行器依赖')
+    monkeypatch.setenv('ZCAN_DATA_DIR', str(tmp_path / 'zcan'))
+    from app.can_service import ROOT
+
+    async def no_adb():
+        pytest.fail('纯 CAN 用例不应读取 ADB 设备')
+    monkeypatch.setattr(ui, 'list_devices', no_adb)
+
+    async def scenario():
+        bus = ui.CanService()
+        manager = ui.UIManager(tmp_path / 'ui', can=bus)
+        dbc = str(ROOT / 'config' / 'Example.dbc')
+        def request(key):
+            return ui.RunRequest(serial='', testCase=case(parameters=[], steps=[
+                can_step('can_send_once', key, 'TestButtons', {'PressA': {'raw': 1}, 'PressB': 1}),
+                can_step('can_send_loop', key, 'TestClassicA', {'Value': 17}, 20),
+                {'id': 'delay', 'type': 'delay', 'prompt': '等待时间', 'options': {'durationMs': 100}},
+                can_step('can_stop', key, 'TestClassicA'),
+            ]))
+
+        with pytest.raises(ValueError, match='打开 DBC'):
+            await manager.start(request('0' * 64))
+        bus.load_dbc(dbc)
+        with pytest.raises(ValueError, match='打开设备'):
+            await manager.start(request(bus.dbc_key))
+        bus.open('simulation', dbc, [0])
+        try:
+            with pytest.raises(ValueError, match='DBC 与步骤配置不同'):
+                await manager.start(request('0' * 64))
+            run = await manager.start(request(bus.dbc_key))
+            await asyncio.wait_for(manager.tasks[run['id']], 10)
+            result = manager.store.get('runs', run['id'])
+            assert result['state'] == 'needs_review'
+            passed = [event for event in manager.store.events(run['id'])
+                      if event['type'] == 'step' and event['state'] == 'passed']
+            assert [event['stepId'] for event in passed] == ['can_send_once', 'can_send_loop', 'delay', 'can_stop']
+            await asyncio.sleep(.15)
+            frames = list(bus.frames)
+            once = [frame for frame in frames if frame['arbitration_id'] == 0x287]
+            assert len(once) == 1 and once[0]['data'][0] == 3 and once[0]['is_fd']
+            repeated = [frame for frame in frames if frame['arbitration_id'] == 6]
+            assert len(repeated) > 1 and all(frame['data'][0] == 17 and not frame['is_fd'] for frame in repeated)
+            assert not any(task['active'] for task in bus.status()['tasks'])
+            await asyncio.sleep(.1)
+            assert len(bus.frames) == len(frames)
+        finally:
+            bus.close()
+    asyncio.run(scenario())
+
+
+def test_cancel_can_loop_keeps_unrelated_sends(monkeypatch, tmp_path):
+    setup_worker(monkeypatch, tmp_path, """
+      import { createInterface } from 'node:readline';
+      const input = createInterface({ input: process.stdin });
+      const lines = input[Symbol.asyncIterator]();
+      const job = JSON.parse((await lines.next()).value);
+      console.log(JSON.stringify({ protocol: 1, type: 'can_request', stepId: job.testCase.steps[0].id }));
+      const reply = JSON.parse((await lines.next()).value);
+      if (!reply.ok) process.exit(2);
+      setInterval(() => {}, 1000);
+    """)
+    monkeypatch.setenv('ZCAN_DATA_DIR', str(tmp_path / 'zcan'))
+
+    async def scenario():
+        bus = ui.CanService()
+        bus.open('simulation', '', [0, 1])
+        try:
+            bus.send_msg_by_name(1, 'TestButtons', {'PressB': 1})
+            manager = ui.UIManager(tmp_path / 'ui', can=bus)
+            request = ui.RunRequest(serial='', testCase=case(parameters=[], steps=[
+                can_step('can_send_loop', bus.dbc_key, 'TestButtons', {'PressA': 1}, 25),
+            ]))
+            run = await manager.start(request)
+            for _ in range(100):
+                if any(frame['channel'] == 0 for frame in bus.frames):
+                    break
+                await asyncio.sleep(.02)
+            else:
+                pytest.fail('循环发送未开始')
+            result = await manager.cancel(run['id'])
+            assert result['state'] == 'cancelled'
+            assert [(task['channel'], task['name']) for task in bus.status()['tasks'] if task['active']] == [(1, 'TestButtons')]
+        finally:
+            bus.close()
+    asyncio.run(scenario())
+
+
 def test_log_export_preserves_device_files_when_ui_overlaps(monkeypatch, tmp_path):
     commands = []
 
@@ -224,6 +322,26 @@ def test_image_assertion_modes_validate_regions_and_preserve_legacy_default():
         ui.Step(**base, options={**baseline, 'mode': 'roi', 'roi': {'left': 20, 'top': 10, 'right': 20, 'bottom': 50}})
     step = ui.Step(**base, options={**baseline, 'mode': 'roi', 'roi': {'left': 20, 'top': 10, 'right': 40, 'bottom': 50}})
     assert step.options.roi.right == 40
+
+
+def test_screenshot_comparison_references_prior_steps_and_survives_draft_creation():
+    first = {'id': 'before', 'type': 'screenshot', 'prompt': '截图',
+             'options': {'captureName': '图片1'}}
+    second = {'id': 'after', 'type': 'screenshot', 'prompt': '旧用例截图'}
+    compare = {'id': 'compare', 'type': 'screenshot_assert', 'prompt': '前后截图对比',
+               'options': {'firstStepId': 'before', 'secondStepId': 'after', 'relation': 'different'}}
+    original = case(parameters=[], steps=[first, second, compare])
+    assert original.steps[-1].options.minSimilarity == 100
+    assert original.steps[-1].options.pixelTolerance == 0
+    assert original.steps[1].options is None
+    for steps in ([first, compare, second], [first, {**second, 'enabled': False}, compare]):
+        with pytest.raises(ValidationError, match='前面已启用'):
+            case(parameters=[], steps=steps)
+    draft = ui.draft_from_run({'testCase': original.model_dump()}, [])['testCase']
+    first, second, assertion = draft['steps']
+    assert first['id'] != 'before'
+    assert assertion['options']['firstStepId'] == first['id']
+    assert assertion['options']['secondStepId'] == second['id']
 
 
 def test_uiautomator2_element_capture_uses_exact_unique_bounds():

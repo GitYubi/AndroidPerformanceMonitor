@@ -1,10 +1,12 @@
 import { matchingNodes } from "./hierarchy.mjs";
+import { setTimeout as sleep } from "node:timers/promises";
 
 export const STEP_TYPES = [
   "action",
   "tap",
   "input",
   "wait",
+  "delay",
   "assert",
   "screenshot",
   "explore",
@@ -15,9 +17,19 @@ export const STEP_TYPES = [
   "adb_swipe",
   "element_assert",
   "image_assert",
+  "screenshot_assert",
+  "can_send_once",
+  "can_send_loop",
+  "can_stop",
 ];
+export const isCanStep = type =>
+  ["can_send_once", "can_send_loop", "can_stop"].includes(type);
+export const stepDeadlineMs = step =>
+  step.type === "delay" ? step.options.durationMs + 1000 : step.timeoutMs;
 export const isAssertion = type =>
-  ["assert", "element_assert", "image_assert"].includes(type);
+  ["assert", "element_assert", "image_assert", "screenshot_assert"].includes(
+    type
+  );
 export const requiresModel = step =>
   ["action", "input", "wait", "assert"].includes(step.type) ||
   (step.type === "tap" && !step.selector) ||
@@ -37,6 +49,10 @@ const elementStates = [
 function validateOptions(step) {
   const options = step.options;
   switch (step.type) {
+    case "delay":
+      if (!validInteger(options?.durationMs, 1, 300000))
+        throw new Error("步骤等待时长须为 1–300000 毫秒");
+      break;
     case "adb_tap":
       if (
         !options ||
@@ -62,6 +78,36 @@ function validateOptions(step) {
       )
         throw new Error("步骤元素断言需要定位条件和预期状态");
       break;
+    case "screenshot":
+      if (
+        options != null &&
+        (typeof (options.captureName ?? "") !== "string" ||
+          [...(options.captureName ?? "")].length > 100)
+      )
+        throw new Error("步骤截图名称须为 100 字以内的文本");
+      break;
+    case "screenshot_assert": {
+      const {
+        firstStepId,
+        secondStepId,
+        relation = "same",
+        minSimilarity = 100,
+        pixelTolerance = 0,
+      } = options ?? {};
+      if (
+        ![firstStepId, secondStepId].every(
+          id => typeof id === "string" && identifier.test(id)
+        ) ||
+        firstStepId === secondStepId ||
+        !["same", "different"].includes(relation) ||
+        !Number.isFinite(minSimilarity) ||
+        minSimilarity < 0 ||
+        minSimilarity > 100 ||
+        !validInteger(pixelTolerance, 0, 255)
+      )
+        throw new Error("步骤截图对比需要两张不同截图及有效的对比参数");
+      break;
+    }
     case "image_assert": {
       if (
         !options ||
@@ -96,9 +142,7 @@ function validateOptions(step) {
 const identifier = /^[a-zA-Z0-9_-]{1,64}$/;
 
 export function validateJob(job) {
-  if (!job || !/^[a-zA-Z0-9._:-]{1,128}$/.test(job.serial || ""))
-    throw new Error("必须指定合法设备序列号");
-  const test = job.testCase;
+  const test = job?.testCase;
   if (
     !test ||
     test.schemaVersion !== 1 ||
@@ -107,6 +151,17 @@ export function validateJob(job) {
     test.steps.length > 100
   )
     throw new Error("用例需要 schemaVersion=1 和 1–100 个步骤");
+  const enabled = test.steps.filter(step => step.enabled !== false);
+  const deviceFree =
+    enabled.length > 0 &&
+    enabled.every(step => isCanStep(step.type) || step.type === "delay");
+  if (
+    typeof job.serial !== "string" ||
+    !(
+      deviceFree ? /^[a-zA-Z0-9._:-]{0,128}$/ : /^[a-zA-Z0-9._:-]{1,128}$/
+    ).test(job.serial)
+  )
+    throw new Error("必须指定合法设备序列号");
   const ids = new Set();
   for (const step of test.steps) {
     if (!identifier.test(step.id || "") || ids.has(step.id))
@@ -202,9 +257,18 @@ export function validateJob(job) {
       throw new Error("失败策略非法");
   }
   const params = job.parameters || {};
-  for (const step of test.steps.filter(s => s.enabled !== false)) {
+  const captured = new Set();
+  for (const step of enabled) {
     substitute(step.prompt, params);
     if (step.type === "input") substitute(step.value, params);
+    if (step.type === "screenshot") captured.add(step.id);
+    if (
+      step.type === "screenshot_assert" &&
+      ![step.options.firstStepId, step.options.secondStepId].every(id =>
+        captured.has(id)
+      )
+    )
+      throw new Error("步骤截图对比只能引用前面已启用的 ADB 截图步骤");
   }
   return job;
 }
@@ -229,6 +293,8 @@ export async function executeStep(
     captureImage = () => device.screenshot(),
     captureElement,
     loadBaseline,
+    loadScreenshot,
+    sensitive = false,
     onResult = () => {},
     onImage = () => {},
   } = {}
@@ -250,6 +316,10 @@ export async function executeStep(
       break;
     case "wait":
       await agent.aiWaitFor(prompt, { timeoutMs: step.timeoutMs });
+      break;
+    case "delay":
+      await sleep(step.options.durationMs);
+      onResult(`已等待 ${step.options.durationMs / 1000} 秒`);
       break;
     case "assert": {
       // A false result is a test failure; a rejected model call is an execution error.
@@ -317,16 +387,55 @@ export async function executeStep(
         ? "passed"
         : "failed";
     }
+    case "screenshot_assert": {
+      const {
+        firstStepId,
+        secondStepId,
+        relation = "same",
+        minSimilarity = 100,
+        pixelTolerance = 0,
+      } = step.options;
+      const first = loadScreenshot?.(firstStepId);
+      const second = loadScreenshot?.(secondStepId);
+      if (!first || !second) {
+        onResult("缺少本次用例的截图，请检查前面的截图步骤");
+        return "error";
+      }
+      const { compareScreenshots } = await import("./image-assertion.mjs");
+      const { similarity, message } = await compareScreenshots(
+        second,
+        first,
+        pixelTolerance,
+        "第一张截图"
+      );
+      const same = similarity !== null && similarity >= minSimilarity;
+      const expected = relation === "same" ? "相同" : "不同";
+      onResult(
+        similarity === null
+          ? `期望${expected} · 尺寸不同 · ${message}`
+          : `期望${expected} · 相似度 ${Number(similarity.toFixed(6))}% · 相同阈值 ${minSimilarity}%`
+      );
+      return same === (relation === "same") ? "passed" : "failed";
+    }
     case "settings":
       await device.settings();
       break;
     case "back":
       await device.back();
       break;
-    case "screenshot":
-      await captureImage();
-      await agent?.recordToReport(prompt);
+    case "screenshot": {
+      const image = await captureImage();
+      const name = step.options?.captureName?.trim();
+      if (name) onResult(`已截图 · ${name}`);
+      if (agent && !sensitive) {
+        await agent.recordToReport(prompt, {
+          screenshots: [
+            { base64: image.toString("base64"), description: name },
+          ],
+        });
+      }
       break;
+    }
   }
   return "passed";
 }

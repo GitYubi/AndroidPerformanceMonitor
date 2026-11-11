@@ -14,7 +14,12 @@ export async function cropScreenshot(image, { left, top, right, bottom }) {
   };
 }
 
-export async function compareScreenshots(actual, baseline, pixelTolerance) {
+export async function compareScreenshots(
+  actual,
+  baseline,
+  pixelTolerance,
+  baselineLabel = "基准图"
+) {
   const decode = image =>
     sharp(image, { limitInputPixels: 16_000_000 })
       .toColourspace("srgb")
@@ -29,7 +34,7 @@ export async function compareScreenshots(actual, baseline, pixelTolerance) {
   if (current.info.width !== width || current.info.height !== height)
     return {
       similarity: null,
-      message: `截图尺寸 ${current.info.width}×${current.info.height}，基准图 ${width}×${height}`,
+      message: `截图尺寸 ${current.info.width}×${current.info.height}，${baselineLabel} ${width}×${height}`,
     };
   let matchingPixels = 0;
   for (let i = 0; i < current.data.length; i += 4) {

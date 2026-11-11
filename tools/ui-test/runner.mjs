@@ -1,11 +1,14 @@
 import { readFileSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { createInterface } from "node:readline";
 import { loadConfig } from "./config.mjs";
 import { captureElement } from "./element-capture.mjs";
 import {
   validateJob,
   executeStep,
+  isCanStep,
   requiresModel,
+  stepDeadlineMs,
   substitute,
 } from "./protocol.mjs";
 
@@ -25,6 +28,11 @@ let currentStep;
 let navigation;
 let terminal = false;
 let watchdog;
+const ipc =
+  process.argv[2] === "--ipc"
+    ? createInterface({ input: process.stdin })
+    : null;
+const replies = ipc?.[Symbol.asyncIterator]();
 const finish = (state, extra = {}) => {
   if (terminal) return;
   terminal = true;
@@ -42,7 +50,11 @@ process.on("SIGINT", () => {
 try {
   loadConfig();
   const job = validateJob(
-    JSON.parse(readFileSync(process.argv[2] || 0, "utf8"))
+    JSON.parse(
+      replies
+        ? (await replies.next()).value
+        : readFileSync(process.argv[2] || 0, "utf8")
+    )
   );
   watchdog = setTimeout(
     () => {
@@ -52,6 +64,18 @@ try {
     Math.min(3600, Math.max(10, job.timeoutSeconds || 900)) * 1000
   );
   const enabled = job.testCase.steps.filter(step => step.enabled !== false);
+  const screenshots = new Map();
+  for (const step of enabled) {
+    if (step.type === "screenshot_assert") {
+      for (const id of [step.options.firstStepId, step.options.secondStepId]) {
+        const capture = screenshots.get(id) ?? { remaining: 0 };
+        capture.remaining++;
+        screenshots.set(id, capture);
+      }
+    }
+  }
+  if (enabled.some(step => isCanStep(step.type)) && !replies)
+    throw new Error("步骤包含 CAN 操作，请通过工作台运行");
   const needsModel = enabled.some(requiresModel);
   if (needsModel && !process.env.MIDSCENE_MODEL_API_KEY?.trim())
     throw new Error("缺少 MIDSCENE_MODEL_API_KEY，请在本机配置");
@@ -72,9 +96,10 @@ try {
   const { runCase } = await import("./framework.mjs");
   const { exploreTree } = await import("./explore.mjs");
   const { createTreeDevice } = await import("./hierarchy.mjs");
-  const treeDevice = createTreeDevice(job.serial);
+  const treeDevice = job.serial ? createTreeDevice(job.serial) : null;
   // Sensitive input is omitted from our events. Disable SDK report for these runs,
-  // because SDK reports may retain raw inputs; screenshots are also suppressed.
+  // because SDK reports may retain raw inputs. Explicit captures stay in memory
+  // for comparisons, but sensitive runs never write screenshot files.
   const sensitive = Boolean(
     job.sensitive || job.testCase.parameters?.some(p => p.secret)
   );
@@ -145,8 +170,22 @@ try {
         });
         finish("error");
         process.exit(124);
-      }, step.timeoutMs);
+      }, stepDeadlineMs(step));
       try {
+        if (isCanStep(step.type)) {
+          emit({ type: "can_request", stepId: step.id });
+          const { value, done } = await replies.next();
+          const response = done ? null : JSON.parse(value);
+          if (response?.stepId !== step.id) throw new Error("CAN 步骤响应无效");
+          const state = response.ok ? "passed" : "error";
+          emit({
+            type: "step",
+            stepId: step.id,
+            state,
+            message: response.message,
+          });
+          return state;
+        }
         let capturedImage;
         let message;
         const execute = () =>
@@ -165,6 +204,15 @@ try {
               capturedImage = image;
             },
             loadBaseline: id => readFileSync(baselinePath(id)),
+            sensitive,
+            loadScreenshot: id => {
+              const capture = screenshots.get(id);
+              if (!capture) return;
+              if (--capture.remaining === 0) screenshots.delete(id);
+              return typeof capture.source === "string"
+                ? readFileSync(capture.source)
+                : capture.source;
+            },
             onResult: text => {
               message = text;
             },
@@ -192,7 +240,12 @@ try {
               )
             : await execute();
         let screenshot;
-        if (!sensitive && (step.type !== "image_assert" || capturedImage)) {
+        if (
+          !sensitive &&
+          step.type !== "delay" &&
+          step.type !== "screenshot_assert" &&
+          (step.type !== "image_assert" || capturedImage)
+        ) {
           try {
             screenshot = `${step.id}.png`;
             const png = capturedImage ?? (await treeDevice.screenshot());
@@ -201,6 +254,11 @@ try {
             screenshot = undefined;
           }
         }
+        const capture = screenshots.get(step.id);
+        if (capture)
+          capture.source = screenshot
+            ? resolve(root, screenshot)
+            : capturedImage;
         emit({
           type: "step",
           stepId: step.id,
@@ -243,4 +301,5 @@ try {
   process.exitCode = 1;
 } finally {
   clearTimeout(watchdog);
+  ipc?.close();
 }

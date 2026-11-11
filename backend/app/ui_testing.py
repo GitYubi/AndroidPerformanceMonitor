@@ -19,9 +19,10 @@ from typing import Literal
 
 from fastapi import APIRouter, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model_validator
 
 from .adb import list_devices
+from .can_service import CanService
 from .ui_navigation import NavigationStore
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,6 +67,11 @@ class SwipeCoordinates(BaseModel):
     durationMs: int = Field(default=300, ge=1, le=10000, strict=True)
 
 
+class DelayOptions(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    durationMs: int = Field(ge=1, le=300000, strict=True)
+
+
 class ElementCheck(BaseModel):
     model_config = ConfigDict(extra='forbid')
     expected: Literal['exists', 'absent', 'enabled', 'disabled', 'checked', 'unchecked'] = 'exists'
@@ -100,19 +106,73 @@ class ImageCheck(BaseModel):
         return self
 
 
+class ScreenshotOptions(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    captureName: str = Field(default='', max_length=100)
+
+
+class ScreenshotCheck(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    firstStepId: str = Field(pattern=NAME)
+    secondStepId: str = Field(pattern=NAME)
+    relation: Literal['same', 'different'] = 'same'
+    minSimilarity: float = Field(default=100, ge=0, le=100)
+    pixelTolerance: int = Field(default=0, ge=0, le=255, strict=True)
+
+    @model_validator(mode='after')
+    def validate_pair(self):
+        if self.firstStepId == self.secondStepId:
+            raise ValueError('请选择两个不同的截图步骤')
+        return self
+
+
+class CanTarget(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    dbcKey: str = Field(pattern=r'^[a-f0-9]{64}$')
+    channel: int = Field(ge=0, le=1, strict=True)
+    message: str = Field(min_length=1, max_length=512)
+
+
+class RawCanValue(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    raw: StrictInt
+
+
+class CanSendOptions(CanTarget):
+    signals: dict[str, StrictInt | FiniteFloat | RawCanValue] = Field(min_length=1)
+    cycleMs: int | None = Field(default=None, ge=1, strict=True)
+
+    @model_validator(mode='before')
+    @classmethod
+    def numeric_values(cls, data):
+        if isinstance(data, dict) and isinstance(data.get('signals'), dict):
+            if any(type(value) not in (int, float, dict) for value in data['signals'].values()):
+                raise ValueError('CAN 信号值必须为数值或 DBC 枚举')
+        return data
+
+
+CAN_STEPS = {'can_send_once', 'can_send_loop', 'can_stop'}
+DEVICE_FREE_STEPS = CAN_STEPS | {'delay'}
 STEP_OPTIONS = {
+    'delay': DelayOptions,
     'adb_tap': TapCoordinates,
     'adb_swipe': SwipeCoordinates,
     'element_assert': ElementCheck,
     'image_assert': ImageCheck,
+    'screenshot': ScreenshotOptions,
+    'screenshot_assert': ScreenshotCheck,
+    'can_send_once': CanSendOptions,
+    'can_send_loop': CanSendOptions,
+    'can_stop': CanTarget,
 }
 
 
 class Step(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=NAME)
-    type: Literal['action', 'tap', 'input', 'wait', 'assert', 'screenshot', 'explore', 'scan', 'settings', 'back',
-                  'adb_tap', 'adb_swipe', 'element_assert', 'image_assert']
+    type: Literal['action', 'tap', 'input', 'wait', 'delay', 'assert', 'screenshot', 'explore', 'scan', 'settings', 'back',
+                  'adb_tap', 'adb_swipe', 'element_assert', 'image_assert', 'screenshot_assert',
+                  'can_send_once', 'can_send_loop', 'can_stop']
     prompt: str = Field(min_length=1, max_length=8000)
     value: str = Field(default='', max_length=8000)
     timeoutMs: int = Field(default=60000, ge=1000, le=300000)
@@ -120,7 +180,8 @@ class Step(BaseModel):
     onFailure: Literal['stop', 'continue'] = 'stop'
     exploration: ExploreScope | None = None
     selector: Selector | None = None
-    options: TapCoordinates | SwipeCoordinates | ElementCheck | ImageCheck | None = None
+    options: (DelayOptions | TapCoordinates | SwipeCoordinates | ElementCheck | ImageCheck | ScreenshotOptions |
+              ScreenshotCheck | CanSendOptions | CanTarget | None) = None
 
     @model_validator(mode='after')
     def validate_step(self):
@@ -131,8 +192,11 @@ class Step(BaseModel):
         if (self.type == 'element_assert' or element_image) and self.selector is None:
             raise ValueError('请至少填写一个元素定位条件')
         options_model = STEP_OPTIONS.get(self.type)
-        if options_model and not isinstance(self.options, options_model):
+        legacy_screenshot = self.type == 'screenshot' and self.options is None
+        if options_model and not legacy_screenshot and not isinstance(self.options, options_model):
             raise ValueError('步骤缺少对应的参数')
+        if self.type == 'can_stop' and isinstance(self.options, CanSendOptions):
+            raise ValueError('停止发送只需要 DBC、通道和报文')
         if not options_model and self.options is not None:
             raise ValueError('该步骤类型不使用结构化参数')
         if self.type in {'explore', 'scan'}:
@@ -174,16 +238,22 @@ class TestCase(BaseModel):
             raise ValueError('参数名不可重复')
         if any(p.secret and p.default for p in self.parameters):
             raise ValueError('敏感参数不可保存默认值，请在执行时输入')
-        for step in self.steps:
+        captured = set()
+        for index, step in enumerate(self.steps, start=1):
             references = REFERENCE.findall(step.prompt + ' ' + step.value)
             if any(name not in names for name in references):
                 raise ValueError('步骤引用了未声明的参数')
+            if step.enabled and step.type == 'screenshot':
+                captured.add(step.id)
+            if step.enabled and isinstance(step.options, ScreenshotCheck):
+                if not {step.options.firstStepId, step.options.secondStepId} <= captured:
+                    raise ValueError(f'第 {index} 步只能引用前面已启用的 ADB 截图步骤')
         return self
 
 
 class RunRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    serial: str = Field(pattern=r'^[a-zA-Z0-9._:-]{1,128}$')
+    serial: str = Field(pattern=r'^[a-zA-Z0-9._:-]{0,128}$')
     testCase: TestCase
     parameters: dict[str, str] = Field(default_factory=dict, max_length=50)
     timeoutSeconds: int = Field(default=900, ge=10, le=3600)
@@ -268,6 +338,7 @@ def draft_from_run(run: dict, events: list[dict]) -> dict:
         if not parameter['secret']:
             parameter['default'] = run.get('parameters', {}).get(parameter['name'], parameter['default'])
     steps, warnings = [], []
+    new_ids = {step['id']: uuid.uuid4().hex for step in result['steps']}
     for original in result['steps']:
         if original['type'] == 'explore':
             observations = [e for e in events if e.get('type') == 'exploration' and e.get('stepId') == original['id']]
@@ -300,7 +371,14 @@ def draft_from_run(run: dict, events: list[dict]) -> dict:
         if original['type'] == 'action' and converted and completed and len(steps) + len(converted) + len(result['steps']) <= 100:
             steps.extend(converted)
         else:
-            steps.append({**original, 'id': uuid.uuid4().hex})
+            step = {**original, 'id': new_ids[original['id']]}
+            if step['type'] == 'screenshot_assert':
+                step['options'] = {
+                    **step['options'],
+                    **{key: new_ids.get(step['options'][key], step['options'][key])
+                       for key in ('firstStepId', 'secondStepId')},
+                }
+            steps.append(step)
             if original['type'] == 'action':
                 warnings.append('部分动作缺少完整语义定位或未完成，保留了原自然语言步骤，请检查前置页面。')
     result['steps'] = steps
@@ -308,10 +386,11 @@ def draft_from_run(run: dict, events: list[dict]) -> dict:
 
 
 class UIManager:
-    def __init__(self, root: Path, monitor=None):
+    def __init__(self, root: Path, monitor=None, can: CanService | None = None):
         self.store = UIStore(root)
         self.navigation = NavigationStore(root)
         self.monitor = monitor
+        self.can = can
         self.tasks: dict[str, asyncio.Task] = {}
         self.processes: dict[str, asyncio.subprocess.Process] = {}
         self.cancelled: set[str] = set()
@@ -376,12 +455,23 @@ class UIManager:
         return env
 
     async def start(self, request: RunRequest):
-        async with self.lock, self.device_lock(request.serial):
-            if self.has_active_device(request.serial):
-                raise ValueError('该设备已有 UI 测试运行中')
-            devices = await list_devices()
-            if not any(d.serial == request.serial and d.state == 'device' for d in devices):
-                raise ValueError('指定设备未连接或未授权')
+        enabled = [step for step in request.testCase.steps if step.enabled]
+        can_steps = {step.id: (step.type, step.options.model_dump())
+                     for step in enabled if step.type in CAN_STEPS}
+        needs_device = not enabled or any(step.type not in DEVICE_FREE_STEPS for step in enabled)
+        serial = request.serial if needs_device else ''
+        async with self.lock, self.device_lock(serial):
+            if self.has_active_device(serial):
+                raise ValueError('该设备已有 UI 测试运行中' if needs_device else '已有本机用例运行中')
+            if needs_device:
+                devices = await list_devices()
+                if not any(d.serial == serial and d.state == 'device' for d in devices):
+                    raise ValueError('指定设备未连接或未授权')
+            can_session = None
+            if can_steps:
+                if self.can is None:
+                    raise ValueError('总线服务不可用')
+                can_session = await asyncio.to_thread(self.can.prepare_ui_run, can_steps.values())
             parameters = {p.name: p.default for p in request.testCase.parameters}
             if set(request.parameters) - set(parameters):
                 raise ValueError('存在未声明的执行参数')
@@ -396,13 +486,13 @@ class UIManager:
             output = (Path(settings['reportRoot']) if settings['reportRoot'] else self.store.root / 'runs') / run_id
             output.mkdir(parents=True, exist_ok=True)
             performance_id = None
-            if self.monitor:
+            if self.monitor and serial:
                 for runtime in self.monitor.active.values():
-                    if runtime.request.serial == request.serial:
+                    if runtime.request.serial == serial:
                         performance_id = runtime.session_id
                         runtime.preserve_device_logs = True
             run = {
-                'id': run_id, 'serial': request.serial, 'state': 'queued',
+                'id': run_id, 'serial': serial, 'state': 'queued',
                 'createdAt': int(time.time() * 1000), 'endedAt': None,
                 'testCase': request.testCase.model_dump(), 'performanceSessionId': performance_id,
                 'outputDir': str(output.resolve()), 'report': None,
@@ -411,15 +501,16 @@ class UIManager:
                 'kind': 'scan' if any(s.type == 'scan' for s in request.testCase.steps) else 'test',
             }
             self.store.put('runs', run)
-            job = {'serial': request.serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
+            job = {'serial': serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
             job['baselineDir'] = str(self.store.baselines.resolve())
             job['pythonExecutable'] = sys.executable
-            if not run['sensitive']:
+            if serial and not run['sensitive']:
                 try:
-                    job['navigation'] = self.navigation.load(request.serial)
+                    job['navigation'] = self.navigation.load(serial)
                 except (ValueError, OSError, sqlite3.Error):
                     pass  # Optional knowledge must not prevent normal Midscene execution.
-            self.tasks[run_id] = asyncio.create_task(self.execute(run_id, job, self.environment(), request.timeoutSeconds))
+            self.tasks[run_id] = asyncio.create_task(
+                self.execute(run_id, job, self.environment(), request.timeoutSeconds, can_steps, can_session))
             return run
 
     async def terminate(self, process):
@@ -450,13 +541,17 @@ class UIManager:
                 except ProcessLookupError:
                     pass
 
-    async def execute(self, run_id, job, env, timeout):
+    async def execute(self, run_id, job, env, timeout, can_steps, can_session):
         run = self.store.get('runs', run_id)
         process = None
+        owned = {}
+        next_can_step = iter(can_steps)
+        expected_step = next(next_can_step, None)
         try:
             if run_id in self.cancelled:
                 return
-            process = await asyncio.create_subprocess_exec('node', str(RUNNER), stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, start_new_session=os.name == 'posix', limit=1024 * 1024)
+            args = ['--ipc'] if can_steps else []
+            process = await asyncio.create_subprocess_exec('node', str(RUNNER), *args, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, env=env, start_new_session=os.name == 'posix', limit=1024 * 1024)
             self.processes[run_id] = process
             if run_id in self.cancelled:
                 await self.terminate(process)
@@ -464,15 +559,39 @@ class UIManager:
             run['state'] = 'running'
             self.store.put('runs', run)
             async with asyncio.timeout(timeout):
-                process.stdin.write(json.dumps(job).encode())
+                process.stdin.write((json.dumps(job) + '\n').encode())
                 await process.stdin.drain()
-                process.stdin.close()
+                if not can_steps:
+                    process.stdin.close()
                 async for line in process.stdout:
                     try:
                         event = json.loads(line)
                     except (ValueError, UnicodeDecodeError):
                         continue
                     if not isinstance(event, dict) or event.get('protocol') != 1:
+                        continue
+                    if event.get('type') == 'can_request' and can_steps:
+                        if run_id in self.cancelled:
+                            break
+                        step_id = event.get('stepId')
+                        response = {'stepId': step_id, 'ok': False, 'message': 'CAN 步骤执行顺序无效'}
+                        if expected_step is not None and step_id == expected_step:
+                            kind, options = can_steps[step_id]
+                            expected_step = next(next_can_step, None)
+                            operation = asyncio.create_task(asyncio.to_thread(
+                                self.can.execute_ui_step, kind, options, can_session, owned))
+                            try:
+                                message = await asyncio.shield(operation)
+                                response.update(ok=True, message=message)
+                            except asyncio.CancelledError:
+                                await asyncio.gather(operation, return_exceptions=True)
+                                raise
+                            except (ValueError, RuntimeError, OSError) as exc:
+                                response['message'] = str(exc)
+                            except Exception:
+                                response['message'] = 'CAN 操作失败，请检查总线设备状态'
+                        process.stdin.write((json.dumps(response) + '\n').encode())
+                        await process.stdin.drain()
                         continue
                     if event.get('type') == 'navigation_update':
                         if not run['sensitive']:
@@ -497,6 +616,8 @@ class UIManager:
             run.update(state='error', message='无法执行 UI 任务，请检查 Node.js、依赖和本机配置')
         finally:
             if process:
+                if not process.stdin.is_closing():
+                    process.stdin.close()
                 await self.terminate(process)
             if run_id in self.cancelled:
                 run['state'] = 'cancelled'
@@ -509,6 +630,12 @@ class UIManager:
             pending = [name for name, event in controls.items() if event.get('state') in {'running', 'passed', 'failed', 'needs_review'}]
             if pending:
                 run['message'] = '探索控件未确认恢复，请检查：' + '、'.join(pending)
+            if owned:
+                errors = await asyncio.to_thread(self.can.stop_ui_sends, can_session, owned)
+                if errors:
+                    if run['state'] != 'cancelled':
+                        run['state'] = 'error'
+                    run['message'] = '部分循环发送停止失败，请检查总线任务：' + '；'.join(errors)
             run['endedAt'] = int(time.time() * 1000)
             run['performanceSessionId'] = self.store.get('runs', run_id).get('performanceSessionId')
             self.store.put('runs', run)
@@ -669,6 +796,7 @@ async def cases_export(value: ExportRequest, request: Request):
     output = io.BytesIO()
     store = manager(request).store
     included_baselines = set()
+    includes_can = False
     with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
         for key in dict.fromkeys(value.ids):
             try:
@@ -678,6 +806,7 @@ async def cases_export(value: ExportRequest, request: Request):
             archive.writestr(f"cases/{case['id']}.json", json.dumps(case, ensure_ascii=False, indent=2))
             archive.writestr(f"parameters/{case['id']}.json", json.dumps({p['name']: '' if p['secret'] else p['default'] for p in case['parameters']}, ensure_ascii=False, indent=2))
             for step in case['steps']:
+                includes_can = includes_can or step['type'] in CAN_STEPS
                 baseline_id = (step.get('options') or {}).get('baselineId')
                 if not isinstance(baseline_id, str) or not re.fullmatch(r'[a-f0-9]{64}', baseline_id):
                     continue
@@ -689,7 +818,12 @@ async def cases_export(value: ExportRequest, request: Request):
                     included_baselines.add(baseline_id)
         if included_baselines:
             archive.writestr('baselines/README.txt', '运行带图像断言的用例时，在 runner 输入中设置 baselineDir 为解压后的 baselines 绝对路径。\n元素区域断言需要 Python 环境安装 uiautomator2。可通过 pythonExecutable 指定该 Python 的路径。\n')
-        archive.writestr('README.txt', '格式版本 1。需要本项目 tools/ui-test 执行器及 npm ci 安装依赖。\n用例 JSON 作为 runner 输入的 testCase，参数 JSON 作为 parameters；另需指定 serial。\n密钥通过本机 .env 或环境变量配置。敏感参数默认留空。\n')
+        readme = ('格式版本 1。需要本项目 tools/ui-test 执行器及 npm ci 安装依赖。\n'
+                  '用例 JSON 作为 runner 输入的 testCase，参数 JSON 作为 parameters；另需指定 serial。\n'
+                  '密钥通过本机 .env 或环境变量配置。敏感参数默认留空。\n')
+        if includes_can:
+            readme += '包含 CAN 步骤的用例请导入工作台运行，并先在总线页面打开对应 DBC、设备和通道。\n'
+        archive.writestr('README.txt', readme)
     return Response(output.getvalue(), media_type='application/zip', headers={'Content-Disposition': 'attachment; filename="ui-cases.zip"'})
 
 

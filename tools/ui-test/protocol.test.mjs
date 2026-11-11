@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { validateJob, substitute, executeStep } from "./protocol.mjs";
+import {
+  validateJob,
+  substitute,
+  executeStep,
+  stepDeadlineMs,
+} from "./protocol.mjs";
 const step = {
   id: "check",
   type: "assert",
@@ -20,6 +25,24 @@ test("rejects duplicate step IDs and unknown parameters before any action", () =
 });
 test("parameter values are substituted literally, including replacement tokens", () => {
   assert.equal(substitute("${SSID}", { SSID: "$&${OTHER}" }), "$&${OTHER}");
+});
+test("fixed delays run locally and have a deadline beyond their duration", async () => {
+  const delay = {
+    id: "delay",
+    type: "delay",
+    prompt: "等待时间",
+    timeoutMs: 1000,
+    options: { durationMs: 1500 },
+  };
+  const local = { serial: "", testCase: { schemaVersion: 1, steps: [delay] } };
+  validateJob(local);
+  assert.ok(stepDeadlineMs(delay) > delay.options.durationMs);
+  delay.options.durationMs = 0;
+  assert.throws(() => validateJob(local), /等待时长/);
+  delay.options.durationMs = 30;
+  const began = performance.now();
+  assert.equal(await executeStep(null, delay, {}, null), "passed");
+  assert.ok(performance.now() - began >= 29);
 });
 test("false assertion differs from model transport failure", async () => {
   assert.equal(
@@ -161,6 +184,71 @@ test("image assertions evaluate pixel tolerance and dimension mismatch", async (
     await executeStep(null, check, { SSID: "test" }, null, io),
     "failed"
   );
+});
+
+test("screenshot assertions compare two earlier captures without reading the screen again", async () => {
+  const { default: sharp } = await import("sharp");
+  const png = (r, width = 1) =>
+    sharp({
+      create: { width, height: 1, channels: 3, background: { r, g: 0, b: 0 } },
+    })
+      .png()
+      .toBuffer();
+  const before = {
+    ...step,
+    id: "before",
+    type: "screenshot",
+    prompt: "截图",
+    options: { captureName: "图片1" },
+  };
+  const after = { ...before, id: "after", options: null };
+  const check = {
+    ...step,
+    type: "screenshot_assert",
+    options: { firstStepId: before.id, secondStepId: after.id },
+  };
+  const j = job();
+  j.testCase.steps = [before, check, after];
+  assert.throws(() => validateJob(j), /前面已启用/);
+  j.testCase.steps = [before, after, check];
+  validateJob(j);
+  const first = await png(20);
+  const recorded = [];
+  const agent = { recordToReport: (_, report) => recorded.push(report) };
+  await executeStep(agent, before, {}, null, {
+    captureImage: async () => first,
+  });
+  await executeStep(agent, before, {}, null, {
+    captureImage: async () => first,
+    sensitive: true,
+  });
+  assert.deepEqual(recorded, [
+    {
+      screenshots: [{ base64: first.toString("base64"), description: "图片1" }],
+    },
+  ]);
+  let second = await png(20);
+  let message;
+  const io = {
+    loadScreenshot: id => (id === before.id ? first : second),
+    captureImage: () => assert.fail("comparison must reuse captured images"),
+    onResult: value => {
+      message = value;
+    },
+  };
+  const compare = () => executeStep(null, check, j.parameters, null, io);
+  assert.equal(await compare(), "passed");
+  check.options.relation = "different";
+  assert.equal(await compare(), "failed");
+  second = await png(21);
+  assert.equal(await compare(), "passed");
+  check.options.pixelTolerance = 1;
+  assert.equal(await compare(), "failed");
+  second = await png(20, 2);
+  assert.equal(await compare(), "passed");
+  assert.match(message, /尺寸不同/);
+  second = undefined;
+  assert.equal(await compare(), "error");
 });
 
 test("ROI assertions compare and report the cropped pixels, with bounds checked", async () => {

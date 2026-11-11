@@ -1,5 +1,6 @@
 import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
 import { BACKEND_URL } from "@/lib/backend";
+import type { CanCatalog } from "@/lib/canCatalog";
 import { getUiSection } from "@/lib/uiNavigation";
 import { UiStepFields } from "@/components/UiStepFields";
 import {
@@ -9,6 +10,7 @@ import {
 import {
   changeStepType,
   isAssertion,
+  isCanStep,
   stepGroups,
   stepTypes,
   type Selector,
@@ -36,6 +38,7 @@ import {
   Download,
   ArrowUp,
   ArrowDown,
+  ChevronDown,
   Trash2,
   RefreshCw,
   FlaskConical,
@@ -218,6 +221,8 @@ export default function UITesting() {
   const [pickStepId, setPickStepId] = useState("");
   const devicePreview = useRef<UiDevicePreviewHandle>(null);
   const [draft, setDraft] = useState<Case>(blank);
+  const [canCatalog, setCanCatalog] = useState<CanCatalog | null>(null);
+  const [canChannels, setCanChannels] = useState<number[]>([]);
   const [parameters, setParameters] = useState<Record<string, string>>({});
   const [cases, setCases] = useState<Case[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
@@ -239,6 +244,35 @@ export default function UITesting() {
   const stepList = useRef<HTMLDivElement>(null);
   const selection = useRef(runId);
   selection.current = runId;
+
+  const editCanSteps = section === "execute" && draft.steps.some(step => isCanStep(step.type));
+  useEffect(() => {
+    if (!editCanSteps) return;
+    let disposed = false;
+    const refreshCan = async () => {
+      try {
+        const [catalog, status] = await Promise.all([
+          api<CanCatalog>("/can/dbc"),
+          api<{ channels?: number[] }>("/can/status"),
+        ]);
+        if (!disposed) {
+          setCanCatalog(catalog);
+          setCanChannels(status.channels ?? []);
+        }
+      } catch {
+        if (!disposed) {
+          setCanCatalog(null);
+          setCanChannels([]);
+        }
+      }
+    };
+    void refreshCan();
+    window.addEventListener("focus", refreshCan);
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", refreshCan);
+    };
+  }, [editCanSteps]);
 
   const refresh = useCallback(async () => {
     try {
@@ -354,9 +388,10 @@ export default function UITesting() {
     setRightPanel("records");
   }
   async function start() {
+    validateStepDraft();
     await devicePreview.current?.stop();
     const next = await api<Run>("/ui/runs", {
-      serial,
+      serial: runSerial,
       testCase: draft,
       parameters,
     });
@@ -385,9 +420,49 @@ export default function UITesting() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   const activeRuns = runs.filter(active);
+  const enabledSteps = draft.steps.filter(step => step.enabled);
+  const needsDevice = !enabledSteps.length ||
+    enabledSteps.some(step => !isCanStep(step.type) && step.type !== "delay");
+  const runSerial = needsDevice ? serial : "";
+  const runBusy = activeRuns.some(item => item.serial === runSerial) ||
+    Boolean(run && run.serial === runSerial && active(run));
   const deviceRunning =
-    activeRuns.some(item => item.serial === serial) ||
-    Boolean(run && run.serial === serial && active(run));
+    !!serial && (activeRuns.some(item => item.serial === serial) ||
+    Boolean(run && run.serial === serial && active(run)));
+  function validateStepDraft() {
+    const screenshots = new Set<string>();
+    draft.steps.forEach((step, index) => {
+      const prefix = `第 ${index + 1} 步`;
+      const options = step.options;
+      if (step.type === "delay") {
+        const duration = options?.durationMs;
+        if (duration === undefined || !Number.isInteger(duration) || duration < 1 || duration > 300000)
+          throw new Error(`${prefix}请输入 0.001–300 秒的等待时长`);
+      }
+      if (step.type === "screenshot" && step.enabled) screenshots.add(step.id);
+      if (step.type === "screenshot_assert") {
+        const { firstStepId, secondStepId } = options ?? {};
+        if (!firstStepId || !secondStepId || firstStepId === secondStepId)
+          throw new Error(`${prefix}请选择两张不同的截图`);
+        if (
+          step.enabled &&
+          (!screenshots.has(firstStepId) || !screenshots.has(secondStepId))
+        )
+          throw new Error(`${prefix}只能引用前面已启用的 ADB 截图步骤`);
+      }
+      if (!isCanStep(step.type)) return;
+      if (!options?.dbcKey || !options.message || options.channel === undefined)
+        throw new Error(`${prefix}请选择 DBC 报文和通道`);
+      if (step.type !== "can_stop") {
+        const signals = Object.values(options.signals ?? {});
+        if (!signals.length || signals.some(value => value == null || (typeof value === "number" && !Number.isFinite(value))))
+          throw new Error(`${prefix}请添加至少一个信号并填写信号值`);
+      }
+      if (step.type === "can_send_loop" && options.cycleMs != null &&
+          (!Number.isInteger(options.cycleMs) || options.cycleMs < 1))
+        throw new Error(`${prefix}的周期必须是正整数毫秒`);
+    });
+  }
   const pickTargets = draft.steps.flatMap((step, index) =>
     step.type === "element_assert" ||
     (step.type === "image_assert" && step.options?.mode === "element") ||
@@ -456,7 +531,7 @@ export default function UITesting() {
               className="underline"
               onClick={() => void perform(() => showRecords(item.id))}
             >
-              {item.testCase.name} · {item.serial}
+              {item.testCase.name} · {item.serial || "本机执行"}
             </button>
           ))}
         </div>
@@ -695,52 +770,60 @@ export default function UITesting() {
                       />
                       {String(i + 1).padStart(2, "0")}
                     </label>
-                    <select
-                      aria-label={`步骤 ${i + 1} 类型`}
-                      className={`${selectClass} h-7 min-w-28 flex-1`}
-                      value={
-                        step.type === "tap" && step.selector
-                          ? "structured_tap"
-                          : step.type
-                      }
-                      onChange={event =>
-                        patchStep(
-                          step.id,
-                          changeStepType(step, event.target.value as StepType)
-                        )
-                      }
-                    >
-                      {stepGroups.map(group => (
-                        <optgroup key={group.label} label={group.label}>
-                          {group.types.map(type => (
-                            <option key={type} value={type}>
-                              {stepTypes[type]}
-                            </option>
-                          ))}
-                          {group.label === "ADB 操作" &&
-                            step.type === "tap" &&
-                            step.selector && (
-                              <option value="structured_tap">结构点击</option>
-                            )}
-                        </optgroup>
-                      ))}
-                    </select>
-                    <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
-                      超时（秒）
-                      <Input
-                        className="h-7 w-14 px-1.5 shadow-none"
-                        aria-label={`步骤 ${i + 1} 超时（秒）`}
-                        type="number"
-                        min={1}
-                        max={300}
-                        value={step.timeoutMs / 1000}
-                        onChange={e =>
-                          patchStep(step.id, {
-                            timeoutMs: Number(e.target.value) * 1000,
-                          })
+                    <div className="relative min-w-28 flex-1">
+                      <select
+                        aria-label={`步骤 ${i + 1} 类型`}
+                        className={`${selectClass} h-7 appearance-none pr-9`}
+                        value={
+                          step.type === "tap" && step.selector
+                            ? "structured_tap"
+                            : step.type
                         }
+                        onChange={event =>
+                          patchStep(
+                            step.id,
+                            changeStepType(step, event.target.value as StepType)
+                          )
+                        }
+                      >
+                        {stepGroups.map(group => (
+                          <optgroup key={group.label} label={group.label}>
+                            {group.types.map(type => (
+                              <option key={type} value={type}>
+                                {stepTypes[type]}
+                              </option>
+                            ))}
+                            {group.label === "页面操作" &&
+                              step.type === "tap" &&
+                              step.selector && (
+                                <option value="structured_tap">结构点击</option>
+                              )}
+                          </optgroup>
+                        ))}
+                      </select>
+                      <ChevronDown
+                        aria-hidden="true"
+                        className="pointer-events-none absolute right-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
                       />
-                    </label>
+                    </div>
+                    {step.type !== "delay" && (
+                      <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                        超时（秒）
+                        <Input
+                          className="h-7 w-14 px-1.5 shadow-none"
+                          aria-label={`步骤 ${i + 1} 超时（秒）`}
+                          type="number"
+                          min={1}
+                          max={300}
+                          value={step.timeoutMs / 1000}
+                          onChange={e =>
+                            patchStep(step.id, {
+                              timeoutMs: Number(e.target.value) * 1000,
+                            })
+                          }
+                        />
+                      </label>
+                    )}
                     {isAssertion(step.type) && (
                       <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
                         <input
@@ -797,6 +880,20 @@ export default function UITesting() {
                     key={step.type}
                     step={step}
                     index={i}
+                    canCatalog={canCatalog}
+                    canChannels={canChannels}
+                    screenshots={
+                      step.type === "screenshot_assert"
+                        ? draft.steps.slice(0, i).flatMap((source, index) =>
+                            source.type === "screenshot" && source.enabled
+                              ? [{
+                                  id: source.id,
+                                  label: `第 ${index + 1} 步 · ${source.options?.captureName?.trim() || source.prompt.trim() || "ADB 截图"}`,
+                                }]
+                              : []
+                          )
+                        : []
+                    }
                     onPickElement={
                       serial && !deviceRunning
                         ? () => {
@@ -816,7 +913,7 @@ export default function UITesting() {
             <div className="sticky bottom-0 z-10 flex flex-wrap gap-2 border-t border-border bg-background py-2">
               <Button
                 size="sm"
-                disabled={busy || !serial || deviceRunning}
+                disabled={busy || (needsDevice && !serial) || runBusy}
                 onClick={() => void perform(start)}
               >
                 <Play className="size-4" />
@@ -828,6 +925,7 @@ export default function UITesting() {
                 disabled={busy}
                 onClick={() =>
                   void perform(async () => {
+                    validateStepDraft();
                     const saved = await api<Case>("/ui/cases", draft);
                     setDraft(saved);
                     await refresh();
@@ -908,7 +1006,7 @@ export default function UITesting() {
                     <div className="mb-5 space-y-2 text-sm">
                       <h3 className="font-medium">{run.testCase.name}</h3>
                       <p className="text-cyan-400">
-                        {states[run.state] || run.state} · {run.serial}
+                        {states[run.state] || run.state} · {run.serial || "本机执行"}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {new Date(run.createdAt).toLocaleString()} · 脚本 v
@@ -1212,7 +1310,7 @@ export default function UITesting() {
                     </span>
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {item.serial} · {new Date(item.createdAt).toLocaleString()}{" "}
+                    {item.serial || "本机执行"} · {new Date(item.createdAt).toLocaleString()}{" "}
                     ·{" "}
                     {item.endedAt
                       ? `${Math.round((item.endedAt - item.createdAt) / 1000)} 秒`
