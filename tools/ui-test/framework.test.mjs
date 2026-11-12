@@ -140,3 +140,76 @@ test("actions alone need review; disabled assertions cannot imply success", asyn
     "needs_review"
   );
 });
+
+test("image absence and variable inequality choose the matching branch, and capture errors stop", async () => {
+  const { default: sharp } = await import("sharp");
+  const image = color =>
+    sharp({ create: { width: 2, height: 2, channels: 3, background: color } })
+      .png()
+      .toBuffer();
+  const baseline = await image("#ffffff");
+  const screen = await image("#000000");
+  const condition = step("check", {
+    type: "if",
+    condition: step("check", {
+      type: "image_assert",
+      prompt: "检查图片",
+      options: {
+        baselineId: "a".repeat(64),
+        mode: "screen",
+        expected: "absent",
+        minSimilarity: 100,
+        pixelTolerance: 0,
+      },
+    }),
+  });
+  const yes = step("yes", {
+    type: "delay",
+    parentId: "check",
+    options: { durationMs: 1 },
+  });
+  const no = step("no", {
+    type: "delay",
+    parentId: "check",
+    branch: "else",
+    options: { durationMs: 1 },
+  });
+  const seen = [];
+  const run = async captureImage => {
+    seen.length = 0;
+    return runCase({ steps: [condition, yes, no] }, async item => {
+      seen.push(item.id);
+      return item.type === "if"
+        ? executeStep(null, item.condition, {}, null, {
+            captureImage,
+            loadBaseline: () => baseline,
+            isCondition: true,
+          })
+        : "passed";
+    });
+  };
+  assert.equal(await run(async () => screen), "needs_review");
+  assert.deepEqual(seen, ["check", "yes"]);
+  assert.equal(await run(async () => baseline), "needs_review");
+  assert.deepEqual(seen, ["check", "no"]);
+  assert.equal(
+    await run(async () => {
+      throw Error("设备截图失败");
+    }),
+    "error"
+  );
+  assert.deepEqual(seen, ["check"]);
+  const variable = step("variable", {
+    type: "variable_assert",
+    prompt: "变量",
+    options: { variable: "value", operator: "ne", expectedValue: "1" },
+  });
+  assert.equal(
+    await executeStep(null, variable, { value: "2" }, null),
+    "passed"
+  );
+  assert.equal(
+    await executeStep(null, variable, { value: "1" }, null),
+    "failed"
+  );
+});

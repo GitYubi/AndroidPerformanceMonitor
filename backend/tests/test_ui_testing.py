@@ -488,3 +488,235 @@ def test_uiautomator2_element_capture_uses_exact_unique_bounds():
     with pytest.raises(ElementNotUnique):
         capture_element(device, selector)
     assert capture_element(device, {**selector, 'xpath': '/hierarchy/node[2]'}).size == (4, 4)
+
+
+def test_project_overview_uses_all_cases_and_run_snapshots(tmp_path):
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+    project = manager.store.images.create_project('车型概览')
+    project_id = project['id']
+    test_case = ui.TestCase(name='图像与元素', projectId=project_id, steps=[
+        ui.Step(id='check', type='element_assert', prompt='元素',
+                selector={'resourceId': 'demo:id/title'}, options={'expected': 'exists'}),
+    ])
+    manager.store.put('cases', test_case.model_dump())
+    manager.store.put('runs', {'id': 'r1', 'state': 'passed', 'createdAt': 100,
+                               'testCase': test_case.model_dump()})
+    manager.store.put('runs', {'id': 'r2', 'state': 'failed', 'createdAt': 200,
+                               'testCase': test_case.model_dump()})
+    manager.store.put('runs', {'id': 'old', 'state': 'passed', 'createdAt': 300,
+                               'testCase': {'name': '旧用例'}})
+    info = ui.ui_project_overview(project_id, request)
+    assert (info['caseCount'], info['runCount'], info['elementCount']) == (1, 2, 1)
+    assert info['states'] == {'failed': 1, 'passed': 1}
+    assert info['recentRuns'][0]['id'] == 'r2'
+    assert info['elements'][0]['selector']['resourceId'] == 'demo:id/title'
+    assert ui.ui_project_overview('default', request)['runCount'] == 1
+    manager.store.put('cases', {**test_case.model_dump(), 'projectId': 'default'})
+    assert ui.ui_project_overview(project_id, request)['runCount'] == 2
+    assert ui.ui_project_overview(project_id, request)['caseCount'] == 0
+    with pytest.raises(ui.HTTPException):
+        ui.ui_project_overview('missing', request)
+
+
+def test_delete_project_removes_owned_data_and_preserves_shared_images(tmp_path):
+    import io
+    from PIL import Image
+
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+    project_id = manager.store.images.create_project('要删除的项目')['id']
+    other = manager.store.images.create_project('保留的项目')['id']
+    png = io.BytesIO()
+    Image.new('RGB', (2, 2), 'red').save(png, 'PNG')
+    image = manager.store.images.save(project_id, '基准图', 'roi', png.getvalue())
+    condition = {'type': 'image_assert', 'options': {'baselineId': image['id'], 'baselineProjectId': project_id}}
+    owned = {'id': 'owned', 'name': '删除用例', 'projectId': project_id, 'steps': []}
+    shared = {'id': 'shared', 'name': '保留用例', 'projectId': other,
+              'steps': [{'type': 'if', 'condition': condition}]}
+    manager.store.put('cases', owned)
+    manager.store.put('cases', shared)
+    run_id = 'a' * 32
+    run_dir = tmp_path / 'runs' / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / 'evidence.png').write_bytes(png.getvalue())
+    manager.store.put('runs', {'id': run_id, 'state': 'passed', 'serial': '',
+                               'testCase': owned, 'outputDir': str(run_dir)})
+    manager.store.event(run_id, {'type': 'step'})
+
+    async def scenario():
+        manager.tasks[run_id] = None
+        with pytest.raises(ui.HTTPException, match='正在运行'):
+            await ui.delete_ui_project(project_id, request)
+        manager.tasks.clear()
+        result = await ui.delete_ui_project(project_id, request)
+        assert result == {'deleted': True, 'cleanupErrors': [], 'deletedRunIds': [run_id]}
+        assert not run_dir.exists()
+        assert not (tmp_path / 'projects' / project_id).exists()
+        assert manager.store.events(run_id) == []
+        with pytest.raises(KeyError): manager.store.get('cases', 'owned')
+        with pytest.raises(KeyError): manager.store.get('runs', run_id)
+        kept = manager.store.get('cases', 'shared')
+        assert kept['steps'][0]['condition']['options']['baselineProjectId'] == 'default'
+        assert manager.store.images.path(image['id'], 'default').read_bytes() == png.getvalue()
+        assert image['id'] in {item['id'] for item in manager.store.images.list_images('default')}
+        with pytest.raises(ui.HTTPException): await ui.delete_ui_project('default', request)
+
+    asyncio.run(scenario())
+
+
+def test_overwriting_named_image_preserves_references_and_coordinates(tmp_path):
+    import io
+    from PIL import Image
+
+    manager = ui.UIManager(tmp_path)
+    store = manager.store
+    first_project = store.images.create_project('项目一')['id']
+    other_project = store.images.create_project('项目二')['id']
+    def png(color, size):
+        output = io.BytesIO()
+        Image.new('RGB', size, color).save(output, 'PNG')
+        return output.getvalue()
+    first = store.images.save(first_project, '音量', 'roi', png('red', (2, 2)), {'left': 1, 'top': 1, 'right': 3, 'bottom': 3})
+    old = store.images.save(first_project, '旧名字', 'roi', png('blue', (3, 2)), {'left': 4, 'top': 1, 'right': 7, 'bottom': 3})
+    other = store.images.save(other_project, '音量', 'roi', png('green', (2, 2)))
+    with store.connect() as conn:
+        conn.execute('UPDATE ui_images SET name=? WHERE project_id=? AND id=?', ('音量', first_project, old['id']))
+    original_region = first['region']
+    value = ui.TestCase(name='使用旧图片', projectId=other_project, steps=[
+        ui.Step(id='if', type='if', prompt='判断', condition=ui.Step(id='if', type='image_assert', prompt='图像',
+            options={'baselineId': first['id'], 'baselineProjectId': first_project, 'mode': 'roi', 'roi': original_region}))
+    ])
+    store.put('cases', value.model_dump())
+    replacement = png('yellow', (4, 3))
+    new_region = {'left': 10, 'top': 20, 'right': 14, 'bottom': 23}
+    updated = store.images.save(first_project, '音量', 'element', replacement, new_region)
+    visible = store.images.list_images(first_project)
+    assert len(visible) == 1
+    assert visible[0]['id'] == updated['id'] == old['id']
+    assert visible[0]['aliases'] == [first['id']]
+    for image_id in (first['id'], old['id']):
+        assert store.images.path(image_id, first_project).read_bytes() == replacement
+    assert store.images.path(other['id'], other_project).read_bytes() == png('green', (2, 2))
+    saved = store.get('cases', value.id)
+    assert saved['steps'][0]['condition']['options']['roi'] == new_region
+    assert saved['version'] == value.version + 1
+    again = store.images.save(first_project, '音量', 'element', replacement, new_region)
+    assert again['id'] == updated['id']
+    assert store.get('cases', value.id)['version'] == saved['version']
+
+
+def test_overwrite_rollback_restores_all_existing_image_files(tmp_path, monkeypatch):
+    import io
+    from PIL import Image
+
+    store = ui.UIManager(tmp_path).store
+    project_id = store.images.create_project('回滚测试')['id']
+    def image(color):
+        stream = io.BytesIO()
+        Image.new('RGB', (2, 2), color).save(stream, 'PNG')
+        return stream.getvalue()
+    first = store.images.save(project_id, '同名', 'roi', image('red'))
+    second = store.images.save(project_id, '旧名', 'roi', image('blue'))
+    with store.connect() as conn:
+        conn.execute('UPDATE ui_images SET name=? WHERE project_id=? AND id=?', ('同名', project_id, second['id']))
+    originals = {item['id']: store.images.path(item['id'], project_id).read_bytes() for item in (first, second)}
+    original_replace = ui.Path.replace
+    calls = 0
+    def fail_once(path, target):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError('模拟写入失败')
+        return original_replace(path, target)
+    monkeypatch.setattr(ui.Path, 'replace', fail_once)
+    with pytest.raises(OSError, match='模拟写入失败'):
+        store.images.save(project_id, '同名', 'roi', image('green'))
+    for image_id, data in originals.items():
+        assert store.images.path(image_id, project_id).read_bytes() == data
+    assert len(store.images.list_images(project_id)) == 2
+
+
+def test_delete_image_warns_references_and_preserves_other_project(tmp_path, monkeypatch):
+    import io
+    from PIL import Image
+
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+    store = manager.store
+    one = store.images.create_project('一')['id']
+    two = store.images.create_project('二')['id']
+    stream = io.BytesIO()
+    Image.new('RGB', (2, 2), 'red').save(stream, 'PNG')
+    data = stream.getvalue()
+    first = store.images.save(one, '图片', 'roi', data)
+    alias = store.images.save(one, '旧名称', 'roi', data)
+    other = store.images.save(two, '图片', 'roi', data)
+    with store.connect() as conn:
+        conn.execute('UPDATE ui_images SET name=? WHERE project_id=? AND id=?', ('图片', one, alias['id']))
+    current = store.images.save(one, '图片', 'roi', data)
+    assert len(store.images.list_images(one)) == 1
+    value = ui.TestCase(name='引用图片的用例', projectId=two, steps=[
+        ui.Step(id='if', type='if', prompt='判断', condition=ui.Step(id='if', type='image_assert', prompt='图像',
+            options={'baselineId': first['id'], 'baselineProjectId': one}))])
+    store.put('cases', value.model_dump())
+    run_id = 'b' * 32
+    store.put('runs', {'id': run_id, 'serial': '', 'state': 'running', 'testCase': value.model_dump()})
+
+    async def scenario():
+        result = await ui.ui_image_references(one, current['id'], ui.ImageTarget(), request)
+        assert result['cases'] == [{'id': value.id, 'name': value.name}]
+        manager.tasks[run_id] = None
+        with pytest.raises(ui.HTTPException, match='正在被运行'):
+            await ui.delete_ui_image(one, current['id'], ui.ImageTarget(), request)
+        manager.tasks.clear()
+        original_replace = ui.Path.replace
+        calls = 0
+        def fail_once(path, target):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError('模拟删除失败')
+            return original_replace(path, target)
+        with monkeypatch.context() as patch:
+            patch.setattr(ui.Path, 'replace', fail_once)
+            with pytest.raises(ui.HTTPException, match='删除图片失败'):
+                await ui.delete_ui_image(one, current['id'], ui.ImageTarget(), request)
+        assert store.images.path(first['id'], one).read_bytes() == data
+        assert store.images.path(alias['id'], one).read_bytes() == data
+        assert len(store.images.list_images(one)) == 1
+        result = await ui.delete_ui_image(one, current['id'], ui.ImageTarget(), request)
+        assert result['affectedCases'] == [{'id': value.id, 'name': value.name}]
+        assert result['cleanupErrors'] == []
+        assert store.images.list_images(one) == []
+        assert not store.images.path(first['id'], one).exists()
+        assert not store.images.path(alias['id'], one).exists()
+        assert store.images.path(other['id'], two).read_bytes() == data
+        assert store.get('cases', value.id)['id'] == value.id
+        with pytest.raises(ValueError, match='不存在'):
+            store.validate_baselines(value)
+        with pytest.raises(ui.HTTPException):
+            await ui.delete_ui_image(one, current['id'], ui.ImageTarget(), request)
+    asyncio.run(scenario())
+
+
+def test_delete_legacy_image_reports_case_references(tmp_path):
+    import io
+    from fastapi import UploadFile
+    from PIL import Image
+
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+    stream = io.BytesIO()
+    Image.new('RGB', (2, 2), 'blue').save(stream, 'PNG')
+    data = stream.getvalue()
+    async def scenario():
+        image = await ui.upload_baseline(request, UploadFile(filename='old.png', file=io.BytesIO(data)))
+        value = ui.TestCase(name='旧用例', steps=[ui.Step(id='image', type='image_assert', prompt='图像', options={'baselineId': image['id']})])
+        manager.store.put('cases', value.model_dump())
+        target = ui.ImageTarget(source='legacy')
+        assert (await ui.ui_image_references('default', image['id'], target, request))['cases'][0]['id'] == value.id
+        result = await ui.delete_ui_image('default', image['id'], target, request)
+        assert result['deleted'] and not manager.store.images.path(image['id']).exists()
+        assert manager.store.get('cases', value.id)['id'] == value.id
+    asyncio.run(scenario())

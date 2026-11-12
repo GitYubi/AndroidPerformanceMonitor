@@ -83,7 +83,10 @@ try {
     (projectId && job.baselineFiles?.[`${projectId}/${id}`]) ||
     (baselineDir && resolve(baselineDir, `${id}.png`));
   for (const step of operations.filter(step => step.options?.baselineId)) {
-    const path = baselinePath(step.options.baselineId, step.options.baselineProjectId);
+    const path = baselinePath(
+      step.options.baselineId,
+      step.options.baselineProjectId
+    );
     const file = path && statSync(path, { throwIfNoEntry: false });
     if (!file || !file.isFile() || file.size > 8 * 1024 * 1024)
       throw new Error("步骤缺少有效的 PNG 图片");
@@ -218,9 +221,11 @@ try {
             onImage: image => {
               capturedImage = image;
             },
-            loadBaseline: (id, projectId) => readFileSync(baselinePath(id, projectId)),
+            loadBaseline: (id, projectId) =>
+              readFileSync(baselinePath(id, projectId)),
             setVariable: (name, value) => assigned.set(name, value),
             sensitive,
+            isCondition: Boolean(step.condition),
             loadScreenshot: id => {
               const capture = screenshots.get(id);
               return typeof capture === "string"

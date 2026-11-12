@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import sys
@@ -100,6 +101,7 @@ class ImageCheck(BaseModel):
     minSimilarity: float = Field(default=99, ge=0, le=100)
     pixelTolerance: int = Field(default=16, ge=0, le=255, strict=True)
     colorMode: Literal['grayscale', 'color'] = 'grayscale'
+    expected: Literal['exists', 'absent'] = 'exists'
     mode: Literal['screen', 'element', 'roi'] = 'screen'
     roi: ImageRegion | None = None
 
@@ -893,6 +895,135 @@ def create_ui_project(value: ProjectName, request: Request):
         raise HTTPException(400, str(error)) from error
 
 
+@router.post('/projects/{project_id}/delete')
+async def delete_ui_project(project_id: str, request: Request):
+    service = manager(request)
+    store = service.store
+    if project_id == DEFAULT_PROJECT:
+        raise HTTPException(400, '默认项目用于存放历史数据，不能删除')
+    async with service.lock:
+        try:
+            store.images.require_project(project_id)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+        with store.connect() as conn:
+            cases = [json.loads(row[0]) for row in conn.execute('SELECT body FROM cases')]
+            runs = [json.loads(row[0]) for row in conn.execute('SELECT body FROM runs')]
+            for run in runs:
+                if run.get('id') in service.tasks:
+                    case = run.get('testCase') or {}
+                    operations = [step.get('condition') or step for step in case.get('steps', [])]
+                    if case.get('projectId', DEFAULT_PROJECT) == project_id or any(
+                        (step.get('options') or {}).get('baselineProjectId') == project_id for step in operations
+                    ):
+                        raise HTTPException(409, '项目相关用例正在运行，请等待运行结束后再删除')
+
+            removed_runs = [run for run in runs if (run.get('testCase') or {}).get('projectId', DEFAULT_PROJECT) == project_id]
+            kept = [('cases', case, case) for case in cases if case.get('projectId', DEFAULT_PROJECT) != project_id]
+            kept += [('runs', run, run.get('testCase') or {}) for run in runs if run not in removed_runs]
+            shared_ids = set()
+            for _, _, case in kept:
+                for step in case.get('steps', []):
+                    options = (step.get('condition') or step).get('options') or {}
+                    if options.get('baselineProjectId') == project_id and options.get('baselineId'):
+                        shared_ids.add(options['baselineId'])
+            try:
+                for image_id in shared_ids:
+                    source = store.images.path(image_id, project_id)
+                    target = store.images.path(image_id, DEFAULT_PROJECT)
+                    if not source.is_file():
+                        raise ValueError('其他项目引用的图片缺失，无法保留引用')
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if target.exists() and hashlib.sha256(source.read_bytes()).digest() != hashlib.sha256(target.read_bytes()).digest():
+                        raise ValueError('共享图片与默认项目中的图片冲突')
+                    if not target.exists():
+                        temp = target.with_name(f'{uuid.uuid4().hex}.tmp')
+                        try:
+                            shutil.copyfile(source, temp)
+                            temp.replace(target)
+                        finally:
+                            temp.unlink(missing_ok=True)
+                    conn.execute('''INSERT OR IGNORE INTO ui_images (project_id,id,name,width,height,source,region)
+                        SELECT ?,id,name,width,height,source,region FROM ui_images WHERE project_id=? AND id=?''',
+                        (DEFAULT_PROJECT, project_id, image_id))
+                for table, body, case in kept:
+                    changed = False
+                    for step in case.get('steps', []):
+                        options = (step.get('condition') or step).get('options') or {}
+                        if options.get('baselineProjectId') == project_id and options.get('baselineId') in shared_ids:
+                            options['baselineProjectId'] = DEFAULT_PROJECT
+                            changed = True
+                    if changed:
+                        conn.execute(f'UPDATE {table} SET body=? WHERE id=?',
+                                     (json.dumps(body, ensure_ascii=False), body['id']))
+                for case in cases:
+                    if case.get('projectId', DEFAULT_PROJECT) == project_id:
+                        conn.execute('DELETE FROM cases WHERE id=?', (case['id'],))
+                for run in removed_runs:
+                    conn.execute('DELETE FROM events WHERE run_id=?', (run['id'],))
+                    conn.execute('DELETE FROM runs WHERE id=?', (run['id'],))
+                conn.execute('DELETE FROM ui_images WHERE project_id=?', (project_id,))
+                conn.execute('DELETE FROM ui_projects WHERE id=?', (project_id,))
+            except (OSError, ValueError) as error:
+                raise HTTPException(409, str(error)) from error
+        errors = []
+        directories = [store.images.root / project_id]
+        for run in removed_runs:
+            run_id = run.get('id', '')
+            path = Path(run.get('outputDir') or '')
+            if re.fullmatch(r'[a-f0-9]{32}', run_id) and path.name == run_id:
+                directories.append(path)
+        for path in directories:
+            try:
+                if path.is_symlink():
+                    path.unlink()
+                elif path.is_dir():
+                    shutil.rmtree(path)
+            except OSError:
+                errors.append(str(path))
+        return {'deleted': True, 'cleanupErrors': errors,
+                'deletedRunIds': [run['id'] for run in removed_runs]}
+
+
+@router.get('/projects/{project_id}/overview')
+def ui_project_overview(project_id: str, request: Request):
+    store = manager(request).store
+    try:
+        store.images.require_project(project_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    case_count = 0
+    elements = {}
+    states = {}
+    recent = []
+    with store.connect() as conn:
+        for (body,) in conn.execute('SELECT body FROM cases'):
+            case = json.loads(body)
+            if (case.get('projectId') or DEFAULT_PROJECT) != project_id:
+                continue
+            case_count += 1
+            for step in case.get('steps', []):
+                operation = step.get('condition') or step
+                selector = {key: value for key, value in (operation.get('selector') or {}).items() if value}
+                if selector:
+                    key = json.dumps(selector, sort_keys=True, ensure_ascii=False)
+                    elements.setdefault(key, {'selector': selector, 'caseName': case.get('name', '')})
+        for (body,) in conn.execute('SELECT body FROM runs ORDER BY rowid DESC'):
+            run = json.loads(body)
+            test_case = run.get('testCase') or {}
+            if (test_case.get('projectId') or DEFAULT_PROJECT) != project_id:
+                continue
+            state = run.get('state', 'unknown')
+            states[state] = states.get(state, 0) + 1
+            if len(recent) < 5:
+                recent.append({'id': run.get('id'), 'name': test_case.get('name', ''),
+                               'state': state, 'createdAt': run.get('createdAt')})
+    images = store.images.list_images(project_id)
+    return {'caseCount': case_count, 'runCount': sum(states.values()), 'states': states,
+            'recentRuns': recent, 'imageCount': len(images), 'images': images[:6],
+            'elementCount': len(elements), 'elements': list(elements.values())[:6]}
+
+
 @router.get('/projects/{project_id}/images')
 def ui_project_images(project_id: str, request: Request):
     try:
@@ -914,7 +1045,8 @@ async def save_ui_project_image(project_id: str, request: Request,
         coordinates = json.loads(region) if region else None
         if coordinates is not None and not isinstance(coordinates, dict):
             raise ValueError('图片坐标无效')
-        return await asyncio.to_thread(manager(request).store.images.save, project_id, name, source, data, coordinates)
+        async with manager(request).lock:
+            return await asyncio.to_thread(manager(request).store.images.save, project_id, name, source, data, coordinates)
     except (ValueError, TypeError) as error:
         raise HTTPException(400, str(error)) from error
 
@@ -931,7 +1063,98 @@ def ui_project_image(project_id: str, image_id: str, request: Request):
         raise HTTPException(404, str(error)) from error
     if not path.is_file():
         raise HTTPException(404, '图片不存在')
-    return FileResponse(path, media_type='image/png', headers={'X-Content-Type-Options': 'nosniff'})
+    return FileResponse(path, media_type='image/png', headers={'X-Content-Type-Options': 'nosniff', 'Cache-Control': 'no-cache'})
+
+
+class ImageTarget(BaseModel):
+    source: Literal['library', 'legacy'] = 'library'
+
+
+def image_deletion_details(store, project_id, image_id, source):
+    store.images.require_project(project_id)
+    store.images.path(image_id, project_id)
+    if source == 'legacy':
+        if project_id != DEFAULT_PROJECT or not store.images.path(image_id).is_file():
+            raise ValueError('图片不存在')
+        ids = {image_id}
+        paths = [store.images.path(image_id)]
+    else:
+        with store.images.connect() as conn:
+            row = conn.execute('SELECT name FROM ui_images WHERE project_id=? AND id=? AND hidden=0',
+                               (project_id, image_id)).fetchone()
+            if row is None:
+                raise ValueError('图片不存在')
+            ids = {image_id}
+            ids.update(item['id'] for item in conn.execute(
+                'SELECT id FROM ui_images WHERE project_id=? AND name=? AND hidden=1', (project_id, row['name'])))
+        paths = [store.images.path(key, project_id) for key in ids]
+
+    def references(case):
+        for step in case.get('steps', []):
+            options = (step.get('condition') or step).get('options') or {}
+            if options.get('baselineId') not in ids:
+                continue
+            owner = options.get('baselineProjectId')
+            if (source == 'legacy' and not owner) or (source == 'library' and owner == project_id):
+                return True
+        return False
+
+    with store.connect() as conn:
+        cases = [json.loads(row[0]) for row in conn.execute('SELECT body FROM cases')]
+    affected = [{'id': case['id'], 'name': case.get('name', '')}
+                for case in cases if references(case)]
+    return ids, paths, affected, references
+
+
+@router.post('/projects/{project_id}/images/{image_id}/references')
+async def ui_image_references(project_id: str, image_id: str, value: ImageTarget, request: Request):
+    async with manager(request).lock:
+        try:
+            _, _, affected, _ = image_deletion_details(manager(request).store, project_id, image_id, value.source)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+    return {'cases': affected}
+
+
+@router.post('/projects/{project_id}/images/{image_id}/delete')
+async def delete_ui_image(project_id: str, image_id: str, value: ImageTarget, request: Request):
+    service = manager(request)
+    store = service.store
+    async with service.lock:
+        try:
+            ids, paths, affected, references = image_deletion_details(store, project_id, image_id, value.source)
+        except ValueError as error:
+            raise HTTPException(404, str(error)) from error
+        for run_id in service.tasks:
+            run = store.get('runs', run_id)
+            if references(run.get('testCase') or {}):
+                raise HTTPException(409, '图片正在被运行中的用例使用，请等待运行结束')
+        moved = []
+        try:
+            with store.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                for path in paths:
+                    if path.is_file():
+                        temp = path.with_name(f'.delete-{uuid.uuid4().hex}.tmp')
+                        path.replace(temp)
+                        moved.append((path, temp))
+                if value.source == 'library':
+                    conn.executemany('DELETE FROM ui_images WHERE project_id=? AND id=?',
+                                     [(project_id, key) for key in ids])
+        except Exception as error:
+            for path, temp in reversed(moved):
+                if temp.exists():
+                    temp.replace(path)
+            if isinstance(error, OSError):
+                raise HTTPException(409, '删除图片失败，请检查文件权限') from error
+            raise
+        errors = []
+        for _, temp in moved:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                errors.append(str(temp))
+        return {'deleted': True, 'affectedCases': affected, 'cleanupErrors': errors}
 
 
 @router.post('/baselines', status_code=201)
@@ -944,36 +1167,38 @@ async def upload_baseline(request: Request, file: UploadFile = File(...)):
     except ValueError as error:
         raise HTTPException(400, str(error)) from error
     baseline_id = hashlib.sha256(data).hexdigest()
-    directory = manager(request).store.baselines
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f'{baseline_id}.png'
-    if not target.exists():
-        temporary = directory / f'{uuid.uuid4().hex}.tmp'
-        try:
-            temporary.write_bytes(data)
-            temporary.replace(target)
-        finally:
-            temporary.unlink(missing_ok=True)
+    async with manager(request).lock:
+        directory = manager(request).store.baselines
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f'{baseline_id}.png'
+        if not target.exists():
+            temporary = directory / f'{uuid.uuid4().hex}.tmp'
+            try:
+                temporary.write_bytes(data)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
     return {'id': baseline_id, 'width': width, 'height': height}
 
 
 @router.post('/cases')
 async def case_save(value: TestCase, request: Request):
-    store = manager(request).store
-    try:
-        store.validate_baselines(value)
-    except ValueError as error:
-        raise HTTPException(400, str(error)) from error
-    body = value.model_dump()
-    try:
-        previous = store.get('cases', value.id)
-        if previous['version'] != value.version:
-            raise HTTPException(409, '用例已被修改，请重新加载后编辑')
-        body['version'] = previous['version'] + 1
-    except KeyError:
-        body['version'] = 1
-    store.put('cases', body)
-    return body
+    async with manager(request).lock:
+        store = manager(request).store
+        try:
+            store.validate_baselines(value)
+        except ValueError as error:
+            raise HTTPException(400, str(error)) from error
+        body = value.model_dump()
+        try:
+            previous = store.get('cases', value.id)
+            if previous['version'] != value.version:
+                raise HTTPException(409, '用例已被修改，请重新加载后编辑')
+            body['version'] = previous['version'] + 1
+        except KeyError:
+            body['version'] = 1
+        store.put('cases', body)
+        return body
 
 
 @router.post('/cases/{case_id}/delete')

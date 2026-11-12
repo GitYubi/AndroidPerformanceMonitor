@@ -23,34 +23,63 @@ export async function searchScreenshot(
   if (width > screen.info.width || height > screen.info.height)
     return {
       similarity: null,
+      found: false,
       message: `基准图 ${width}×${height} 超出截图 ${screen.info.width}×${screen.info.height}`,
     };
   const maxMismatch = Math.floor(
     (width * height * (100 - minSimilarity)) / 100 + 1e-9
   );
+  // Check less common template pixels first. Every pixel is still checked
+  // before accepting a match, and rejection only happens past the threshold.
+  const frequency = new Uint32Array(256);
+  for (let i = 0; i < template.data.length; i += channels)
+    frequency[template.data[i]]++;
+  const order = Array.from({ length: width * height }, (_, index) => index);
+  order.sort(
+    (a, b) =>
+      frequency[template.data[a * channels]] -
+      frequency[template.data[b * channels]]
+  );
+  const screenOffsets = new Int32Array(order.length);
+  const templateOffsets = new Int32Array(order.length);
+  for (let i = 0; i < order.length; i++) {
+    const index = order[i];
+    screenOffsets[i] =
+      (Math.floor(index / width) * screen.info.width + (index % width)) *
+      channels;
+    templateOffsets[i] = index * channels;
+  }
   for (let y = 0; y <= screen.info.height - height; y++) {
     for (let x = 0; x <= screen.info.width - width; x++) {
       let mismatches = 0;
-      for (let row = 0; row < height && mismatches <= maxMismatch; row++) {
-        for (let col = 0; col < width && mismatches <= maxMismatch; col++) {
-          const a = ((y + row) * screen.info.width + x + col) * channels;
-          const b = (row * width + col) * channels;
-          for (let channel = 0; channel < channels; channel++) {
-            if (
-              Math.abs(screen.data[a + channel] - template.data[b + channel]) >
-              pixelTolerance
-            ) {
-              mismatches++;
-              break;
-            }
+      const start = (y * screen.info.width + x) * channels;
+      for (let i = 0; i < order.length && mismatches <= maxMismatch; i++) {
+        const a = start + screenOffsets[i];
+        const b = templateOffsets[i];
+        for (let channel = 0; channel < channels; channel++) {
+          if (
+            Math.abs(screen.data[a + channel] - template.data[b + channel]) >
+            pixelTolerance
+          ) {
+            mismatches++;
+            break;
           }
         }
       }
       if (mismatches <= maxMismatch)
-        return { similarity: 100 * (1 - mismatches / (width * height)), x, y };
+        return {
+          similarity: 100 * (1 - mismatches / (width * height)),
+          found: true,
+          x,
+          y,
+        };
     }
   }
-  return { similarity: null, message: "全屏未找到满足相似度阈值的基准图" };
+  return {
+    similarity: null,
+    found: false,
+    message: "全屏未找到满足相似度阈值的基准图",
+  };
 }
 
 export async function cropScreenshot(image, { left, top, right, bottom }) {

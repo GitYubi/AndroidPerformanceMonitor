@@ -443,3 +443,63 @@ test("element image assertions use only the element capture and surface lookup f
   );
   assert.match(message, /未找到/);
 });
+
+test("global image search matches exhaustive comparison across colors and thresholds", async () => {
+  const { default: sharp } = await import("sharp");
+  const { searchScreenshot, compareScreenshots } = await import(
+    "./image-assertion.mjs"
+  );
+  let seed = 731;
+  const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0);
+  for (const colorMode of ["grayscale", "color"]) {
+    for (const threshold of [0, 50, 80, 99, 100]) {
+      for (let trial = 0; trial < 5; trial++) {
+        const bytes = Buffer.alloc(7 * 6 * 3);
+        for (let i = 0; i < bytes.length; i++) bytes[i] = random() >>> 24;
+        const screen = await sharp(bytes, {
+          raw: { width: 7, height: 6, channels: 3 },
+        })
+          .png()
+          .toBuffer();
+        const left = random() % 5,
+          top = random() % 5;
+        const template = await sharp(screen)
+          .extract({ left, top, width: 3, height: 2 })
+          .png()
+          .toBuffer();
+        let expected = null;
+        for (let y = 0; y < 5 && !expected; y++) {
+          for (let x = 0; x < 5; x++) {
+            const candidate = await sharp(screen)
+              .extract({ left: x, top: y, width: 3, height: 2 })
+              .png()
+              .toBuffer();
+            const result = await compareScreenshots(
+              candidate,
+              template,
+              16,
+              "基准图",
+              colorMode
+            );
+            if (result.similarity >= threshold) {
+              expected = { x, y, similarity: result.similarity };
+              break;
+            }
+          }
+        }
+        const actual = await searchScreenshot(
+          screen,
+          template,
+          16,
+          threshold,
+          colorMode
+        );
+        assert.equal(actual.found, Boolean(expected));
+        assert.equal(actual.x, expected?.x);
+        assert.equal(actual.y, expected?.y);
+        if (expected)
+          assert.ok(Math.abs(actual.similarity - expected.similarity) < 1e-9);
+      }
+    }
+  }
+});

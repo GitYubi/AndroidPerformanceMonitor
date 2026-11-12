@@ -1,8 +1,24 @@
-import { useState, type FormEvent } from "react";
 import { Link } from "wouter";
+import { useState } from "react";
+import { Trash2 } from "lucide-react";
+import { toast } from "sonner";
+import { BACKEND_URL } from "@/lib/backend";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { uiImageUrl, type UiImage, type UiProject } from "@/lib/uiImages";
+import {
+  AlertDialog,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+  uiImagesPath,
+  uiImageUrl,
+  type UiImage,
+  type UiProject,
+} from "@/lib/uiImages";
 
 export function UiProjectOptions({ projects }: { projects: UiProject[] }) {
   return (
@@ -22,23 +38,73 @@ export function UiImageLibrary({
   onSelect,
   images,
   loading,
-  busy,
-  onCreate,
+  onDeleted,
 }: {
   projects: UiProject[];
   projectId: string;
   onSelect: (id: string) => void;
   images: UiImage[];
   loading: boolean;
-  busy: boolean;
-  onCreate: (name: string) => Promise<boolean>;
+  onDeleted: (projectId: string, imageId: string) => void;
 }) {
-  const [name, setName] = useState("");
-  async function create(event: FormEvent) {
-    event.preventDefault();
-    if (name.trim() && (await onCreate(name.trim()))) setName("");
+  const [target, setTarget] = useState<{
+    projectId: string;
+    image: UiImage;
+    cases: { id: string; name: string }[];
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  async function request(path: string, image: UiImage) {
+    const response = await fetch(`${BACKEND_URL}/api${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: image.source === "legacy" ? "legacy" : "library",
+      }),
+    });
+    const result = await response.json();
+    if (!response.ok)
+      throw Error(
+        typeof result.detail === "string" ? result.detail : "图片操作失败"
+      );
+    return result;
   }
-
+  async function prepareDelete(image: UiImage) {
+    setBusy(true);
+    try {
+      const result = await request(
+        `${uiImagesPath(projectId)}/${encodeURIComponent(image.id)}/references`,
+        image
+      );
+      setTarget({ projectId, image, cases: result.cases });
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function deleteImage() {
+    if (!target) return;
+    setBusy(true);
+    try {
+      const result = await request(
+        `${uiImagesPath(target.projectId)}/${encodeURIComponent(target.image.id)}/delete`,
+        target.image
+      );
+      onDeleted(target.projectId, target.image.id);
+      setTarget(null);
+      if (result.cleanupErrors?.length) {
+        toast.error(
+          `图片已删除，部分文件清理失败：${result.cleanupErrors.join("、")}`
+        );
+      } else {
+        toast.success("图片已删除");
+      }
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
     <section className="space-y-5">
       <div className="flex flex-wrap items-end justify-between gap-3">
@@ -48,28 +114,18 @@ export function UiImageLibrary({
             aria-label="图片库项目"
             className="h-9 min-w-40 rounded-md border border-input bg-background px-2"
             value={projectId}
+            disabled={busy}
             onChange={event => onSelect(event.target.value)}
           >
             <UiProjectOptions projects={projects} />
           </select>
         </label>
-        <form onSubmit={create} className="flex flex-wrap items-center gap-2">
-          <Input
-            className="w-44"
-            aria-label="新项目名称"
-            placeholder="新项目名称"
-            maxLength={100}
-            value={name}
-            onChange={event => setName(event.target.value)}
-          />
-          <Button
-            type="submit"
-            variant="outline"
-            disabled={busy || !name.trim()}
-          >
-            新建项目
-          </Button>
-        </form>
+        <Link
+          href="/ui?section=projects"
+          className="text-sm text-primary hover:underline"
+        >
+          项目管理
+        </Link>
       </div>
       {loading ? (
         <p className="text-sm text-muted-foreground">正在读取图片…</p>
@@ -109,10 +165,23 @@ export function UiImageLibrary({
               </div>
               {item.region && (
                 <div className="text-xs text-muted-foreground">
-                  ({item.region.left}, {item.region.top}) → ({item.region.right},{" "}
-                  {item.region.bottom})
+                  ({item.region.left}, {item.region.top}) → ({item.region.right}
+                  , {item.region.bottom})
                 </div>
               )}
+              <div className="mt-2 flex justify-end">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy}
+                  aria-label={`删除图片 ${item.name}`}
+                  onClick={() => void prepareDelete(item)}
+                >
+                  <Trash2 className="size-4" />
+                  删除
+                </Button>
+              </div>
             </li>
           ))}
         </ul>
@@ -125,6 +194,51 @@ export function UiImageLibrary({
           中保存截图。
         </p>
       )}
+      <AlertDialog
+        open={Boolean(target)}
+        onOpenChange={open => {
+          if (!open && !busy) setTarget(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              删除图片“{target?.image.name}”？
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              {target?.cases.length
+                ? `有 ${target.cases.length} 个用例引用了这张图片。删除后需要为这些用例重新选择图片。`
+                : "引用这张图片的用例在删除后需要重新选择图片。"}
+              删除后无法恢复。
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {!!target?.cases.length && (
+            <ul className="max-h-32 overflow-auto rounded border border-border px-3 py-2 text-sm">
+              {target.cases.slice(0, 8).map(item => (
+                <li key={item.id} className="truncate" title={item.name}>
+                  {item.name}
+                </li>
+              ))}
+              {target.cases.length > 8 && (
+                <li className="text-muted-foreground">
+                  还有 {target.cases.length - 8} 个用例
+                </li>
+              )}
+            </ul>
+          )}
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>取消</AlertDialogCancel>
+            <Button
+              type="button"
+              variant="destructive"
+              disabled={busy}
+              onClick={() => void deleteImage()}
+            >
+              删除图片
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </section>
   );
 }

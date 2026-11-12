@@ -36,6 +36,7 @@ type Props = {
   screenshots: { id: string; label: string }[];
   variables: string[];
   imageVariables: string[];
+  conditionContext?: boolean;
   onChange: (patch: Partial<Step> | ((current: Step) => Partial<Step>)) => void;
 };
 
@@ -51,6 +52,7 @@ export function UiStepFields({
   screenshots,
   variables,
   imageVariables,
+  conditionContext = false,
   onChange,
 }: Props) {
   const [uploading, setUploading] = useState(false);
@@ -259,6 +261,7 @@ export function UiStepFields({
           screenshots={screenshots}
           variables={variables}
           imageVariables={imageVariables}
+          conditionContext
           onPickElement={onPickElement}
           pickingElement={pickingElement}
           onChange={patch =>
@@ -560,7 +563,8 @@ export function UiStepFields({
     const mode = options.mode ?? "screen";
     const selected = images.find(
       item =>
-        item.id === options.baselineId &&
+        (item.id === options.baselineId ||
+          item.aliases?.includes(options.baselineId ?? "")) &&
         (item.source === "legacy"
           ? !options.baselineProjectId
           : options.baselineProjectId === projectId)
@@ -568,6 +572,25 @@ export function UiStepFields({
     return (
       <div className="space-y-2">
         <div className="grid grid-cols-2 gap-2 @min-[550px]:grid-cols-[minmax(0,1fr)_minmax(0,1.6fr)_minmax(0,1fr)_minmax(0,1fr)]">
+          {conditionContext && (
+            <label className={labelClass}>
+              预期状态
+              <select
+                className={selectClass}
+                value={options.expected ?? "exists"}
+                onChange={event =>
+                  patchOptions({ expected: event.target.value })
+                }
+              >
+                <option value="exists">
+                  {mode === "screen" ? "图像存在" : "图像匹配"}
+                </option>
+                <option value="absent">
+                  {mode === "screen" ? "图像不存在" : "图像不匹配"}
+                </option>
+              </select>
+            </label>
+          )}
           <label className={labelClass}>
             截图范围
             <select
@@ -583,8 +606,11 @@ export function UiStepFields({
                     mode: selected,
                     roi:
                       selected === "roi"
-                        ? (images.find(image => image.id === options.baselineId)
-                            ?.region ?? {})
+                        ? (images.find(
+                            image =>
+                              image.id === options.baselineId ||
+                              image.aliases?.includes(options.baselineId ?? "")
+                          )?.region ?? {})
                         : undefined,
                   },
                   selector: selected === "element" ? {} : null,
@@ -656,8 +682,7 @@ export function UiStepFields({
         )}
         {mode === "roi" && roiFields()}
         <p className="text-xs text-muted-foreground">
-          {mode === "screen" &&
-            "在整张截图内搜索基准图，达到相似度阈值即通过。"}
+          {mode === "screen" && "在整张截图内搜索基准图，并按预期状态判断。"}
           {mode === "element" && "元素截图需要与基准图尺寸一致。"}
           {mode === "roi" &&
             "使用基准图保存时的坐标，可手动调整。截图范围须与基准图尺寸一致。"}

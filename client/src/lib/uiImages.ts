@@ -8,6 +8,7 @@ export type UiImage = {
   width: number;
   height: number;
   source: "roi" | "element" | "legacy";
+  aliases?: string[];
   region?: { left: number; top: number; right: number; bottom: number } | null;
 };
 

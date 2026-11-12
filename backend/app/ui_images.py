@@ -40,6 +40,8 @@ class UIImages:
                 PRIMARY KEY (project_id, id))''')
             if 'region' not in {row[1] for row in conn.execute('PRAGMA table_info(ui_images)')}:
                 conn.execute('ALTER TABLE ui_images ADD COLUMN region TEXT')
+            if 'hidden' not in {row[1] for row in conn.execute('PRAGMA table_info(ui_images)')}:
+                conn.execute('ALTER TABLE ui_images ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
             conn.execute('INSERT OR IGNORE INTO ui_projects VALUES (?, ?)', (DEFAULT_PROJECT, '默认项目'))
 
     def connect(self):
@@ -82,11 +84,14 @@ class UIImages:
     def list_images(self, project_id):
         self.require_project(project_id)
         with self.connect() as conn:
-            images = [dict(row) for row in conn.execute(
-                'SELECT id,name,width,height,source,region FROM ui_images WHERE project_id=? ORDER BY rowid DESC',
+            rows = [dict(row) for row in conn.execute(
+                'SELECT id,name,width,height,source,region,hidden FROM ui_images WHERE project_id=? ORDER BY rowid DESC',
                 (project_id,))]
+        images = [row.copy() for row in rows if not row['hidden']]
         for item in images:
+            item.pop('hidden')
             item['region'] = json.loads(item['region']) if item['region'] else None
+            item['aliases'] = [row['id'] for row in rows if row.get('hidden') and row['name'] == item['name']]
         if project_id == DEFAULT_PROJECT:
             known = {item['id'] for item in images}
             for path in sorted(self.legacy.glob('*.png')):
@@ -120,17 +125,67 @@ class UIImages:
         region_json = json.dumps(region, sort_keys=True) if region is not None else None
         digest = hashlib.sha256(f'{source}\0{name}\0{region_json}\0'.encode())
         digest.update(data)
-        image_id = digest.hexdigest()
-        path = self.path(image_id, project_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            temp = path.with_name(f'{uuid.uuid4().hex}.tmp')
-            try:
-                temp.write_bytes(data)
-                temp.replace(path)
-            finally:
+        replaced = []
+        temps = []
+        try:
+            with self.connect() as conn:
+                conn.execute('BEGIN IMMEDIATE')
+                if not conn.execute('SELECT 1 FROM ui_projects WHERE id=?', (project_id,)).fetchone():
+                    raise ValueError('项目不存在')
+                rows = conn.execute(
+                    'SELECT id,region FROM ui_images WHERE project_id=? AND name=? ORDER BY hidden ASC, rowid DESC',
+                    (project_id, name)).fetchall()
+                image_id = rows[0]['id'] if rows else digest.hexdigest()
+                old_regions = {row['id']: json.loads(row['region']) if row['region'] else None for row in rows}
+                ids = list(old_regions) or [image_id]
+                for key in ids:
+                    path = self.path(key, project_id)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    original = path.read_bytes() if path.is_file() else None
+                    temp = path.with_name(f'{uuid.uuid4().hex}.tmp')
+                    temps.append(temp)
+                    temp.write_bytes(data)
+                    temp.replace(path)
+                    replaced.append((path, original))
+                if rows:
+                    conn.execute('''UPDATE ui_images SET width=?,height=?,source=?,region=?,hidden=(id<>?)
+                        WHERE project_id=? AND name=?''',
+                        (width, height, source, region_json, image_id, project_id, name))
+                    if region is not None:
+                        for row in conn.execute('SELECT id,body FROM cases').fetchall():
+                            case = json.loads(row['body'])
+                            changed = False
+                            for step in case.get('steps', []):
+                                options = (step.get('condition') or step).get('options') or {}
+                                baseline_id = options.get('baselineId')
+                                if (options.get('baselineProjectId') == project_id and baseline_id in old_regions
+                                    and options.get('mode') == 'roi' and old_regions[baseline_id] is not None
+                                    and old_regions[baseline_id] != region
+                                    and options.get('roi') == old_regions[baseline_id]):
+                                    options['roi'] = region
+                                    changed = True
+                            if changed:
+                                case['version'] = case.get('version', 1) + 1
+                                conn.execute('UPDATE cases SET body=? WHERE id=?',
+                                             (json.dumps(case, ensure_ascii=False), row['id']))
+                else:
+                    conn.execute('''INSERT INTO ui_images (project_id,id,name,width,height,source,region)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                        (project_id, image_id, name, width, height, source, region_json))
+        except Exception:
+            for path, original in reversed(replaced):
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    temp = path.with_name(f'{uuid.uuid4().hex}.tmp')
+                    try:
+                        temp.write_bytes(original)
+                        temp.replace(path)
+                    finally:
+                        temp.unlink(missing_ok=True)
+            raise
+        finally:
+            for temp in temps:
                 temp.unlink(missing_ok=True)
-        with self.connect() as conn:
-            conn.execute('''INSERT OR IGNORE INTO ui_images (project_id,id,name,width,height,source,region) VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                         (project_id, image_id, name, width, height, source, region_json))
-        return {'id': image_id, 'name': name, 'width': width, 'height': height, 'source': source, 'region': region}
+        return {'id': image_id, 'name': name, 'width': width, 'height': height,
+                'source': source, 'region': region, 'aliases': ids[1:] if rows else []}

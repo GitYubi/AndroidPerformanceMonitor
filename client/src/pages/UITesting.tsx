@@ -3,6 +3,8 @@ import { BACKEND_URL } from "@/lib/backend";
 import type { CanCatalog } from "@/lib/canCatalog";
 import { getUiSection } from "@/lib/uiNavigation";
 import { UiStepFields } from "@/components/UiStepFields";
+import { UiCaseLibrary } from "@/components/UiCaseLibrary";
+import { UiProjectManagement } from "@/components/UiProjectManagement";
 import { UiImageLibrary, UiProjectOptions } from "@/components/UiImageLibrary";
 import {
   defaultProject,
@@ -56,7 +58,6 @@ import {
   Plus,
   Save,
   Settings,
-  Download,
   ArrowUp,
   ArrowDown,
   ChevronDown,
@@ -438,6 +439,37 @@ export default function UITesting() {
       created = true;
     });
     return created;
+  }
+  async function deleteProject(id: string) {
+    let deleted = false;
+    await perform(async () => {
+      const response = await fetch(
+        `${API}/api/ui/projects/${encodeURIComponent(id)}/delete`,
+        { method: "POST" }
+      );
+      const result = await response.json();
+      if (!response.ok)
+        throw new Error(
+          typeof result.detail === "string" ? result.detail : "删除项目失败"
+        );
+      setProjects(previous => previous.filter(project => project.id !== id));
+      setProjectId(defaultProject.id);
+      setDraft(previous => (previous.projectId === id ? blank() : previous));
+      setRunId(current =>
+        result.deletedRunIds?.includes(current) ? "" : current
+      );
+      setSelected([]);
+      await refresh();
+      if (result.cleanupErrors?.length) {
+        toast.error(
+          `项目已删除，部分文件清理失败：${result.cleanupErrors.join("、")}`
+        );
+      } else {
+        toast.success("项目已删除");
+      }
+      deleted = true;
+    });
+    return deleted;
   }
   function load(test: Case) {
     const copy = structuredClone(test);
@@ -861,22 +893,30 @@ export default function UITesting() {
           <h1
             className={`font-semibold ${section === "execute" ? "text-lg" : "text-2xl"}`}
           >
-            {section === "images" ? "图片库" : "UI 自动化测试"}
+            {section === "projects"
+              ? "项目管理"
+              : section === "images"
+                ? "图片库"
+                : "UI 自动化测试"}
           </h1>
-          {section !== "execute" && section !== "images" && (
-            <p className="mt-2 text-sm text-muted-foreground">
-              用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
-            </p>
-          )}
+          {section !== "execute" &&
+            section !== "images" &&
+            section !== "projects" && (
+              <p className="mt-2 text-sm text-muted-foreground">
+                用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
+              </p>
+            )}
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => void perform(openSettings)}
-        >
-          <Settings className="size-4" />
-          设置
-        </Button>
+        {section !== "projects" && (
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void perform(openSettings)}
+          >
+            <Settings className="size-4" />
+            设置
+          </Button>
+        )}
       </header>
       {error && (
         <p
@@ -900,6 +940,16 @@ export default function UITesting() {
           ))}
         </div>
       )}
+      {section === "projects" && (
+        <UiProjectManagement
+          projects={projects}
+          projectId={projectId}
+          onSelect={setProjectId}
+          busy={busy}
+          onCreate={createProject}
+          onDelete={deleteProject}
+        />
+      )}
       {section === "structure" && (
         <PageMapWorkbench
           projects={projects}
@@ -914,8 +964,16 @@ export default function UITesting() {
           onSelect={setProjectId}
           images={images}
           loading={catalog?.id !== catalogId}
-          busy={busy}
-          onCreate={createProject}
+          onDeleted={(id, imageId) =>
+            setCatalog(current =>
+              current?.id === id
+                ? {
+                    ...current,
+                    items: current.items.filter(image => image.id !== imageId),
+                  }
+                : current
+            )
+          }
         />
       )}
       {section === "execute" && (
@@ -1818,92 +1876,22 @@ export default function UITesting() {
         </div>
       )}
       {section === "cases" && (
-        <section>
-          <div className="flex justify-between items-center mb-5">
-            <h2 className="font-medium">已保存用例 · {cases.length}</h2>
-            <Button
-              variant="outline"
-              disabled={!selected.length || busy}
-              onClick={() => void perform(exportCases)}
-            >
-              <Download className="size-4" />
-              导出已选 ZIP（{selected.length}）
-            </Button>
-          </div>
-          {!cases.length && (
-            <p className="py-12 text-muted-foreground">
-              尚未保存用例。在“执行与编辑”中创建步骤后保存。
-            </p>
-          )}
-          {projects.map(project => {
-            const projectCases = cases.filter(
-              test => (test.projectId ?? defaultProject.id) === project.id
-            );
-            if (!projectCases.length) return null;
-            return (
-              <section
-                key={project.id}
-                className="mb-5 rounded-md border border-border"
-              >
-                <h3 className="border-b border-border bg-muted/50 px-4 py-2 text-sm font-medium">
-                  {project.name}{" "}
-                  <span className="text-muted-foreground">
-                    · {projectCases.length} 个用例
-                  </span>
-                </h3>
-                <ul className="divide-y divide-border px-4">
-                  {projectCases.map(test => (
-                    <li
-                      key={test.id}
-                      className="flex flex-wrap items-center gap-4 py-4"
-                    >
-                      <input
-                        aria-label={`选择 ${test.name}`}
-                        type="checkbox"
-                        checked={selected.includes(test.id)}
-                        onChange={e =>
-                          setSelected(
-                            e.target.checked
-                              ? [...selected, test.id]
-                              : selected.filter(id => id !== test.id)
-                          )
-                        }
-                      />
-                      <div className="flex-1">
-                        <p>{test.name}</p>
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          {test.group || "未分组"} · {test.steps.length} 步 · v
-                          {test.version}{" "}
-                          {test.tags
-                            .filter(Boolean)
-                            .map(t => `#${t}`)
-                            .join(" ")}
-                        </p>
-                      </div>
-                      <Button variant="outline" onClick={() => load(test)}>
-                        编辑 / 复跑
-                      </Button>
-                      <Button
-                        aria-label={`删除 ${test.name}`}
-                        variant="ghost"
-                        size="icon"
-                        onClick={() =>
-                          void perform(async () => {
-                            await api(`/ui/cases/${test.id}/delete`, {});
-                            setSelected(selected.filter(id => id !== test.id));
-                            await refresh();
-                          })
-                        }
-                      >
-                        <Trash2 className="size-4" />
-                      </Button>
-                    </li>
-                  ))}
-                </ul>
-              </section>
-            );
-          })}
-        </section>
+        <UiCaseLibrary
+          cases={cases}
+          projects={projects}
+          selected={selected}
+          busy={busy}
+          onSelect={setSelected}
+          onEdit={load}
+          onDelete={test =>
+            void perform(async () => {
+              await api(`/ui/cases/${test.id}/delete`, {});
+              setSelected(current => current.filter(id => id !== test.id));
+              await refresh();
+            })
+          }
+          onExport={() => void perform(exportCases)}
+        />
       )}
       {section === "reports" && (
         <section>

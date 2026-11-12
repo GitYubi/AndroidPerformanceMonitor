@@ -227,6 +227,11 @@ function validateOptions(step) {
     }
     case "image_assert": {
       if (
+        options?.expected != null &&
+        !["exists", "absent"].includes(options.expected)
+      )
+        throw new Error("步骤图像断言的预期状态无效");
+      if (
         options?.colorMode != null &&
         !["grayscale", "color"].includes(options.colorMode)
       )
@@ -546,6 +551,7 @@ export async function executeStep(
     loadScreenshot,
     setVariable,
     sensitive = false,
+    isCondition = false,
     onResult = () => {},
     onImage = () => {},
   } = {}
@@ -674,7 +680,7 @@ export async function executeStep(
         const capture = await captureElement(step.selector);
         if (!capture.image) {
           onResult(capture.message);
-          return capture.state;
+          return isCondition ? "error" : capture.state;
         }
         actual = capture.image;
       } else {
@@ -684,7 +690,7 @@ export async function executeStep(
           if (!cropped.image) {
             onImage(null);
             onResult(cropped.message);
-            return "failed";
+            return isCondition ? "error" : "failed";
           }
           actual = cropped.image;
         }
@@ -708,13 +714,20 @@ export async function executeStep(
               colorMode
             );
       const { similarity, message } = result;
+      const isSearch = (step.options.mode ?? "screen") === "screen";
+      if (!isSearch && similarity === null && isCondition) {
+        onResult(message);
+        return "error";
+      }
       onResult(
         message ||
           `图像相似度 ${similarity.toFixed(2)}%，阈值 ${step.options.minSimilarity}%${result.x != null ? `，位置 (${result.x}, ${result.y})` : ""}`
       );
-      return similarity !== null && similarity >= step.options.minSimilarity
-        ? "passed"
-        : "failed";
+      const matched = isSearch
+        ? result.found
+        : similarity !== null && similarity >= step.options.minSimilarity;
+      const expected = step.options.expected ?? "exists";
+      return (expected === "absent" ? !matched : matched) ? "passed" : "failed";
     }
     case "screenshot_assert": {
       const {

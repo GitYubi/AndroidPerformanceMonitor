@@ -7,7 +7,14 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import NotFound from "@/pages/NotFound";
 import { Link, Route, Switch, useLocation, useSearchParams } from "wouter";
 import { useEffect, useState } from "react";
-import { Activity, Gauge, Moon, Sun, type LucideIcon } from "lucide-react";
+import {
+  Activity,
+  FolderKanban,
+  Gauge,
+  Moon,
+  Sun,
+  type LucideIcon,
+} from "lucide-react";
 import { canSections, getCanSection } from "@/lib/canNavigation";
 import { getUiSection, uiSections } from "@/lib/uiNavigation";
 import ErrorBoundary from "./components/ErrorBoundary";
@@ -115,6 +122,20 @@ function WorkspaceNav() {
         aria-label="工作台导航"
         className="min-h-0 flex-1 space-y-5 overflow-y-auto overscroll-contain px-1.5 py-3 md:px-2.5"
       >
+        <div className="space-y-1" role="group" aria-label="项目">
+          <p
+            aria-hidden="true"
+            className="hidden px-2.5 pb-1 text-xs font-medium text-muted-foreground md:block"
+          >
+            项目
+          </p>
+          <SidebarLink
+            href="/ui?section=projects"
+            label="项目管理"
+            icon={FolderKanban}
+            current={location === "/ui" && uiSection === "projects"}
+          />
+        </div>
         <div className="space-y-1" role="group" aria-label="性能测试">
           <p
             aria-hidden="true"
@@ -144,20 +165,22 @@ function WorkspaceNav() {
           >
             UI 自动化
           </p>
-          {uiSections.map(({ id, label, icon }) => (
-            <SidebarLink
-              key={id}
-              href={id === "execute" ? "/ui" : `/ui?section=${id}`}
-              label={label}
-              icon={icon}
-              current={location === "/ui" && uiSection === id}
-              detail={
-                id === "execute" && status.ui
-                  ? `${status.ui} 运行中`
-                  : undefined
-              }
-            />
-          ))}
+          {uiSections
+            .filter(({ id }) => id !== "projects")
+            .map(({ id, label, icon }) => (
+              <SidebarLink
+                key={id}
+                href={id === "execute" ? "/ui" : `/ui?section=${id}`}
+                label={label}
+                icon={icon}
+                current={location === "/ui" && uiSection === id}
+                detail={
+                  id === "execute" && status.ui
+                    ? `${status.ui} 运行中`
+                    : undefined
+                }
+              />
+            ))}
         </div>
         <div className="space-y-1" role="group" aria-label="总线控制">
           <p
