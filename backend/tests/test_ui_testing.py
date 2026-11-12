@@ -130,7 +130,8 @@ def test_can_steps_use_selected_dbc_and_share_the_bus(monkeypatch, tmp_path):
         dbc = str(ROOT / 'config' / 'Example.dbc')
         def request(key):
             return ui.RunRequest(serial='', testCase=case(parameters=[], steps=[
-                can_step('can_send_once', key, 'TestButtons', {'PressA': {'raw': 1}, 'PressB': 1}),
+                {'id': 'loop', 'type': 'for', 'prompt': 'For 循环', 'options': {'count': 2}},
+                {**can_step('can_send_once', key, 'TestButtons', {'PressA': {'raw': 1}, 'PressB': 1}), 'parentId': 'loop'},
                 can_step('can_send_loop', key, 'TestClassicA', {'Value': 17}, 20),
                 {'id': 'delay', 'type': 'delay', 'prompt': '等待时间', 'options': {'durationMs': 100}},
                 can_step('can_stop', key, 'TestClassicA'),
@@ -151,11 +152,12 @@ def test_can_steps_use_selected_dbc_and_share_the_bus(monkeypatch, tmp_path):
             assert result['state'] == 'needs_review'
             passed = [event for event in manager.store.events(run['id'])
                       if event['type'] == 'step' and event['state'] == 'passed']
-            assert [event['stepId'] for event in passed] == ['can_send_once', 'can_send_loop', 'delay', 'can_stop']
+            assert [event['stepId'] for event in passed] == [
+                'loop', 'can_send_once', 'can_send_once', 'can_send_loop', 'delay', 'can_stop']
             await asyncio.sleep(.15)
             frames = list(bus.frames)
             once = [frame for frame in frames if frame['arbitration_id'] == 0x287]
-            assert len(once) == 1 and once[0]['data'][0] == 3 and once[0]['is_fd']
+            assert len(once) == 2 and all(frame['data'][0] == 3 and frame['is_fd'] for frame in once)
             repeated = [frame for frame in frames if frame['arbitration_id'] == 6]
             assert len(repeated) > 1 and all(frame['data'][0] == 17 and not frame['is_fd'] for frame in repeated)
             assert not any(task['active'] for task in bus.status()['tasks'])
@@ -172,6 +174,7 @@ def test_cancel_can_loop_keeps_unrelated_sends(monkeypatch, tmp_path):
       const input = createInterface({ input: process.stdin });
       const lines = input[Symbol.asyncIterator]();
       const job = JSON.parse((await lines.next()).value);
+      console.log(JSON.stringify({ protocol: 1, type: 'step', state: 'running', stepId: job.testCase.steps[0].id }));
       console.log(JSON.stringify({ protocol: 1, type: 'can_request', stepId: job.testCase.steps[0].id }));
       const reply = JSON.parse((await lines.next()).value);
       if (!reply.ok) process.exit(2);
@@ -299,6 +302,7 @@ def test_image_baseline_is_local_and_included_in_case_export(tmp_path):
 
     async def scenario():
         uploaded = await ui.upload_baseline(request, UploadFile(filename='reference.png', file=io.BytesIO(data)))
+        assert ui.ui_project_images('default', request)[0]['source'] == 'legacy'
         value = ui.TestCase(name='图像断言', steps=[ui.Step(id='image', type='image_assert', prompt='图像断言',
                             options={'baselineId': uploaded['id']})])
         await ui.case_save(value, request)
@@ -307,6 +311,65 @@ def test_image_baseline_is_local_and_included_in_case_export(tmp_path):
             assert archive.read(f"baselines/{uploaded['id']}.png") == data
             saved = json.loads(archive.read(f'cases/{value.id}.json'))
             assert saved['steps'][0]['options']['minSimilarity'] == 99
+
+    asyncio.run(scenario())
+
+
+def test_project_images_are_scoped_and_export_with_cases(tmp_path):
+    import io
+    import zipfile
+    from fastapi import UploadFile
+    from PIL import Image
+
+    manager = ui.UIManager(tmp_path)
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager)))
+    first = ui.create_ui_project(ui.ProjectName(name='车型一'), request)
+    second = ui.create_ui_project(ui.ProjectName(name='车型二'), request)
+    assert ui.ui_projects(request)[0]['id'] == 'default'
+    with pytest.raises(ui.HTTPException, match='项目名称已存在'):
+        ui.create_ui_project(ui.ProjectName(name=' 车型一 '), request)
+
+    png = io.BytesIO()
+    Image.new('RGB', (3, 2), 'blue').save(png, 'PNG')
+    data = png.getvalue()
+
+    async def scenario():
+        async def upload(project, name, source, raw=data):
+            return await ui.save_ui_project_image(
+                project['id'], request, name, source,
+                UploadFile(filename='reference.png', file=io.BytesIO(raw)), region=None)
+
+        with pytest.raises(ui.HTTPException, match='PNG 图片无法读取'):
+            await upload(first, '损坏图片', 'roi', data[:35])
+        roi = await upload(first, '框选按钮', 'roi')
+        assert ui.ui_project_images(second['id'], request) == []
+        element = await upload(second, '元素截图', 'element')
+        assert await upload(first, '框选按钮', 'roi') == roi
+        named_copy = await upload(first, '按钮的另一名称', 'roi')
+        coordinates = {'left': 5, 'top': 8, 'right': 8, 'bottom': 10}
+        with_coords = await ui.save_ui_project_image(first['id'], request, '带坐标', 'roi',
+                            UploadFile(filename='reference.png', file=io.BytesIO(data)), region=json.dumps(coordinates))
+        assert with_coords['region'] == coordinates
+        assert ui.ui_project_images(first['id'], request)[0]['region'] == coordinates
+        assert roi['id'] != named_copy['id']
+        assert ui.ui_project_images(first['id'], request) == [with_coords, named_copy, roi]
+        assert ui.ui_project_images(second['id'], request) == [element]
+        assert (roi['width'], roi['height'], roi['source']) == (3, 2, 'roi')
+        path = tmp_path / 'projects' / first['id'] / 'images' / f"{roi['id']}.png"
+        assert path.read_bytes() == data
+        assert ui.ui_project_image(first['id'], roi['id'], request).path == path
+        value = ui.TestCase(name='车型用例', projectId=first['id'], steps=[
+            ui.Step(id='image', type='image_assert', prompt='图像断言',
+                    options={'baselineId': roi['id'], 'baselineProjectId': first['id']})
+        ])
+        saved = await ui.case_save(value, request)
+        assert saved['projectId'] == first['id']
+        assert manager.store.validate_baselines(value) == {f"{first['id']}/{roi['id']}": str(path.resolve())}
+        response = await ui.cases_export(ui.ExportRequest(ids=[value.id]), request)
+        with zipfile.ZipFile(io.BytesIO(response.body)) as archive:
+            assert archive.read(f"baselines/{roi['id']}.png") == data
+            options = json.loads(archive.read(f'cases/{value.id}.json'))['steps'][0]['options']
+            assert options['baselineProjectId'] == first['id']
 
     asyncio.run(scenario())
 
@@ -344,6 +407,60 @@ def test_screenshot_comparison_references_prior_steps_and_survives_draft_creatio
     assert assertion['options']['secondStepId'] == second['id']
 
 
+def test_control_flow_validates_branch_scopes_and_remaps_drafts():
+    loop = {'id': 'loop', 'type': 'for', 'prompt': '循环',
+            'options': {'count': 2, 'indexVariable': 'round'}}
+    condition = {'id': 'if', 'type': 'variable_assert', 'prompt': '变量比较',
+                 'options': {'variable': 'round', 'expectedValue': '1'}}
+    check = {'id': 'if', 'type': 'if', 'prompt': '判断', 'parentId': 'loop', 'condition': condition}
+    roi = {'id': 'roi', 'type': 'screenshot', 'prompt': 'ROI', 'parentId': 'if',
+           'options': {'captureName': '区域', 'mode': 'roi',
+                       'roi': {'left': 1, 'top': 1, 'right': 5, 'bottom': 4}}}
+    element = {'id': 'element', 'type': 'element_screenshot', 'prompt': '元素', 'parentId': 'if',
+               'selector': {'resourceId': 'demo:id/control'}, 'options': {'captureName': '按钮'}}
+    compare = {'id': 'compare', 'type': 'screenshot_assert', 'prompt': '对比', 'parentId': 'if',
+               'options': {'firstStepId': 'roi', 'secondStepId': 'element'}}
+    test_case = case(parameters=[], steps=[loop, check, roi, element, compare])
+    saved = ui.draft_from_run({'testCase': test_case.model_dump()}, [])['testCase']['steps']
+    assert saved[1]['parentId'] == saved[0]['id']
+    assert saved[4]['parentId'] == saved[1]['id']
+    assert saved[4]['options']['secondStepId'] == saved[3]['id']
+    with pytest.raises(ValidationError, match='当前分支或外层'):
+        case(parameters=[], steps=[loop, check, roi, element, {**compare, 'branch': 'else'}])
+    with pytest.raises(ValidationError, match='不可见的变量'):
+        case(parameters=[], steps=[loop, check, roi, element, compare, {**condition, 'id': 'outside'}])
+    with pytest.raises(ValidationError, match='定位条件'):
+        case(parameters=[], steps=[loop, check, {**element, 'selector': None}])
+    fallback = {'id': 'fallback', 'type': 'else', 'prompt': 'Else 分支', 'parentId': 'if', 'branch': 'else'}
+    action = {'id': 'no', 'type': 'delay', 'prompt': '等待', 'options': {'durationMs': 1}}
+    case(parameters=[], steps=[loop, check, {**action, 'parentId': 'if', 'branch': 'else'}])
+    test_case = case(parameters=[], steps=[loop, check, fallback, {**action, 'parentId': 'fallback'}])
+    draft = ui.draft_from_run({'testCase': test_case.model_dump()}, [])['testCase']['steps']
+    assert draft[2]['parentId'] == draft[1]['id'] and draft[3]['parentId'] == draft[2]['id']
+    with pytest.raises(ValidationError, match='Else 必须归属于 If'):
+        case(parameters=[], steps=[{**fallback, 'parentId': None, 'branch': None}])
+    with pytest.raises(ValidationError, match='只能有一个 Else'):
+        case(parameters=[], steps=[loop, check, fallback, {**fallback, 'id': 'duplicate'}])
+
+
+def test_named_variable_assignments_validate_sources_and_remap_screenshot_ids():
+    capture = {'id': 'capture', 'type': 'screenshot', 'name': '采集画面', 'prompt': '截图'}
+    assignment = {'id': 'saved', 'type': 'assign', 'name': '保存画面', 'prompt': '赋值',
+                  'options': {'variable': 'shot', 'valueType': 'image', 'sourceStepId': 'capture'}}
+    compare = {'id': 'compare', 'type': 'screenshot_assert', 'prompt': '对比',
+               'options': {'firstStepId': 'capture', 'secondVariable': 'shot'}}
+    original = case(parameters=[], steps=[capture, assignment, compare])
+    draft = ui.draft_from_run({'testCase': original.model_dump()}, [])['testCase']['steps']
+    assert [item['name'] for item in draft] == ['采集画面', '保存画面', '']
+    assert draft[1]['options']['sourceStepId'] == draft[0]['id']
+    assert draft[2]['options']['firstStepId'] == draft[0]['id']
+    assert draft[2]['options']['secondVariable'] == 'shot'
+    with pytest.raises(ValidationError, match='图片变量须在前面赋值'):
+        case(parameters=[], steps=[capture, compare, assignment])
+    with pytest.raises(ValidationError):
+        ui.Step(**{**assignment, 'options': {'variable': 'flag', 'valueType': 'boolean', 'booleanValue': 'false'}})
+
+
 def test_uiautomator2_element_capture_uses_exact_unique_bounds():
     from PIL import Image
     from uiautomator2.xpath import XPathEntry
@@ -367,6 +484,7 @@ def test_uiautomator2_element_capture_uses_exact_unique_bounds():
     assert capture_element(device, selector).size == (3, 2)
     with pytest.raises(ElementNotFound):
         capture_element(device, {**selector, 'label': '不匹配'})
-    device.nodes *= 2
+    device.nodes += device.node.replace('[1,1][4,3]', '[2,2][6,6]')
     with pytest.raises(ElementNotUnique):
         capture_element(device, selector)
+    assert capture_element(device, {**selector, 'xpath': '/hierarchy/node[2]'}).size == (4, 4)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import sys
 
 
@@ -18,10 +19,14 @@ class ElementNotUnique(Exception):
 def capture_element(device, selector):
     from uiautomator2.xpath import safe_xmlstr
 
-    if not any(selector.get(key, '').strip() for key in ('resourceId', 'label', 'className', 'package')):
+    path = selector.get('xpath', '')
+    if path and not re.fullmatch(r'/hierarchy(?:/node\[[1-9][0-9]{0,4}\])+', path):
+        raise ValueError('Invalid element XPath')
+    if not any(selector.get(key, '').strip() for key in ('resourceId', 'label', 'className', 'package', 'xpath')):
         raise ValueError('Missing selector')
     matches = []
-    for element in device.xpath('//*[@bounds]').all():
+    query = path.replace('/node[', '/*[') if path else '//*[@bounds]'
+    for element in device.xpath(query).all():
         attributes = element.attrib
         if selector.get('resourceId') and attributes.get('resource-id') != selector['resourceId']:
             continue

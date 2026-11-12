@@ -63,9 +63,17 @@ function selectorFor(node: MapNode, observation: Observation): Selector {
       other.className === node.className &&
       other.package === node.package
   );
-  if (!node.resourceId || sameIdentity.length > 1)
-    return { ...selector, label: node.text || node.description };
-  return selector;
+  if (node.resourceId && sameIdentity.length === 1) return selector;
+  const label = node.text || node.description;
+  const stillAmbiguous =
+    sameIdentity.filter(
+      other => !label || label === other.text || label === other.description
+    ).length > 1;
+  return {
+    ...selector,
+    label,
+    ...(stillAmbiguous ? { xpath: node.xpath } : {}),
+  };
 }
 
 function ElementDetail({ label, value }: { label: string; value?: string }) {

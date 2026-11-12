@@ -1,71 +1,74 @@
-import { createCaseRunner, defineNode, z } from "@midscene/test";
-import { isAssertion, stepDeadlineMs } from "./protocol.mjs";
+import { setImmediate as yieldTurn } from "node:timers/promises";
+import { buildStepPlan, isAssertion } from "./protocol.mjs";
 
-// Midscene Test owns step sequencing and stop/continue policy. Only stable IDs
-// enter its result objects; resolved parameters stay inside the execution closure.
 export async function runCase(testCase, execute, onSkip = () => {}) {
+  const { children } = buildStepPlan(testCase.steps);
+  const executions = new Map();
   let state = "passed";
-  const steps = new Map(testCase.steps.map(step => [step.id, step]));
-  const node = defineNode({
-    name: "uiStep",
-    inputSchema: z.object({ id: z.string() }),
-    async execute({ input }) {
-      const step = steps.get(input.id);
-      if (
-        step.enabled === false ||
-        state === "error" ||
-        state === "needs_review"
-      ) {
-        onSkip(step);
-        return;
+  let verified = false;
+
+  function skip(steps, iterations) {
+    for (const step of steps) {
+      onSkip(step, iterations);
+      skip(children(step.id), iterations);
+      skip(children(step.id, "else"), iterations);
+    }
+  }
+
+  async function run(steps, variables, iterations) {
+    for (const step of steps) {
+      if (step.enabled === false) {
+        skip([step], iterations);
+        continue;
       }
+      const occurrence = (executions.get(step.id) ?? 0) + 1;
+      executions.set(step.id, occurrence);
       let result;
       try {
-        result = await execute(step);
+        result = await execute(step, variables, occurrence, iterations);
       } catch {
         result = "error";
       }
+      if (step.type === "if" && ["passed", "failed"].includes(result)) {
+        const branch = result === "passed" ? null : "else";
+        skip(children(step.id, branch === null ? "else" : null), iterations);
+        if (!(await run(children(step.id, branch), variables, iterations)))
+          return false;
+        continue;
+      }
       if (result !== "passed") {
         state =
-          result === "error"
-            ? "error"
-            : result === "needs_review"
-              ? "needs_review"
-              : "failed";
-        throw new Error(
-          result === "error" ? "UI execution error" : "UI assertion failed"
-        );
+          result === "error" || result === "needs_review" ? result : "failed";
+        if (
+          state === "failed" &&
+          isAssertion(step.type) &&
+          step.onFailure === "continue"
+        )
+          continue;
+        return false;
       }
-      return { data: { state: result } };
-    },
-  });
-  const runner = createCaseRunner({ nodes: [node] });
-  try {
-    await runner.run({
-      name: testCase.name || "UI test",
-      steps: testCase.steps.map(step => ({
-        uiStep: {
-          id: step.id,
-          $: {
-            timeout: stepDeadlineMs(step) + 15000,
-            "continue-on-error":
-              isAssertion(step.type) && step.onFailure === "continue",
-          },
-        },
-      })),
-    });
-  } catch (error) {
-    if (state === "passed" && !error.result) throw error;
-    if (state === "passed") state = "error";
+      if (isAssertion(step.type) || ["explore", "scan"].includes(step.type))
+        verified = true;
+      if (
+        step.type === "else" &&
+        !(await run(children(step.id), variables, iterations))
+      )
+        return false;
+      if (step.type === "for") {
+        const body = children(step.id);
+        const { count, indexVariable } = step.options;
+        for (let index = 1; body.length && index <= count; index++) {
+          await yieldTurn();
+          const scope = indexVariable
+            ? { ...variables, [indexVariable]: String(index) }
+            : variables;
+          if (!(await run(body, scope, [...iterations, index]))) return false;
+        }
+      }
+    }
+    return true;
   }
-  if (
-    state === "passed" &&
-    !testCase.steps.some(
-      s =>
-        s.enabled !== false &&
-        (isAssertion(s.type) || ["explore", "scan"].includes(s.type))
-    )
-  )
-    return "needs_review";
-  return state;
+
+  await run(children(), {}, []);
+  return state === "passed" && !verified ? "needs_review" : state;
 }

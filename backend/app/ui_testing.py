@@ -9,7 +9,6 @@ import os
 import re
 import signal
 import sqlite3
-import struct
 import sys
 import time
 import uuid
@@ -17,18 +16,20 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, File, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictInt, model_validator
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictBool, StrictInt, model_validator
 
 from .adb import list_devices
 from .can_service import CanService
+from .ui_images import DEFAULT_PROJECT, IMAGE_ID, MAX_PNG, PROJECT_ID, UIImages, png_size
 from .ui_navigation import NavigationStore
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / 'tools' / 'ui-test' / 'runner.mjs'
 TERMINAL = {'passed', 'failed', 'error', 'cancelled', 'interrupted', 'needs_review'}
 NAME = r'^[a-zA-Z0-9_-]{1,64}$'
+VARIABLE = r'^[a-zA-Z0-9_]{1,64}$'
 REFERENCE = re.compile(r'\$\{([a-zA-Z0-9_]+)\}')
 
 
@@ -50,6 +51,7 @@ class Selector(BaseModel):
     className: str = Field(default='', max_length=200)
     resourceId: str = Field(default='', max_length=500)
     label: str = Field(default='', max_length=2000)
+    xpath: str = Field(default='', max_length=1600, pattern=r'^(?:/hierarchy(?:/node\[[1-9][0-9]{0,4}\])+)?$')
 
 
 class TapCoordinates(BaseModel):
@@ -94,8 +96,10 @@ class ImageRegion(BaseModel):
 class ImageCheck(BaseModel):
     model_config = ConfigDict(extra='forbid')
     baselineId: str = Field(pattern=r'^[a-f0-9]{64}$')
+    baselineProjectId: str | None = Field(default=None, pattern=PROJECT_ID)
     minSimilarity: float = Field(default=99, ge=0, le=100)
     pixelTolerance: int = Field(default=16, ge=0, le=255, strict=True)
+    colorMode: Literal['grayscale', 'color'] = 'grayscale'
     mode: Literal['screen', 'element', 'roi'] = 'screen'
     roi: ImageRegion | None = None
 
@@ -109,20 +113,69 @@ class ImageCheck(BaseModel):
 class ScreenshotOptions(BaseModel):
     model_config = ConfigDict(extra='forbid')
     captureName: str = Field(default='', max_length=100)
+    mode: Literal['screen', 'roi'] = 'screen'
+    roi: ImageRegion | None = None
+
+    @model_validator(mode='after')
+    def validate_region(self):
+        if (self.mode == 'roi') != (self.roi is not None):
+            raise ValueError('ROI 模式需要填写截图区域的四个坐标')
+        return self
+
+
+class LoopOptions(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    count: int = Field(ge=1, le=100, strict=True)
+    indexVariable: str | None = Field(default=None, pattern=VARIABLE)
+
+
+class VariableCheck(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    variable: str = Field(pattern=VARIABLE)
+    operator: Literal['eq', 'ne', 'gt', 'gte', 'lt', 'lte'] = 'eq'
+    expectedValue: str = Field(default='', max_length=8000)
 
 
 class ScreenshotCheck(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    firstStepId: str = Field(pattern=NAME)
-    secondStepId: str = Field(pattern=NAME)
+    firstStepId: str | None = Field(default=None, pattern=NAME)
+    secondStepId: str | None = Field(default=None, pattern=NAME)
+    firstVariable: str | None = Field(default=None, pattern=VARIABLE)
+    secondVariable: str | None = Field(default=None, pattern=VARIABLE)
     relation: Literal['same', 'different'] = 'same'
     minSimilarity: float = Field(default=100, ge=0, le=100)
     pixelTolerance: int = Field(default=0, ge=0, le=255, strict=True)
 
     @model_validator(mode='after')
     def validate_pair(self):
-        if self.firstStepId == self.secondStepId:
-            raise ValueError('请选择两个不同的截图步骤')
+        first = (self.firstStepId, self.firstVariable)
+        second = (self.secondStepId, self.secondVariable)
+        if any(sum(value is not None for value in source) != 1 for source in (first, second)):
+            raise ValueError('每张对比图须选择截图步骤或图片变量')
+        if first == second:
+            raise ValueError('请选择两个不同的图片来源')
+        return self
+
+
+class VariableAssignment(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    variable: str = Field(pattern=VARIABLE)
+    valueType: Literal['boolean', 'number', 'image']
+    booleanValue: StrictBool | None = None
+    numberValue: FiniteFloat | None = Field(default=None, strict=True)
+    sourceStepId: str | None = Field(default=None, pattern=NAME)
+    baselineId: str | None = Field(default=None, pattern=r'^[a-f0-9]{64}$')
+
+    @model_validator(mode='after')
+    def validate_value(self):
+        values = {
+            'boolean': self.booleanValue is not None,
+            'number': self.numberValue is not None,
+            'image': (self.sourceStepId is not None) != (self.baselineId is not None),
+        }
+        if sum(value is not None for value in (
+                self.booleanValue, self.numberValue, self.sourceStepId, self.baselineId)) != 1 or not values[self.valueType]:
+            raise ValueError('请为所选变量类型填写一个值')
         return self
 
 
@@ -152,14 +205,20 @@ class CanSendOptions(CanTarget):
 
 
 CAN_STEPS = {'can_send_once', 'can_send_loop', 'can_stop'}
-DEVICE_FREE_STEPS = CAN_STEPS | {'delay'}
+DEVICE_FREE_STEPS = CAN_STEPS | {'delay', 'for', 'else', 'assign', 'variable_assert', 'screenshot_assert'}
+CONDITION_TYPES = {'assert', 'element_assert', 'image_assert', 'screenshot_assert', 'variable_assert'}
+CAPTURE_TYPES = {'screenshot', 'element_screenshot'}
 STEP_OPTIONS = {
+    'assign': VariableAssignment,
     'delay': DelayOptions,
+    'for': LoopOptions,
+    'variable_assert': VariableCheck,
     'adb_tap': TapCoordinates,
     'adb_swipe': SwipeCoordinates,
     'element_assert': ElementCheck,
     'image_assert': ImageCheck,
     'screenshot': ScreenshotOptions,
+    'element_screenshot': ScreenshotOptions,
     'screenshot_assert': ScreenshotCheck,
     'can_send_once': CanSendOptions,
     'can_send_loop': CanSendOptions,
@@ -170,8 +229,10 @@ STEP_OPTIONS = {
 class Step(BaseModel):
     model_config = ConfigDict(extra='forbid')
     id: str = Field(pattern=NAME)
+    name: str = Field(default='', max_length=120)
     type: Literal['action', 'tap', 'input', 'wait', 'delay', 'assert', 'screenshot', 'explore', 'scan', 'settings', 'back',
                   'adb_tap', 'adb_swipe', 'element_assert', 'image_assert', 'screenshot_assert',
+                  'if', 'else', 'for', 'assign', 'variable_assert', 'element_screenshot',
                   'can_send_once', 'can_send_loop', 'can_stop']
     prompt: str = Field(min_length=1, max_length=8000)
     value: str = Field(default='', max_length=8000)
@@ -181,20 +242,31 @@ class Step(BaseModel):
     exploration: ExploreScope | None = None
     selector: Selector | None = None
     options: (DelayOptions | TapCoordinates | SwipeCoordinates | ElementCheck | ImageCheck | ScreenshotOptions |
-              ScreenshotCheck | CanSendOptions | CanTarget | None) = None
+              ScreenshotCheck | LoopOptions | VariableCheck | VariableAssignment | CanSendOptions | CanTarget | None) = None
+    parentId: str | None = Field(default=None, pattern=NAME)
+    branch: Literal['else'] | None = None
+    condition: Step | None = None
 
     @model_validator(mode='after')
     def validate_step(self):
         element_image = isinstance(self.options, ImageCheck) and self.options.mode == 'element'
-        if self.selector and (not (self.type in {'tap', 'element_assert'} or element_image)
+        if self.selector and (not (self.type in {'tap', 'element_assert', 'element_screenshot'} or element_image)
                               or not any(v.strip() for v in self.selector.model_dump().values())):
             raise ValueError('结构定位条件不能为空且须适用于该步骤')
-        if (self.type == 'element_assert' or element_image) and self.selector is None:
+        if (self.type in {'element_assert', 'element_screenshot'} or element_image) and self.selector is None:
             raise ValueError('请至少填写一个元素定位条件')
         options_model = STEP_OPTIONS.get(self.type)
         legacy_screenshot = self.type == 'screenshot' and self.options is None
         if options_model and not legacy_screenshot and not isinstance(self.options, options_model):
             raise ValueError('步骤缺少对应的参数')
+        if self.type == 'element_screenshot' and self.options.mode != 'screen':
+            raise ValueError('元素截图使用所选元素的范围')
+        if self.type == 'if':
+            if (self.condition is None or self.condition.type not in CONDITION_TYPES
+                    or self.condition.parentId or self.condition.branch or not self.condition.prompt.strip()):
+                raise ValueError('If 需要有效的布尔判断条件')
+        elif self.condition is not None:
+            raise ValueError('仅 If 步骤可以配置判断条件')
         if self.type == 'can_stop' and isinstance(self.options, CanSendOptions):
             raise ValueError('停止发送只需要 DBC、通道和报文')
         if not options_model and self.options is not None:
@@ -211,7 +283,7 @@ class Step(BaseModel):
 
 class Parameter(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    name: str = Field(pattern=r'^[a-zA-Z0-9_]{1,64}$')
+    name: str = Field(pattern=VARIABLE)
     secret: bool = False
     default: str = Field(default='', max_length=8000)
 
@@ -223,12 +295,15 @@ class TestCase(BaseModel):
     version: int = Field(default=1, ge=1)
     name: str = Field(min_length=1, max_length=160)
     group: str = Field(default='', max_length=100)
+    projectId: str = Field(default=DEFAULT_PROJECT, pattern=PROJECT_ID)
     tags: list[str] = Field(default_factory=list, max_length=20)
     parameters: list[Parameter] = Field(default_factory=list, max_length=50)
-    steps: list[Step] = Field(min_length=1, max_length=100)
+    steps: list[Step] = Field(min_length=1, max_length=200)
 
     @model_validator(mode='after')
     def validate_steps(self):
+        if sum(step.type != 'else' for step in self.steps) > 100:
+            raise ValueError('用例最多包含 100 个步骤，Else 分支块单独计数')
         if not self.name.strip() or any(not s.prompt.strip() for s in self.steps):
             raise ValueError('名称和步骤描述不能为空白')
         if len({s.id for s in self.steps}) != len(self.steps):
@@ -238,17 +313,83 @@ class TestCase(BaseModel):
             raise ValueError('参数名不可重复')
         if any(p.secret and p.default for p in self.parameters):
             raise ValueError('敏感参数不可保存默认值，请在执行时输入')
-        captured = set()
+        seen = {}
+        paths = {}
+        visible_names = {}
+        captured = {}
+        assigned = set()
+        image_variables = set()
+        enabled_ids = set()
+        groups = {}
         for index, step in enumerate(self.steps, start=1):
-            references = REFERENCE.findall(step.prompt + ' ' + step.value)
-            if any(name not in names for name in references):
-                raise ValueError('步骤引用了未声明的参数')
-            if step.enabled and step.type == 'screenshot':
-                captured.add(step.id)
-            if step.enabled and isinstance(step.options, ScreenshotCheck):
-                if not {step.options.firstStepId, step.options.secondStepId} <= captured:
-                    raise ValueError(f'第 {index} 步只能引用前面已启用的 ADB 截图步骤')
+            parent = seen.get(step.parentId)
+            if (step.parentId and (not parent or parent.type not in {'if', 'else', 'for'})) or (
+                    step.branch and (not parent or parent.type != 'if')):
+                raise ValueError(f'第 {index} 步的分支或循环归属无效')
+            if step.type == 'else' and (not parent or parent.type != 'if' or step.branch != 'else'):
+                raise ValueError(f'第 {index} 步的 Else 必须归属于 If')
+            scope = (*paths[parent.id], (parent.id, step.branch)) if parent else ()
+            scoped = visible_names[parent.id] if parent else names
+            available = scoped | assigned
+            effective = step.enabled and (not parent or parent.id in enabled_ids)
+            for operation in (step, step.condition) if step.condition else (step,):
+                references = set(REFERENCE.findall(operation.prompt + ' ' + operation.value))
+                if isinstance(operation.options, VariableCheck):
+                    references.add(operation.options.variable)
+                    references.update(REFERENCE.findall(operation.options.expectedValue))
+                if references - available:
+                    raise ValueError(f'第 {index} 步引用了未声明或不可见的变量')
+                if effective:
+                    options = operation.options
+                    sources = ()
+                    if isinstance(options, ScreenshotCheck):
+                        sources = (options.firstStepId, options.secondStepId)
+                        if {options.firstVariable, options.secondVariable} - image_variables - {None}:
+                            raise ValueError(f'第 {index} 步引用的图片变量须在前面赋值')
+                    elif isinstance(options, VariableAssignment):
+                        sources = (options.sourceStepId,)
+                    for source in filter(None, sources):
+                        source_scope = captured.get(source)
+                        if source_scope is None or source_scope != scope[:len(source_scope)]:
+                            raise ValueError(f'第 {index} 步只能引用前面已启用的截图步骤，且须位于当前分支或外层')
+            if effective:
+                enabled_ids.add(step.id)
+                if step.type in CAPTURE_TYPES:
+                    captured[step.id] = scope
+                if isinstance(step.options, VariableAssignment):
+                    if step.options.variable in scoped - names:
+                        raise ValueError(f'第 {index} 步不能给循环索引变量赋值')
+                    assigned.add(step.options.variable)
+                    if step.options.valueType == 'image':
+                        image_variables.add(step.options.variable)
+            loop_variable = step.options.indexVariable if isinstance(step.options, LoopOptions) else None
+            if loop_variable and loop_variable in available:
+                raise ValueError(f'第 {index} 步的循环变量与现有变量重名')
+            visible_names[step.id] = scoped | {loop_variable} if loop_variable else scoped
+            seen[step.id] = step
+            paths[step.id] = scope
+            groups.setdefault((step.parentId, step.branch), []).append(step.id)
+
+        for (_, branch), step_ids in groups.items():
+            if branch == 'else' and len(step_ids) > 1 and any(seen[step_id].type == 'else' for step_id in step_ids):
+                raise ValueError('每个 If 只能有一个 Else 步骤块')
+
+        def ordered(parent=None, branch=None):
+            for step_id in groups.get((parent, branch), []):
+                yield step_id
+                yield from ordered(step_id)
+                yield from ordered(step_id, 'else')
+
+        if list(ordered()) != [step.id for step in self.steps]:
+            raise ValueError('分支和循环的子步骤须连续排列，且 If 分支位于 Else 之前')
         return self
+
+    def enabled_steps(self):
+        enabled_ids = set()
+        for step in self.steps:
+            if step.enabled and (step.parentId is None or step.parentId in enabled_ids):
+                enabled_ids.add(step.id)
+                yield step
 
 
 class RunRequest(BaseModel):
@@ -282,6 +423,7 @@ class UIStore:
         root.mkdir(parents=True, exist_ok=True)
         self.db = root / 'ui.db'
         self.baselines = root / 'baselines'
+        self.images = UIImages(root, self.db)
         with self.connect() as conn:
             conn.execute('CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
             conn.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
@@ -292,10 +434,19 @@ class UIStore:
         return sqlite3.connect(self.db, timeout=10)
 
     def validate_baselines(self, test_case: TestCase):
+        self.images.require_project(test_case.projectId)
+        files = {}
         for step in test_case.steps:
-            if isinstance(step.options, ImageCheck):
-                if not (self.baselines / f'{step.options.baselineId}.png').is_file():
-                    raise ValueError('图像断言的基准图不存在，请重新上传')
+            operation = step.condition or step
+            if isinstance(operation.options, (ImageCheck, VariableAssignment)) and operation.options.baselineId:
+                image_id = operation.options.baselineId
+                project_id = getattr(operation.options, 'baselineProjectId', None)
+                path = self.images.path(image_id, project_id)
+                if not path.is_file():
+                    raise ValueError('用例引用的 PNG 图片不存在，请重新选择')
+                if project_id:
+                    files[f'{project_id}/{image_id}'] = str(path.resolve())
+        return files
 
     def all(self, table: str):
         with self.connect() as conn:
@@ -316,9 +467,10 @@ class UIStore:
         with self.connect() as conn:
             conn.execute('INSERT INTO events(run_id,body) VALUES (?,?)', (run_id, json.dumps(body, ensure_ascii=False)))
 
-    def events(self, run_id: str, after: int = 0):
+    def events(self, run_id: str, after: int = 0, limit: int = -1):
         with self.connect() as conn:
-            return [{'seq': row[0], **json.loads(row[1])} for row in conn.execute('SELECT seq,body FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT 10000', (run_id, after))]
+            return [{'seq': row[0], **json.loads(row[1])} for row in conn.execute(
+                'SELECT seq,body FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?', (run_id, after, limit))]
 
     def recover(self):
         with self.connect() as conn:
@@ -340,7 +492,7 @@ def draft_from_run(run: dict, events: list[dict]) -> dict:
     steps, warnings = [], []
     new_ids = {step['id']: uuid.uuid4().hex for step in result['steps']}
     for original in result['steps']:
-        if original['type'] == 'explore':
+        if original['type'] == 'explore' and not original.get('parentId'):
             observations = [e for e in events if e.get('type') == 'exploration' and e.get('stepId') == original['id']]
             controls = list(dict.fromkeys(e.get('control') for e in observations if e.get('control')))
             regression = []
@@ -368,16 +520,22 @@ def draft_from_run(run: dict, events: list[dict]) -> dict:
                 break
         # A partially failed action may have performed only half the intended work.
         completed = any(e.get('type') == 'step' and e.get('stepId') == original['id'] and e.get('state') == 'passed' for e in events)
-        if original['type'] == 'action' and converted and completed and len(steps) + len(converted) + len(result['steps']) <= 100:
+        if (original['type'] == 'action' and not original.get('parentId') and converted and completed
+                and len(steps) + len(converted) + len(result['steps']) <= 100):
             steps.extend(converted)
         else:
             step = {**original, 'id': new_ids[original['id']]}
-            if step['type'] == 'screenshot_assert':
-                step['options'] = {
-                    **step['options'],
-                    **{key: new_ids.get(step['options'][key], step['options'][key])
-                       for key in ('firstStepId', 'secondStepId')},
-                }
+            if step.get('parentId'):
+                step['parentId'] = new_ids[step['parentId']]
+            operation = step.get('condition') or step
+            if step.get('condition'):
+                operation['id'] = step['id']
+            if operation['type'] in {'screenshot_assert', 'assign'}:
+                options = operation['options']
+                operation['options'] = {**options, **{
+                    key: new_ids.get(options[key], options[key])
+                    for key in ('firstStepId', 'secondStepId', 'sourceStepId') if options.get(key)
+                }}
             steps.append(step)
             if original['type'] == 'action':
                 warnings.append('部分动作缺少完整语义定位或未完成，保留了原自然语言步骤，请检查前置页面。')
@@ -455,10 +613,10 @@ class UIManager:
         return env
 
     async def start(self, request: RunRequest):
-        enabled = [step for step in request.testCase.steps if step.enabled]
+        enabled = list(request.testCase.enabled_steps())
         can_steps = {step.id: (step.type, step.options.model_dump())
                      for step in enabled if step.type in CAN_STEPS}
-        needs_device = not enabled or any(step.type not in DEVICE_FREE_STEPS for step in enabled)
+        needs_device = not enabled or any((step.condition or step).type not in DEVICE_FREE_STEPS for step in enabled)
         serial = request.serial if needs_device else ''
         async with self.lock, self.device_lock(serial):
             if self.has_active_device(serial):
@@ -480,7 +638,7 @@ class UIManager:
                 raise ValueError('请填写敏感参数')
             if any(len(v) > 8000 for v in parameters.values()):
                 raise ValueError('参数值过长')
-            self.store.validate_baselines(request.testCase)
+            baseline_files = self.store.validate_baselines(request.testCase)
             run_id = uuid.uuid4().hex
             settings = self.settings()
             output = (Path(settings['reportRoot']) if settings['reportRoot'] else self.store.root / 'runs') / run_id
@@ -503,6 +661,7 @@ class UIManager:
             self.store.put('runs', run)
             job = {'serial': serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
             job['baselineDir'] = str(self.store.baselines.resolve())
+            job['baselineFiles'] = baseline_files
             job['pythonExecutable'] = sys.executable
             if serial and not run['sensitive']:
                 try:
@@ -545,8 +704,7 @@ class UIManager:
         run = self.store.get('runs', run_id)
         process = None
         owned = {}
-        next_can_step = iter(can_steps)
-        expected_step = next(next_can_step, None)
+        pending_can_step = None
         try:
             if run_id in self.cancelled:
                 return
@@ -570,14 +728,16 @@ class UIManager:
                         continue
                     if not isinstance(event, dict) or event.get('protocol') != 1:
                         continue
+                    if event.get('type') == 'step' and event.get('state') == 'running':
+                        pending_can_step = event.get('stepId')
                     if event.get('type') == 'can_request' and can_steps:
                         if run_id in self.cancelled:
                             break
                         step_id = event.get('stepId')
                         response = {'stepId': step_id, 'ok': False, 'message': 'CAN 步骤执行顺序无效'}
-                        if expected_step is not None and step_id == expected_step:
+                        if isinstance(step_id, str) and step_id == pending_can_step and step_id in can_steps:
                             kind, options = can_steps[step_id]
-                            expected_step = next(next_can_step, None)
+                            pending_can_step = None
                             operation = asyncio.create_task(asyncio.to_thread(
                                 self.can.execute_ui_step, kind, options, can_session, owned))
                             try:
@@ -716,17 +876,73 @@ async def cases_list(request: Request):
     return manager(request).store.all('cases')
 
 
+class ProjectName(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+@router.get('/projects')
+def ui_projects(request: Request):
+    return manager(request).store.images.projects()
+
+
+@router.post('/projects', status_code=201)
+def create_ui_project(value: ProjectName, request: Request):
+    try:
+        return manager(request).store.images.create_project(value.name)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@router.get('/projects/{project_id}/images')
+def ui_project_images(project_id: str, request: Request):
+    try:
+        return manager(request).store.images.list_images(project_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+@router.post('/projects/{project_id}/images', status_code=201)
+async def save_ui_project_image(project_id: str, request: Request,
+                                name: str = Form(min_length=1, max_length=120),
+                                source: Literal['roi', 'element'] = Form(),
+                                file: UploadFile = File(...),
+                                region: str | None = Form(default=None)):
+    data = await file.read(MAX_PNG + 1)
+    if len(data) > MAX_PNG:
+        raise HTTPException(400, 'PNG 图片最大为 8 MB')
+    try:
+        coordinates = json.loads(region) if region else None
+        if coordinates is not None and not isinstance(coordinates, dict):
+            raise ValueError('图片坐标无效')
+        return await asyncio.to_thread(manager(request).store.images.save, project_id, name, source, data, coordinates)
+    except (ValueError, TypeError) as error:
+        raise HTTPException(400, str(error)) from error
+
+
+@router.get('/projects/{project_id}/images/{image_id}')
+def ui_project_image(project_id: str, image_id: str, request: Request):
+    library = manager(request).store.images
+    try:
+        library.require_project(project_id)
+        path = library.path(image_id, project_id)
+        if project_id == DEFAULT_PROJECT and not path.is_file():
+            path = library.path(image_id)
+    except ValueError as error:
+        raise HTTPException(404, str(error)) from error
+    if not path.is_file():
+        raise HTTPException(404, '图片不存在')
+    return FileResponse(path, media_type='image/png', headers={'X-Content-Type-Options': 'nosniff'})
+
+
 @router.post('/baselines', status_code=201)
 async def upload_baseline(request: Request, file: UploadFile = File(...)):
-    max_bytes = 8 * 1024 * 1024
-    data = await file.read(max_bytes + 1)
-    if len(data) > max_bytes:
+    data = await file.read(MAX_PNG + 1)
+    if len(data) > MAX_PNG:
         raise HTTPException(400, '基准 PNG 最大为 8 MB')
-    if len(data) < 33 or data[:16] != b'\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR':
-        raise HTTPException(400, '请选择 PNG 基准图')
-    width, height = struct.unpack('>II', data[16:24])
-    if not width or not height or width * height > 16_000_000:
-        raise HTTPException(400, '基准图尺寸无效或过大')
+    try:
+        width, height = png_size(data)
+    except ValueError as error:
+        raise HTTPException(400, str(error)) from error
     baseline_id = hashlib.sha256(data).hexdigest()
     directory = manager(request).store.baselines
     directory.mkdir(parents=True, exist_ok=True)
@@ -807,11 +1023,13 @@ async def cases_export(value: ExportRequest, request: Request):
             archive.writestr(f"parameters/{case['id']}.json", json.dumps({p['name']: '' if p['secret'] else p['default'] for p in case['parameters']}, ensure_ascii=False, indent=2))
             for step in case['steps']:
                 includes_can = includes_can or step['type'] in CAN_STEPS
-                baseline_id = (step.get('options') or {}).get('baselineId')
-                if not isinstance(baseline_id, str) or not re.fullmatch(r'[a-f0-9]{64}', baseline_id):
+                operation = step.get('condition') or step
+                options = operation.get('options') or {}
+                baseline_id = options.get('baselineId')
+                if not isinstance(baseline_id, str) or not re.fullmatch(IMAGE_ID, baseline_id):
                     continue
                 if baseline_id not in included_baselines:
-                    path = store.baselines / f'{baseline_id}.png'
+                    path = store.images.path(baseline_id, options.get('baselineProjectId'))
                     if not path.is_file():
                         raise HTTPException(409, '用例的基准图缺失，请重新上传后导出')
                     archive.write(path, f'baselines/{path.name}')
@@ -849,7 +1067,7 @@ async def run_get(run_id: str, request: Request):
 @router.get('/runs/{run_id}/events')
 async def run_events(run_id: str, request: Request, after: int = 0):
     get_run(request, run_id)
-    return manager(request).store.events(run_id, after)
+    return manager(request).store.events(run_id, after, limit=10000)
 
 
 @router.get('/runs/{run_id}/report')

@@ -167,6 +167,7 @@ test("image assertions evaluate pixel tolerance and dimension mismatch", async (
       baselineId: "a".repeat(64),
       minSimilarity: 100,
       pixelTolerance: 10,
+      colorMode: "color",
     },
   };
   const io = { captureImage: async () => actual, loadBaseline: () => baseline };
@@ -182,8 +183,47 @@ test("image assertions evaluate pixel tolerance and dimension mismatch", async (
   actual = await make(20, 2);
   assert.equal(
     await executeStep(null, check, { SSID: "test" }, null, io),
-    "failed"
+    "passed"
   );
+});
+
+test("global image search finds a template anywhere and supports grayscale and color", async () => {
+  const { default: sharp } = await import("sharp");
+  const png = async (r, g, b) =>
+    sharp({
+      create: { width: 1, height: 1, channels: 3, background: { r, g, b } },
+    })
+      .png()
+      .toBuffer();
+  const baseline = await png(255, 0, 0);
+  const screen = await sharp({
+    create: { width: 3, height: 2, channels: 3, background: "#000000" },
+  })
+    .composite([{ input: baseline, left: 2, top: 1 }])
+    .png()
+    .toBuffer();
+  const check = {
+    ...step,
+    prompt: "全屏搜索",
+    type: "image_assert",
+    options: {
+      baselineId: "a".repeat(64),
+      minSimilarity: 100,
+      pixelTolerance: 0,
+      mode: "screen",
+      colorMode: "color",
+    },
+  };
+  const io = { captureImage: async () => screen, loadBaseline: () => baseline };
+  assert.equal(await executeStep(null, check, {}, null, io), "passed");
+  io.loadBaseline = () => png(0, 0, 255);
+  assert.equal(await executeStep(null, check, {}, null, io), "failed");
+  const gray = await sharp(baseline).greyscale().png().toBuffer();
+  io.loadBaseline = () => gray;
+  check.options.colorMode = "grayscale";
+  assert.equal(await executeStep(null, check, {}, null, io), "passed");
+  check.options.colorMode = "color";
+  assert.equal(await executeStep(null, check, {}, null, io), "failed");
 });
 
 test("screenshot assertions compare two earlier captures without reading the screen again", async () => {
@@ -249,6 +289,58 @@ test("screenshot assertions compare two earlier captures without reading the scr
   assert.match(message, /尺寸不同/);
   second = undefined;
   assert.equal(await compare(), "error");
+});
+
+test("ADB ROI and element captures expose only the selected PNG to the run", async () => {
+  const { default: sharp } = await import("sharp");
+  const screen = await sharp({
+    create: { width: 8, height: 6, channels: 3, background: "red" },
+  })
+    .png()
+    .toBuffer();
+  const selector = { resourceId: "demo:id/control" };
+  let captured;
+  const io = {
+    captureImage: async () => screen,
+    onImage: image => {
+      captured = image;
+    },
+  };
+  const snapshot = {
+    ...step,
+    prompt: "截图",
+    type: "screenshot",
+    options: {
+      mode: "roi",
+      roi: { left: 1, top: 2, right: 5, bottom: 5 },
+    },
+  };
+  assert.equal(await executeStep(null, snapshot, {}, null, io), "passed");
+  const cropped = await sharp(captured).metadata();
+  assert.deepEqual([cropped.width, cropped.height], [4, 3]);
+  snapshot.options.roi.right = 10;
+  assert.equal(await executeStep(null, snapshot, {}, null, io), "error");
+  assert.equal(captured, null);
+
+  assert.equal(
+    await executeStep(
+      null,
+      { ...snapshot, type: "element_screenshot", selector, options: null },
+      {},
+      null,
+      {
+        ...io,
+        captureImage: () =>
+          assert.fail("element capture should not take an ADB screenshot"),
+        captureElement: async target => {
+          assert.deepEqual(target, selector);
+          return { image: screen };
+        },
+      }
+    ),
+    "passed"
+  );
+  assert.equal(captured, screen);
 });
 
 test("ROI assertions compare and report the cropped pixels, with bounds checked", async () => {

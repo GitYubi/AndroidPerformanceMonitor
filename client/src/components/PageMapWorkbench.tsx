@@ -1,12 +1,30 @@
 import { BACKEND_URL } from "@/lib/backend";
 import {
   nodesAtPoint,
+  screenPixel,
   type MapNode as Node,
   type Observation,
 } from "@/lib/uiObservation";
 import ScrcpyScreen, { type ScrcpyHandle } from "./ScrcpyScreen";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent,
+} from "react";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { UiProjectOptions } from "@/components/UiImageLibrary";
+import { uiImagesPath, type UiProject } from "@/lib/uiImages";
+import { toast } from "sonner";
 const API = BACKEND_URL;
 type App = { id: string; name: string; package: string | null };
 type Page = {
@@ -54,6 +72,12 @@ type Graph = {
   deleted: unknown[];
 };
 type Pick = { obs: Observation; node: Node };
+type Region = [left: number, top: number, right: number, bottom: number];
+type BaselineDraft = {
+  image: string;
+  region: Region;
+  source: "roi" | "element";
+};
 type Menu = {
   x: number;
   y: number;
@@ -75,14 +99,28 @@ async function api(path: string, body: unknown) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await r.json();
+  const text = await r.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw Error(`设备服务响应异常（HTTP ${r.status}）`);
+  }
   if (!r.ok)
     throw Error(
       typeof data.detail === "string" ? data.detail : "请求参数或设备响应无效"
     );
   return data;
 }
-export default function PageMapWorkbench() {
+export default function PageMapWorkbench({
+  projects,
+  projectId,
+  onProjectChange,
+}: {
+  projects: UiProject[];
+  projectId: string;
+  onProjectChange: (id: string) => void;
+}) {
   const [devices, setDevices] = useState<{ serial: string; state: string }[]>(
       []
     ),
@@ -119,6 +157,15 @@ export default function PageMapWorkbench() {
     [name, setName] = useState("");
   const [menu, setMenu] = useState<Menu | null>(null),
     [undo, setUndo] = useState("");
+  const [selectingRegion, setSelectingRegion] = useState(false);
+  const [region, setRegion] = useState<Region | null>(null);
+  const dragStart = useRef<{ x: number; y: number; pointerId: number } | null>(
+    null
+  );
+  const [baselineDraft, setBaselineDraft] = useState<BaselineDraft | null>(
+    null
+  );
+  const [baselineName, setBaselineName] = useState("");
   const inspectionPaused = useRef(false);
   const working = useRef(false),
     serialRef = useRef(serial),
@@ -126,6 +173,10 @@ export default function PageMapWorkbench() {
   serialRef.current = serial;
   const imageRef = useRef<HTMLImageElement>(null),
     cropRef = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    setRegion(null);
+    dragStart.current = null;
+  }, [frame?.image]);
   const refreshDevices = useCallback(async () => {
     try {
       const r = await fetch(`${API}/api/devices`);
@@ -148,7 +199,12 @@ export default function PageMapWorkbench() {
     setMode("inspect");
     setObs(null);
     setFrame(null);
+    setSelectingRegion(false);
+    setRegion(null);
+    dragStart.current = null;
     setPick(null);
+    setRegion(null);
+    dragStart.current = null;
     setCandidates([]);
     setMenu(null);
     setGraph(empty);
@@ -270,7 +326,8 @@ export default function PageMapWorkbench() {
     right = false
   ) {
     e.preventDefault();
-    if (!serial || busy || !obs || mode !== "inspect") return;
+    if (selectingRegion || !serial || busy || !obs || mode !== "inspect")
+      return;
     const rect = e.currentTarget.getBoundingClientRect(),
       rx = (e.clientX - rect.left) / rect.width,
       ry = (e.clientY - rect.top) / rect.height,
@@ -302,6 +359,113 @@ export default function PageMapWorkbench() {
     };
     await select();
   }
+  function startRegion(event: PointerEvent<HTMLImageElement>) {
+    if (
+      !selectingRegion ||
+      !frame ||
+      busy ||
+      !event.isPrimary ||
+      event.button !== 0
+    )
+      return;
+    const point = screenPixel(
+      frame,
+      event.currentTarget.getBoundingClientRect(),
+      event.clientX,
+      event.clientY
+    );
+    if (!point) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    dragStart.current = { ...point, pointerId: event.pointerId };
+    setRegion(null);
+  }
+  function drawRegion(event: PointerEvent<HTMLImageElement>) {
+    const start = dragStart.current;
+    if (!frame || start?.pointerId !== event.pointerId) return;
+    const end = screenPixel(
+      frame,
+      event.currentTarget.getBoundingClientRect(),
+      event.clientX,
+      event.clientY
+    );
+    if (!end) return;
+    setRegion(
+      start.x === end.x && start.y === end.y
+        ? null
+        : [
+            Math.min(start.x, end.x),
+            Math.min(start.y, end.y),
+            Math.max(start.x, end.x) + 1,
+            Math.max(start.y, end.y) + 1,
+          ]
+    );
+    if (event.type === "pointerup") dragStart.current = null;
+  }
+  function saveElementBaseline() {
+    if (!pick?.node.bounds) return;
+    const [left, top, right, bottom] = pick.node.bounds;
+    setBaselineName(
+      (pick.node.label || pick.node.resourceId || pick.node.className).slice(
+        0,
+        120
+      )
+    );
+    setBaselineDraft({
+      image: pick.obs.image,
+      region: [left, top, right, bottom],
+      source: "element",
+    });
+  }
+  async function saveBaseline() {
+    if (!baselineDraft || !baselineName.trim()) return;
+    await job(async () => {
+      const source = new Image();
+      source.src = baselineDraft.image;
+      await source.decode();
+      const [left, top, right, bottom] = baselineDraft.region;
+      const x = Math.max(0, left);
+      const y = Math.max(0, top);
+      const width = Math.min(source.naturalWidth, right) - x;
+      const height = Math.min(source.naturalHeight, bottom) - y;
+      if (width <= 0 || height <= 0 || width * height > 16_000_000)
+        throw Error("截图范围无效或过大");
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const context = canvas.getContext("2d");
+      if (!context) throw Error("当前浏览器无法生成截图");
+      context.drawImage(source, x, y, width, height, 0, 0, width, height);
+      const png = await new Promise<Blob | null>(resolve =>
+        canvas.toBlob(resolve, "image/png")
+      );
+      if (!png) throw Error("截图生成失败");
+      const data = new FormData();
+      data.append("file", png, "baseline.png");
+      data.append("name", baselineName.trim());
+      data.append("source", baselineDraft.source);
+      data.append(
+        "region",
+        JSON.stringify({
+          left: x,
+          top: y,
+          right: x + width,
+          bottom: y + height,
+        })
+      );
+      const response = await fetch(`${API}/api${uiImagesPath(projectId)}`, {
+        method: "POST",
+        body: data,
+      });
+      if (!response.ok) {
+        const result = await response.json();
+        throw Error(
+          typeof result.detail === "string" ? result.detail : "基准图保存失败"
+        );
+      }
+      setBaselineDraft(null);
+      toast.success("基准图已保存到项目图片库");
+    });
+  }
   async function switchMode(next: string) {
     if (busy || mode === next) return;
     setLive(false);
@@ -312,6 +476,9 @@ export default function PageMapWorkbench() {
       return;
     }
     if (next === "operate") {
+      setSelectingRegion(false);
+      setRegion(null);
+      dragStart.current = null;
       setPick(null);
       setCandidates([]);
       setDraftToken("");
@@ -592,8 +759,21 @@ export default function PageMapWorkbench() {
           disabled={!serial || busy || mode !== "inspect"}
           onClick={() =>
             job(async () => {
-              await read();
-              setStatus("已读取当前页画面与控件，未操作设备。");
+              try {
+                await read();
+                setStatus("已读取当前页画面与控件，未操作设备。");
+              } catch (e) {
+                setObs(null);
+                setPick(null);
+                setCandidates([]);
+                setFrame(null);
+                const captured = await api("frame", { serial });
+                if (serialRef.current !== serial) return;
+                setFrame(captured);
+                setStatus(
+                  `已读取屏幕截图，可框选并保存基准图。控件读取失败：${(e as Error).message}`
+                );
+              }
             })
           }
         >
@@ -603,7 +783,7 @@ export default function PageMapWorkbench() {
           <input
             type="checkbox"
             checked={live}
-            disabled={!obs || busy || mode !== "inspect"}
+            disabled={!frame || busy || mode !== "inspect" || selectingRegion}
             onChange={e => {
               inspectionPaused.current = false;
               setLive(e.target.checked);
@@ -812,6 +992,76 @@ export default function PageMapWorkbench() {
               )}
             </div>
           )}
+          {mode === "inspect" && (
+            <div className="flex flex-wrap items-center gap-2 rounded border border-border p-2">
+              <label className="flex items-center gap-2 text-sm">
+                基准图项目
+                <select
+                  className="h-8 max-w-48 rounded-md border border-input bg-background px-2"
+                  value={projectId}
+                  onChange={event => onProjectChange(event.target.value)}
+                >
+                  <UiProjectOptions projects={projects} />
+                </select>
+              </label>
+              <Button
+                type="button"
+                size="sm"
+                variant={selectingRegion ? "secondary" : "outline"}
+                disabled={!frame || busy}
+                onClick={() => {
+                  inspectionPaused.current = true;
+                  setLive(false);
+                  setMenu(null);
+                  setSelectingRegion(!selectingRegion);
+                  setRegion(null);
+                  dragStart.current = null;
+                }}
+              >
+                {selectingRegion ? "退出框选" : "框选基准图"}
+              </Button>
+              {selectingRegion ? (
+                <>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={!region || busy}
+                    onClick={() => {
+                      if (!frame || !region) return;
+                      setBaselineName("");
+                      setBaselineDraft({
+                        image: frame.image,
+                        region,
+                        source: "roi",
+                      });
+                    }}
+                  >
+                    保存框选基准图
+                  </Button>
+                  <span className="text-xs text-muted-foreground">
+                    {region
+                      ? `(${region[0]}, ${region[1]}) → (${region[2]}, ${region[3]}) · ${region[2] - region[0]} × ${region[3] - region[1]} px`
+                      : "在画面上拖动选择区域"}
+                  </span>
+                </>
+              ) : (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={
+                    !pick?.node.bounds ||
+                    busy ||
+                    frame?.image !== pick.obs.image
+                  }
+                  onClick={saveElementBaseline}
+                >
+                  保存元素基准图
+                </Button>
+              )}
+            </div>
+          )}
           {mode === "operate" ? (
             <ScrcpyScreen
               ref={scrcpy}
@@ -831,8 +1081,28 @@ export default function PageMapWorkbench() {
                 style={{ touchAction: "none" }}
                 onClick={e => screenClick(e)}
                 onContextMenu={e => screenClick(e, true)}
+                onPointerDown={startRegion}
+                onPointerMove={drawRegion}
+                onPointerUp={drawRegion}
+                onPointerCancel={event => {
+                  if (dragStart.current?.pointerId !== event.pointerId) return;
+                  dragStart.current = null;
+                  setRegion(null);
+                }}
               />
-              {pick &&
+              {selectingRegion && region && (
+                <div
+                  className="pointer-events-none absolute border-2 border-cyan-400 bg-cyan-400/15"
+                  style={{
+                    left: `${(region[0] / frame.width) * 100}%`,
+                    top: `${(region[1] / frame.height) * 100}%`,
+                    width: `${((region[2] - region[0]) / frame.width) * 100}%`,
+                    height: `${((region[3] - region[1]) / frame.height) * 100}%`,
+                  }}
+                />
+              )}
+              {!selectingRegion &&
+                pick &&
                 obs?.id === pick.obs.id &&
                 frame.image === pick.obs.image &&
                 pick.node.bounds && (
@@ -854,6 +1124,47 @@ export default function PageMapWorkbench() {
           )}
         </div>
       </div>
+      <Dialog
+        open={Boolean(baselineDraft)}
+        onOpenChange={open => {
+          if (!open && !busy) setBaselineDraft(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>保存基准图</DialogTitle>
+            <DialogDescription>
+              项目 · {projects.find(project => project.id === projectId)?.name}
+            </DialogDescription>
+          </DialogHeader>
+          <form
+            className="space-y-3"
+            onSubmit={event => {
+              event.preventDefault();
+              void saveBaseline();
+            }}
+          >
+            <label className="grid gap-1 text-sm">
+              基准图名称
+              <Input
+                value={baselineName}
+                maxLength={120}
+                onChange={event => setBaselineName(event.target.value)}
+              />
+            </label>
+            {error && (
+              <p role="alert" className="text-sm text-destructive">
+                {error}
+              </p>
+            )}
+            <div className="flex justify-end">
+              <Button type="submit" disabled={busy || !baselineName.trim()}>
+                保存到图片库
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
       {error && (
         <p
           role="alert"

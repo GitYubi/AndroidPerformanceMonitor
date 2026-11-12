@@ -6,7 +6,10 @@ import { captureElement } from "./element-capture.mjs";
 import {
   validateJob,
   executeStep,
+  buildStepPlan,
+  captureSourceIds,
   isCanStep,
+  isCapture,
   requiresModel,
   stepDeadlineMs,
   substitute,
@@ -63,16 +66,12 @@ try {
     },
     Math.min(3600, Math.max(10, job.timeoutSeconds || 900)) * 1000
   );
-  const enabled = job.testCase.steps.filter(step => step.enabled !== false);
+  const { children, enabled } = buildStepPlan(job.testCase.steps);
   const screenshots = new Map();
-  for (const step of enabled) {
-    if (step.type === "screenshot_assert") {
-      for (const id of [step.options.firstStepId, step.options.secondStepId]) {
-        const capture = screenshots.get(id) ?? { remaining: 0 };
-        capture.remaining++;
-        screenshots.set(id, capture);
-      }
-    }
+  const assigned = new Map();
+  const operations = enabled.map(step => step.condition ?? step);
+  for (const step of operations) {
+    for (const id of captureSourceIds(step)) screenshots.set(id, null);
   }
   if (enabled.some(step => isCanStep(step.type)) && !replies)
     throw new Error("步骤包含 CAN 操作，请通过工作台运行");
@@ -80,15 +79,14 @@ try {
   if (needsModel && !process.env.MIDSCENE_MODEL_API_KEY?.trim())
     throw new Error("缺少 MIDSCENE_MODEL_API_KEY，请在本机配置");
   const baselineDir = job.baselineDir ? resolve(job.baselineDir) : null;
-  const baselinePath = id => resolve(baselineDir, `${id}.png`);
-  for (const step of enabled.filter(step => step.type === "image_assert")) {
-    const file =
-      baselineDir &&
-      statSync(baselinePath(step.options.baselineId), {
-        throwIfNoEntry: false,
-      });
+  const baselinePath = (id, projectId) =>
+    (projectId && job.baselineFiles?.[`${projectId}/${id}`]) ||
+    (baselineDir && resolve(baselineDir, `${id}.png`));
+  for (const step of operations.filter(step => step.options?.baselineId)) {
+    const path = baselinePath(step.options.baselineId, step.options.baselineProjectId);
+    const file = path && statSync(path, { throwIfNoEntry: false });
     if (!file || !file.isFile() || file.size > 8 * 1024 * 1024)
-      throw new Error("步骤图像断言缺少有效的 PNG 基准图");
+      throw new Error("步骤缺少有效的 PNG 图片");
   }
   const root = resolve(job.outputDir || "midscene_run");
   mkdirSync(root, { recursive: true });
@@ -157,14 +155,14 @@ try {
   emit({ type: "started", state: "running" });
   const state = await runCase(
     job.testCase,
-    async step => {
+    async (step, variables, occurrence, iterations) => {
       currentStep = step.id;
-      emit({ type: "step", stepId: step.id, state: "running" });
+      const emitStep = event =>
+        emit({ type: "step", stepId: step.id, iterations, ...event });
+      emitStep({ state: "running" });
       // Exit the worker on deadline: Promise.race alone would leave UI actions running.
       const deadline = setTimeout(() => {
-        emit({
-          type: "step",
-          stepId: step.id,
+        emitStep({
           state: "error",
           message: "步骤超时，执行进程已终止",
         });
@@ -172,24 +170,41 @@ try {
         process.exit(124);
       }, stepDeadlineMs(step));
       try {
+        if (step.type === "for") {
+          emitStep({
+            state: "passed",
+            message: `循环 ${step.options.count} 次`,
+          });
+          return "passed";
+        }
+        if (step.type === "else") {
+          emitStep({ state: "passed" });
+          return "passed";
+        }
         if (isCanStep(step.type)) {
           emit({ type: "can_request", stepId: step.id });
           const { value, done } = await replies.next();
           const response = done ? null : JSON.parse(value);
           if (response?.stepId !== step.id) throw new Error("CAN 步骤响应无效");
           const state = response.ok ? "passed" : "error";
-          emit({
-            type: "step",
-            stepId: step.id,
+          emitStep({
             state,
             message: response.message,
           });
           return state;
         }
+        const operation = step.condition
+          ? { ...step.condition, timeoutMs: step.timeoutMs }
+          : step;
+        const parameters = {
+          ...job.parameters,
+          ...Object.fromEntries(assigned),
+          ...variables,
+        };
         let capturedImage;
         let message;
         const execute = () =>
-          executeStep(agent, step, job.parameters || {}, treeDevice, {
+          executeStep(agent, operation, parameters, treeDevice, {
             captureImage: async () =>
               (capturedImage ??= await treeDevice.screenshot()),
             captureElement: selector =>
@@ -203,15 +218,14 @@ try {
             onImage: image => {
               capturedImage = image;
             },
-            loadBaseline: id => readFileSync(baselinePath(id)),
+            loadBaseline: (id, projectId) => readFileSync(baselinePath(id, projectId)),
+            setVariable: (name, value) => assigned.set(name, value),
             sensitive,
             loadScreenshot: id => {
               const capture = screenshots.get(id);
-              if (!capture) return;
-              if (--capture.remaining === 0) screenshots.delete(id);
-              return typeof capture.source === "string"
-                ? readFileSync(capture.source)
-                : capture.source;
+              return typeof capture === "string"
+                ? readFileSync(capture)
+                : capture;
             },
             onResult: text => {
               message = text;
@@ -231,7 +245,7 @@ try {
             })
           : navigation && step.type === "action"
             ? await navigation.run(
-                substitute(step.prompt, job.parameters || {}),
+                substitute(step.prompt, parameters),
                 execute,
                 name =>
                   agent.aiBoolean(
@@ -242,36 +256,46 @@ try {
         let screenshot;
         if (
           !sensitive &&
-          step.type !== "delay" &&
-          step.type !== "screenshot_assert" &&
-          (step.type !== "image_assert" || capturedImage)
+          !["delay", "assign", "screenshot_assert", "variable_assert"].includes(
+            operation.type
+          ) &&
+          (!(operation.type === "image_assert" || isCapture(operation.type)) ||
+            capturedImage)
         ) {
           try {
-            screenshot = `${step.id}.png`;
+            screenshot = `${step.id}${occurrence > 1 ? `.${occurrence}` : ""}.png`;
             const png = capturedImage ?? (await treeDevice.screenshot());
             writeFileSync(resolve(root, screenshot), png);
           } catch {
             screenshot = undefined;
           }
         }
-        const capture = screenshots.get(step.id);
-        if (capture)
-          capture.source = screenshot
-            ? resolve(root, screenshot)
-            : capturedImage;
-        emit({
-          type: "step",
-          stepId: step.id,
-          state: result,
+        if (screenshots.has(step.id))
+          screenshots.set(
+            step.id,
+            screenshot ? resolve(root, screenshot) : capturedImage
+          );
+        let branchMessage;
+        if (step.type === "if" && result === "passed") {
+          branchMessage = "进入 If 分支";
+        } else if (step.type === "if" && result === "failed") {
+          branchMessage = children(step.id, "else").some(
+            child => child.enabled !== false
+          )
+            ? "进入 Else 分支"
+            : "条件不成立，跳过 If";
+        }
+        emitStep({
+          state: branchMessage ? "passed" : result,
           screenshot,
-          message,
+          message: branchMessage
+            ? [branchMessage, message].filter(Boolean).join(" · ")
+            : message,
         });
         return result;
       } catch {
         // Never echo SDK errors, which can include raw input or authorization headers.
-        emit({
-          type: "step",
-          stepId: step.id,
+        emitStep({
           state: "error",
           message: "执行异常：请检查设备、模型配置及页面状态",
         });
@@ -280,7 +304,8 @@ try {
         clearTimeout(deadline);
       }
     },
-    step => emit({ type: "step", stepId: step.id, state: "skipped" })
+    (step, iterations) =>
+      emit({ type: "step", stepId: step.id, state: "skipped", iterations })
   );
   await agent?.destroy();
   finish(state, { report: sensitive ? null : agent?.reportFile || null });

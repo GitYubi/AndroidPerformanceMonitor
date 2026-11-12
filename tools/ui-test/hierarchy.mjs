@@ -16,7 +16,7 @@ export function parseHierarchy(xml) {
   }).parse(xml).hierarchy;
   if (!root) throw new Error("控件树没有 hierarchy 根节点");
   const nodes = [];
-  function visit(raw, parent, depth) {
+  function visit(raw, parent, depth, xpath) {
     if (depth > 100 || nodes.length > 5000)
       throw new Error("控件树超过解析范围");
     const coords = /^\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]$/
@@ -26,6 +26,7 @@ export function parseHierarchy(xml) {
     const node = {
       index: nodes.length,
       parent,
+      xpath,
       children: [],
       resourceId: raw["resource-id"] || "",
       text: raw.password === "true" ? "" : String(raw.text || ""),
@@ -44,11 +45,16 @@ export function parseHierarchy(xml) {
       label: "",
     };
     nodes.push(node);
-    for (const child of list(raw.node))
-      node.children.push(visit(child, node.index, depth + 1));
+    list(raw.node).forEach((child, index) =>
+      node.children.push(
+        visit(child, node.index, depth + 1, `${xpath}/node[${index + 1}]`)
+      )
+    );
     return node.index;
   }
-  for (const raw of list(root.node)) visit(raw, null, 0);
+  list(root.node).forEach((raw, index) =>
+    visit(raw, null, 0, `/hierarchy/node[${index + 1}]`)
+  );
   const childLabel = index => {
     const n = nodes[index];
     if (n.password || n.resourceId.endsWith("/summary")) return "";
@@ -106,7 +112,7 @@ export function selectorFor(node) {
   };
 }
 export function matchingNodes(tree, selector) {
-  const fields = ["package", "className", "resourceId", "label"];
+  const fields = ["package", "className", "resourceId", "label", "xpath"];
   if (!fields.some(key => selector[key])) throw new Error("缺少结构定位条件");
   return tree.nodes.filter(node =>
     fields.every(key => !selector[key] || node[key] === selector[key])

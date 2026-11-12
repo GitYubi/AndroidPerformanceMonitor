@@ -3,22 +3,43 @@ import { BACKEND_URL } from "@/lib/backend";
 import type { CanCatalog } from "@/lib/canCatalog";
 import { getUiSection } from "@/lib/uiNavigation";
 import { UiStepFields } from "@/components/UiStepFields";
+import { UiImageLibrary, UiProjectOptions } from "@/components/UiImageLibrary";
+import {
+  defaultProject,
+  uiImagesPath,
+  type UiImage,
+  type UiProject,
+} from "@/lib/uiImages";
 import {
   UiDevicePreview,
   type UiDevicePreviewHandle,
 } from "@/components/UiDevicePreview";
 import {
   changeStepType,
+  childInsertion,
+  expandElseBlocks,
   isAssertion,
+  isBlock,
   isCanStep,
+  isCapture,
+  relocateStep,
+  stepLayout,
   stepGroups,
   stepTypes,
   type Selector,
   type Step,
+  type StepDrop,
   type StepType,
 } from "@/lib/uiSteps";
 import PageMapWorkbench from "@/components/PageMapWorkbench";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type DragEvent,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -39,6 +60,8 @@ import {
   ArrowUp,
   ArrowDown,
   ChevronDown,
+  ChevronRight,
+  GripVertical,
   Trash2,
   RefreshCw,
   FlaskConical,
@@ -53,6 +76,7 @@ type Case = {
   id: string;
   version: number;
   name: string;
+  projectId?: string;
   group: string;
   tags: string[];
   parameters: Parameter[];
@@ -84,6 +108,7 @@ type Event = {
   control?: string;
   original?: boolean;
   elapsedMs?: number;
+  iterations?: number[];
 };
 type Config = {
   baseUrl: string;
@@ -117,20 +142,28 @@ const states: Record<string, string> = {
 };
 const active = (run: Run) => ["queued", "running"].includes(run.state);
 const uid = () => crypto.randomUUID().replaceAll("-", "");
-const newStep = (type: StepType = "action", prompt = "", value = ""): Step => ({
+const newStep = (type: StepType = "action", prompt = ""): Step => ({
   id: uid(),
   type,
   prompt,
-  value,
+  value: "",
   timeoutMs: 60000,
   enabled: true,
   onFailure: "stop",
 });
-const blank = (): Case => ({
+const newElse = (parentId: string): Step => ({
+  ...newStep("else", stepTypes.else),
+  parentId,
+  branch: "else",
+});
+const stepLimitReached = (steps: Step[]) =>
+  steps.filter(step => step.type !== "else").length >= 100;
+const blank = (projectId = defaultProject.id): Case => ({
   schemaVersion: 1,
   id: uid(),
   version: 1,
   name: "新的 UI 用例",
+  projectId,
   group: "",
   tags: [],
   parameters: [],
@@ -139,6 +172,9 @@ const blank = (): Case => ({
 const selectClass =
   "h-8 w-full min-w-0 rounded-md border border-input bg-background px-2 text-sm";
 const compactInput = "h-8 px-2 shadow-none";
+const sameScope = (a: Step, b: Step) =>
+  (a.parentId ?? null) === (b.parentId ?? null) &&
+  (a.branch ?? null) === (b.branch ?? null);
 
 async function api<T>(path: string, body?: unknown): Promise<T> {
   const response = await fetch(
@@ -161,54 +197,6 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
   return data;
 }
 
-function template(kind: string): Case {
-  const test = blank();
-  test.group = "系统设置";
-  if (kind === "observe") {
-    test.name = "只读画面检查";
-    test.steps = [
-      newStep("screenshot", "当前画面"),
-      newStep("assert", "当前屏幕有可辨认的界面内容，不是黑屏或空白画面"),
-    ];
-  } else if (kind === "wifi") {
-    test.name = "连接指定 Wi-Fi";
-    test.parameters = [
-      { name: "SSID", secret: false, default: "YuBiL" },
-      { name: "PASSWORD", secret: true, default: "" },
-    ];
-    test.steps = [
-      newStep("action", "打开应用列表，进入系统设置的 WLAN 页面"),
-      newStep("action", "如果 WLAN 开关未打开，则打开；如果已打开则保持"),
-      newStep("tap", "名称为 ${SSID} 的 Wi-Fi 网络"),
-      newStep("input", "Wi-Fi 密码输入框", "${PASSWORD}"),
-      newStep("tap", "连接按钮"),
-      newStep("wait", "Wi-Fi ${SSID} 显示已连接"),
-      newStep("assert", "当前连接的 Wi-Fi 是 ${SSID}，且显示已连接"),
-    ];
-  } else if (kind === "explore") {
-    test.name = "显示设置 · 受限探索";
-    test.steps = [
-      newStep(
-        "action",
-        "打开 Android 系统设置的显示页面，并展开高级选项，让自动旋转屏幕开关可见"
-      ),
-      {
-        ...newStep("explore", "Android 系统设置的显示设置页面"),
-        timeoutMs: 300000,
-        exploration: { allowedControls: ["自动旋转屏幕"], maxActions: 2 },
-      },
-    ];
-  } else {
-    test.name = "深色模式检查";
-    test.steps = [
-      newStep("action", "打开系统设置，找到显示或主题设置中的深色模式开关"),
-      newStep("action", "确保深色模式已开启；如果已开启则保持"),
-      newStep("assert", "系统设置页面已使用深色背景，主要文字清晰可读"),
-    ];
-  }
-  return test;
-}
-
 export default function UITesting() {
   const [search] = useSearchParams();
   const [, navigate] = useLocation();
@@ -220,7 +208,19 @@ export default function UITesting() {
   const [rightPanel, setRightPanel] = useState<"device" | "records">("device");
   const [pickStepId, setPickStepId] = useState("");
   const devicePreview = useRef<UiDevicePreviewHandle>(null);
-  const [draft, setDraft] = useState<Case>(blank);
+  const [draft, setDraft] = useState<Case>(() => blank());
+  const [projects, setProjects] = useState<UiProject[]>([defaultProject]);
+  const [projectId, setProjectId] = useState(defaultProject.id);
+  const [catalog, setCatalog] = useState<{
+    id: string;
+    items: UiImage[];
+  } | null>(null);
+  const caseProjectId = draft.projectId ?? defaultProject.id;
+  const catalogId = section === "execute" ? caseProjectId : projectId;
+  const images = catalog?.id === catalogId ? catalog.items : [];
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const [dragged, setDragged] = useState<string | null>(null);
+  const [hoverDrop, setHoverDrop] = useState<string | null>(null);
   const [canCatalog, setCanCatalog] = useState<CanCatalog | null>(null);
   const [canChannels, setCanChannels] = useState<number[]>([]);
   const [parameters, setParameters] = useState<Record<string, string>>({});
@@ -245,7 +245,88 @@ export default function UITesting() {
   const selection = useRef(runId);
   selection.current = runId;
 
-  const editCanSteps = section === "execute" && draft.steps.some(step => isCanStep(step.type));
+  useLayoutEffect(() => {
+    const list = stepList.current;
+    if (!dragged || !list) return;
+    let frame = 0;
+    let point: { x: number; y: number } | null = null;
+    function scroll() {
+      frame = 0;
+      if (!point || !list) return;
+      const box = list.getBoundingClientRect();
+      const top = Math.max(0, box.top);
+      const bottom = Math.min(window.innerHeight, box.bottom);
+      if (
+        point.x < box.left ||
+        point.x > box.right ||
+        point.y < top ||
+        point.y > bottom ||
+        top >= bottom
+      )
+        return;
+      const edge = Math.min(56, (bottom - top) / 3);
+      const delta =
+        point.y < top + edge
+          ? point.y - top - edge
+          : point.y > bottom - edge
+            ? point.y - bottom + edge
+            : 0;
+      if (!delta) return;
+      const previous = list.scrollTop;
+      list.scrollTop +=
+        Math.sign(delta) * Math.ceil((18 * Math.abs(delta)) / edge);
+      if (list.scrollTop !== previous) frame = requestAnimationFrame(scroll);
+    }
+    function track(event: globalThis.DragEvent) {
+      point = { x: event.clientX, y: event.clientY };
+      if (!frame) frame = requestAnimationFrame(scroll);
+    }
+    function leave(event: globalThis.DragEvent) {
+      if (!event.relatedTarget && event.target === document.documentElement)
+        point = null;
+    }
+    document.addEventListener("dragover", track, true);
+    document.addEventListener("dragleave", leave, true);
+    return () => {
+      cancelAnimationFrame(frame);
+      document.removeEventListener("dragover", track, true);
+      document.removeEventListener("dragleave", leave, true);
+    };
+  }, [dragged, section]);
+
+  const editCanSteps =
+    section === "execute" && draft.steps.some(step => isCanStep(step.type));
+  useEffect(() => {
+    let disposed = false;
+    api<UiProject[]>("/ui/projects")
+      .then(items => {
+        if (!disposed) setProjects(items);
+      })
+      .catch(e => {
+        if (!disposed) toast.error(e.message);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, []);
+  useEffect(() => {
+    if (section !== "images" && section !== "execute") return;
+    let disposed = false;
+    setCatalog(null);
+    api<UiImage[]>(uiImagesPath(catalogId))
+      .then(items => {
+        if (!disposed) setCatalog({ id: catalogId, items });
+      })
+      .catch(e => {
+        if (!disposed) {
+          setCatalog({ id: catalogId, items: [] });
+          toast.error(e.message);
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [catalogId, section]);
   useEffect(() => {
     if (!editCanSteps) return;
     let disposed = false;
@@ -302,20 +383,29 @@ export default function UITesting() {
       return;
     }
     let disposed = false;
+    let polling = false;
+    let after = 0;
     const poll = async () => {
+      if (polling) return;
+      polling = true;
       try {
         const [next, log, nextMetrics] = await Promise.all([
           api<Run>(`/ui/runs/${runId}`),
-          api<Event[]>(`/ui/runs/${runId}/events`),
+          api<Event[]>(`/ui/runs/${runId}/events?after=${after}`),
           api<StepMetric[]>(`/ui/runs/${runId}/metrics`).catch(() => []),
         ]);
         if (!disposed && selection.current === runId) {
           setRun(next);
-          setEvents(log);
+          if (log.length) {
+            after = log[log.length - 1].seq;
+            setEvents(previous => [...previous, ...log]);
+          }
           setMetrics(nextMetrics);
         }
       } catch (e) {
         if (!disposed) setError((e as Error).message);
+      } finally {
+        polling = false;
       }
     };
     setRun(null);
@@ -339,20 +429,57 @@ export default function UITesting() {
       setBusy(false);
     }
   }
+  async function createProject(name: string) {
+    let created = false;
+    await perform(async () => {
+      const project = await api<UiProject>("/ui/projects", { name });
+      setProjects(previous => [...previous, project]);
+      setProjectId(project.id);
+      created = true;
+    });
+    return created;
+  }
   function load(test: Case) {
-    setDraft(structuredClone(test));
+    const copy = structuredClone(test);
+    setDraft({ ...copy, steps: expandElseBlocks(copy.steps, newElse) });
+    setProjectId(copy.projectId ?? defaultProject.id);
     setParameters({});
+    setCollapsed(new Set());
     showExecution();
   }
   function showExecution() {
     if (section !== "execute") navigate("/ui");
   }
-  function addStep() {
-    const step = newStep();
-    setDraft(previous => ({ ...previous, steps: [...previous.steps, step] }));
+  function addStep(parentId: string | null = null, asElse = false) {
+    const step =
+      asElse && parentId ? newElse(parentId) : { ...newStep(), parentId };
+    setDraft(previous => {
+      const rows = stepLayout(previous.steps);
+      if (step.type !== "else" && stepLimitReached(previous.steps))
+        return previous;
+      if (
+        step.type === "else" &&
+        (previous.steps.find(item => item.id === parentId)?.type !== "if" ||
+          previous.steps.some(
+            item => item.parentId === parentId && item.branch === "else"
+          ))
+      )
+        return previous;
+      const insert = childInsertion(rows, parentId, step.branch ?? null);
+      if (insert < 0) return previous;
+      return {
+        ...previous,
+        steps: [
+          ...previous.steps.slice(0, insert),
+          step,
+          ...previous.steps.slice(insert),
+        ],
+      };
+    });
     window.requestAnimationFrame(() => {
-      const list = stepList.current;
-      if (list) list.scrollTop = list.scrollHeight;
+      stepList.current
+        ?.querySelector(`[data-step-id="${step.id}"]`)
+        ?.scrollIntoView({ block: "nearest" });
     });
   }
   function patchStep(
@@ -373,13 +500,79 @@ export default function UITesting() {
   }
   function move(index: number, delta: number) {
     setDraft(previous => {
-      const steps = [...previous.steps];
-      [steps[index], steps[index + delta]] = [
-        steps[index + delta],
-        steps[index],
-      ];
-      return { ...previous, steps };
+      const { steps } = previous;
+      const step = steps[index];
+      const siblings = steps.filter(item => sameScope(item, step));
+      const target = siblings[siblings.indexOf(step) + delta];
+      if (!target) return previous;
+      const before =
+        delta < 0 ? target : siblings[siblings.indexOf(target) + 1];
+      const drop = before
+        ? { before: before.id }
+        : { into: step.parentId ?? null };
+      return { ...previous, steps: relocateStep(steps, step.id, drop) };
     });
+  }
+  function stopDragging() {
+    setDragged(null);
+    setHoverDrop(null);
+  }
+  function toggleCollapsed(id: string) {
+    setCollapsed(previous => {
+      const next = new Set(previous);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }
+  function dropEvents(drop: StepDrop, key: string) {
+    return {
+      onDragOver(event: DragEvent<HTMLElement>) {
+        event.stopPropagation();
+        event.preventDefault();
+        event.dataTransfer.dropEffect = "move";
+        setHoverDrop(key);
+      },
+      onDragLeave(event: DragEvent<HTMLElement>) {
+        if (
+          !(
+            event.relatedTarget instanceof Node &&
+            event.currentTarget.contains(event.relatedTarget)
+          )
+        )
+          setHoverDrop(current => (current === key ? null : current));
+      },
+      onDrop(event: DragEvent<HTMLElement>) {
+        event.stopPropagation();
+        event.preventDefault();
+        if (dragged && event.dataTransfer.getData("text/plain") === dragged) {
+          setDraft(previous => {
+            const steps = relocateStep(previous.steps, dragged, drop);
+            return steps === previous.steps ? previous : { ...previous, steps };
+          });
+          if ("into" in drop && drop.into !== null && collapsed.has(drop.into))
+            toggleCollapsed(drop.into);
+        }
+        stopDragging();
+      },
+    };
+  }
+  function canDrop(drop: StepDrop) {
+    return (
+      dragged !== null &&
+      relocateStep(draft.steps, dragged, drop) !== draft.steps
+    );
+  }
+  function insertionZone(drop: StepDrop, key: string, label: string) {
+    if (!canDrop(drop)) return null;
+    return (
+      <div
+        {...dropEvents(drop, key)}
+        data-drop-zone={key}
+        className={`rounded border border-dashed px-2 py-0.5 text-xs ${hoverDrop === key ? "border-primary bg-primary/15 text-primary" : "border-border text-muted-foreground"}`}
+      >
+        {label}
+      </div>
+    );
   }
   async function showRecords(id?: string) {
     await devicePreview.current?.stop();
@@ -420,61 +613,228 @@ export default function UITesting() {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
   const activeRuns = runs.filter(active);
-  const enabledSteps = draft.steps.filter(step => step.enabled);
-  const needsDevice = !enabledSteps.length ||
-    enabledSteps.some(step => !isCanStep(step.type) && step.type !== "delay");
+  const rows = stepLayout(draft.steps);
+  const stepsFull = stepLimitReached(draft.steps);
+  const draggingElse = draft.steps.some(
+    step => step.id === dragged && step.type === "else"
+  );
+  const enabledSteps = rows
+    .filter(row => row.active)
+    .map(row => row.step.condition ?? row.step);
+  const needsDevice =
+    !enabledSteps.length ||
+    enabledSteps.some(
+      step =>
+        !isCanStep(step.type) &&
+        ![
+          "delay",
+          "for",
+          "else",
+          "assign",
+          "variable_assert",
+          "screenshot_assert",
+        ].includes(step.type)
+    );
   const runSerial = needsDevice ? serial : "";
-  const runBusy = activeRuns.some(item => item.serial === runSerial) ||
+  const runBusy =
+    activeRuns.some(item => item.serial === runSerial) ||
     Boolean(run && run.serial === runSerial && active(run));
   const deviceRunning =
-    !!serial && (activeRuns.some(item => item.serial === serial) ||
-    Boolean(run && run.serial === serial && active(run)));
+    !!serial &&
+    (activeRuns.some(item => item.serial === serial) ||
+      Boolean(run && run.serial === serial && active(run)));
   function validateStepDraft() {
-    const screenshots = new Set<string>();
-    draft.steps.forEach((step, index) => {
+    rows.forEach((row, index) => {
+      const { step } = row;
       const prefix = `第 ${index + 1} 步`;
-      const options = step.options;
+      const operation = step.condition ?? step;
+      const options = operation.options;
+      if (step.type === "for") {
+        const { count, indexVariable } = options ?? {};
+        if (
+          count === undefined ||
+          !Number.isInteger(count) ||
+          count < 1 ||
+          count > 100
+        )
+          throw new Error(`${prefix}请输入 1–100 次循环`);
+        if (
+          indexVariable &&
+          (!/^[a-zA-Z0-9_]{1,64}$/.test(indexVariable) ||
+            visibleVariables(row, index).includes(indexVariable))
+        )
+          throw new Error(`${prefix}的索引变量名称无效或与现有变量重名`);
+      }
+      if (
+        operation.type === "variable_assert" &&
+        (!options?.variable ||
+          !visibleVariables(row, index).includes(options.variable))
+      )
+        throw new Error(`${prefix}请选择一个可用变量`);
+      if (operation.type === "assign") {
+        const {
+          variable,
+          valueType,
+          booleanValue,
+          numberValue,
+          baselineId,
+          sourceStepId,
+        } = options ?? {};
+        if (!variable || !/^[a-zA-Z0-9_]{1,64}$/.test(variable))
+          throw new Error(`${prefix}的变量名称只能使用字母、数字或下划线`);
+        if (
+          row.ancestors.some(
+            parent => parent.options?.indexVariable === variable
+          )
+        )
+          throw new Error(`${prefix}不能给循环索引变量赋值`);
+        if (valueType === "boolean" && typeof booleanValue !== "boolean")
+          throw new Error(`${prefix}请选择布尔值`);
+        if (valueType === "number" && !Number.isFinite(numberValue))
+          throw new Error(`${prefix}请输入有效数值`);
+        if (
+          valueType === "image" &&
+          !baselineId &&
+          (!sourceStepId ||
+            (row.active &&
+              !priorCaptures(row, index).some(
+                source => source.id === sourceStepId
+              )))
+        )
+          throw new Error(`${prefix}请选择前面的截图或上传 PNG`);
+      }
+      if (operation.type === "assert" && !operation.prompt.trim())
+        throw new Error(`${prefix}请填写断言条件`);
+      if (operation.type === "image_assert" && !options?.baselineId)
+        throw new Error(`${prefix}请从图片库选择基准图`);
+      if (
+        (operation.type === "element_screenshot" ||
+          operation.type === "element_assert" ||
+          (operation.type === "image_assert" && options?.mode === "element")) &&
+        !Object.values(operation.selector ?? {}).some(value => value?.trim())
+      )
+        throw new Error(`${prefix}请从投屏选取元素或填写定位条件`);
+      if (options?.mode === "roi") {
+        const { left, top, right, bottom } = options.roi ?? {};
+        if (
+          left === undefined ||
+          top === undefined ||
+          right === undefined ||
+          bottom === undefined ||
+          [left, top, right, bottom].some(
+            value => !Number.isInteger(value) || value < 0 || value > 32767
+          ) ||
+          left >= right ||
+          top >= bottom
+        )
+          throw new Error(`${prefix}请填写有效的 ROI 左上角和右下角坐标`);
+      }
       if (step.type === "delay") {
         const duration = options?.durationMs;
-        if (duration === undefined || !Number.isInteger(duration) || duration < 1 || duration > 300000)
+        if (
+          duration === undefined ||
+          !Number.isInteger(duration) ||
+          duration < 1 ||
+          duration > 300000
+        )
           throw new Error(`${prefix}请输入 0.001–300 秒的等待时长`);
       }
-      if (step.type === "screenshot" && step.enabled) screenshots.add(step.id);
-      if (step.type === "screenshot_assert") {
-        const { firstStepId, secondStepId } = options ?? {};
-        if (!firstStepId || !secondStepId || firstStepId === secondStepId)
-          throw new Error(`${prefix}请选择两张不同的截图`);
+      if (operation.type === "screenshot_assert") {
+        const { firstStepId, secondStepId, firstVariable, secondVariable } =
+          options ?? {};
+        const first = firstVariable ? `var:${firstVariable}` : firstStepId;
+        const second = secondVariable ? `var:${secondVariable}` : secondStepId;
+        if (!first || !second || first === second)
+          throw new Error(`${prefix}请选择两个不同的图片来源`);
         if (
-          step.enabled &&
-          (!screenshots.has(firstStepId) || !screenshots.has(secondStepId))
+          row.active &&
+          ![first, second].every(source =>
+            source.startsWith("var:")
+              ? assignedVariables(index, "image").includes(source.slice(4))
+              : priorCaptures(row, index).some(item => item.id === source)
+          )
         )
-          throw new Error(`${prefix}只能引用前面已启用的 ADB 截图步骤`);
+          throw new Error(`${prefix}请选择前面已启用的截图或图片变量`);
       }
       if (!isCanStep(step.type)) return;
       if (!options?.dbcKey || !options.message || options.channel === undefined)
         throw new Error(`${prefix}请选择 DBC 报文和通道`);
       if (step.type !== "can_stop") {
         const signals = Object.values(options.signals ?? {});
-        if (!signals.length || signals.some(value => value == null || (typeof value === "number" && !Number.isFinite(value))))
+        if (
+          !signals.length ||
+          signals.some(
+            value =>
+              value == null ||
+              (typeof value === "number" && !Number.isFinite(value))
+          )
+        )
           throw new Error(`${prefix}请添加至少一个信号并填写信号值`);
       }
-      if (step.type === "can_send_loop" && options.cycleMs != null &&
-          (!Number.isInteger(options.cycleMs) || options.cycleMs < 1))
+      if (
+        step.type === "can_send_loop" &&
+        options.cycleMs != null &&
+        (!Number.isInteger(options.cycleMs) || options.cycleMs < 1)
+      )
         throw new Error(`${prefix}的周期必须是正整数毫秒`);
     });
   }
-  const pickTargets = draft.steps.flatMap((step, index) =>
-    step.type === "element_assert" ||
-    (step.type === "image_assert" && step.options?.mode === "element") ||
-    (step.type === "tap" && step.selector)
-      ? [
-          {
-            id: step.id,
-            label: `第 ${index + 1} 步 · ${step.type === "image_assert" ? "元素区域断言" : step.type === "tap" ? "结构点击" : "元素断言"}`,
-          },
-        ]
-      : []
-  );
+  function assignedVariables(index: number, valueType?: "image") {
+    return Array.from(
+      new Set(
+        rows
+          .slice(0, index)
+          .flatMap(({ step, active }) =>
+            active &&
+            step.type === "assign" &&
+            step.options?.variable &&
+            (!valueType || step.options.valueType === valueType)
+              ? [step.options.variable]
+              : []
+          )
+      )
+    );
+  }
+  function visibleVariables(row: (typeof rows)[number], index: number) {
+    return Array.from(
+      new Set([
+        ...draft.parameters.map(parameter => parameter.name).filter(Boolean),
+        ...assignedVariables(index),
+        ...row.ancestors.flatMap(parent =>
+          parent.options?.indexVariable ? [parent.options.indexVariable] : []
+        ),
+      ])
+    );
+  }
+  function priorCaptures(row: (typeof rows)[number], index: number) {
+    return rows.slice(0, index).flatMap((source, position) =>
+      isCapture(source.step.type) &&
+      source.step.enabled &&
+      (!row.active || source.active) &&
+      source.path.every((entry, depth) => entry === row.path[depth])
+        ? [
+            {
+              id: source.step.id,
+              label: `第 ${position + 1} 步 · ${source.step.options?.captureName?.trim() || source.step.name?.trim() || source.step.prompt.trim() || stepTypes[source.step.type]}`,
+            },
+          ]
+        : []
+    );
+  }
+  const pickTargets = draft.steps.flatMap((step, index) => {
+    const operation = step.condition ?? step;
+    const label =
+      operation.type === "image_assert" && operation.options?.mode === "element"
+        ? "元素区域断言"
+        : operation.type === "tap" && operation.selector
+          ? "结构点击"
+          : ["element_assert", "element_screenshot"].includes(operation.type)
+            ? stepTypes[operation.type]
+            : "";
+    return label
+      ? [{ id: step.id, label: `第 ${index + 1} 步 · ${label}` }]
+      : [];
+  });
   const pickTarget = pickTargets.some(item => item.id === pickStepId)
     ? pickStepId
     : pickTargets.length === 1
@@ -482,7 +842,11 @@ export default function UITesting() {
       : "";
   function applyElement(selector: Selector) {
     if (!pickTarget || !Object.values(selector).some(Boolean)) return;
-    patchStep(pickTarget, { selector });
+    patchStep(pickTarget, step =>
+      step.condition
+        ? { condition: { ...step.condition, selector } }
+        : { selector }
+    );
     toast.success("元素定位条件已回填到步骤");
   }
 
@@ -497,9 +861,9 @@ export default function UITesting() {
           <h1
             className={`font-semibold ${section === "execute" ? "text-lg" : "text-2xl"}`}
           >
-            UI 自动化测试
+            {section === "images" ? "图片库" : "UI 自动化测试"}
           </h1>
-          {section !== "execute" && (
+          {section !== "execute" && section !== "images" && (
             <p className="mt-2 text-sm text-muted-foreground">
               用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
             </p>
@@ -536,32 +900,38 @@ export default function UITesting() {
           ))}
         </div>
       )}
-      {section === "structure" && <PageMapWorkbench />}
+      {section === "structure" && (
+        <PageMapWorkbench
+          projects={projects}
+          projectId={projectId}
+          onProjectChange={setProjectId}
+        />
+      )}
+      {section === "images" && (
+        <UiImageLibrary
+          projects={projects}
+          projectId={projectId}
+          onSelect={setProjectId}
+          images={images}
+          loading={catalog?.id !== catalogId}
+          busy={busy}
+          onCreate={createProject}
+        />
+      )}
       {section === "execute" && (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(300px,0.7fr)]">
           <section className="@container min-w-0 space-y-2.5">
             <div className="flex flex-wrap gap-1.5">
-              <Button variant="outline" size="sm" onClick={() => load(blank())}>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => load(blank(projectId))}
+              >
                 <Plus className="size-4" />
                 新用例
               </Button>
-              {[
-                ["observe", "只读检查"],
-                ["wifi", "Wi-Fi 示例"],
-                ["dark", "深色模式示例"],
-                ["explore", "受限探索示例"],
-              ].map(([key, label]) => (
-                <Button
-                  key={key}
-                  variant="outline"
-                  size="sm"
-                  onClick={() => load(template(key))}
-                >
-                  {label}
-                </Button>
-              ))}
             </div>
-            <div className="grid grid-cols-2 gap-x-2.5 gap-y-1.5 @min-[620px]:grid-cols-[minmax(0,1.25fr)_minmax(0,1.25fr)_minmax(0,0.75fr)_minmax(0,0.75fr)]">
+            <div className="grid grid-cols-2 gap-x-2.5 gap-y-1.5 @min-[620px]:grid-cols-[minmax(0,1.25fr)_minmax(0,1.25fr)_minmax(0,0.8fr)_minmax(0,0.75fr)_minmax(0,0.75fr)]">
               <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
                 用例名称
                 <Input
@@ -588,6 +958,20 @@ export default function UITesting() {
                       {device.state}
                     </option>
                   ))}
+                </select>
+              </label>
+              <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
+                项目
+                <select
+                  className={selectClass}
+                  value={caseProjectId}
+                  onChange={e => {
+                    const id = e.target.value;
+                    setDraft(previous => ({ ...previous, projectId: id }));
+                    setProjectId(id);
+                  }}
+                >
+                  <UiProjectOptions projects={projects} />
                 </select>
               </label>
               <label className="grid min-w-0 gap-1 text-xs font-medium text-muted-foreground">
@@ -742,7 +1126,12 @@ export default function UITesting() {
                 <span className="text-xs text-muted-foreground">
                   v{draft.version}
                 </span>
-                <Button variant="outline" size="sm" onClick={addStep}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={stepsFull}
+                  onClick={() => addStep()}
+                >
                   <Plus className="size-3.5" />
                   添加步骤
                 </Button>
@@ -751,164 +1140,323 @@ export default function UITesting() {
             <div
               ref={stepList}
               aria-label="测试步骤列表"
+              onDragOver={event => {
+                if (dragged) event.preventDefault();
+              }}
               className="max-h-[clamp(260px,calc(100dvh-255px),365px)] space-y-1.5 overflow-y-auto overscroll-contain p-0.5"
             >
-              {draft.steps.map((step, i) => (
-                <article
-                  key={step.id}
-                  className={`space-y-1.5 rounded-md border border-border bg-card p-1.5 text-card-foreground ${!step.enabled ? "opacity-50" : ""}`}
-                >
-                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                    <label className="flex shrink-0 items-center gap-1.5 font-mono text-xs">
-                      <input
-                        aria-label={`启用步骤 ${i + 1}`}
-                        type="checkbox"
-                        checked={step.enabled}
-                        onChange={e =>
-                          patchStep(step.id, { enabled: e.target.checked })
-                        }
-                      />
-                      {String(i + 1).padStart(2, "0")}
-                    </label>
-                    <div className="relative min-w-28 flex-1">
-                      <select
-                        aria-label={`步骤 ${i + 1} 类型`}
-                        className={`${selectClass} h-7 appearance-none pr-9`}
-                        value={
-                          step.type === "tap" && step.selector
-                            ? "structured_tap"
-                            : step.type
-                        }
-                        onChange={event =>
-                          patchStep(
-                            step.id,
-                            changeStepType(step, event.target.value as StepType)
-                          )
-                        }
-                      >
-                        {stepGroups.map(group => (
-                          <optgroup key={group.label} label={group.label}>
-                            {group.types.map(type => (
-                              <option key={type} value={type}>
-                                {stepTypes[type]}
-                              </option>
-                            ))}
-                            {group.label === "页面操作" &&
-                              step.type === "tap" &&
-                              step.selector && (
-                                <option value="structured_tap">结构点击</option>
-                              )}
-                          </optgroup>
-                        ))}
-                      </select>
-                      <ChevronDown
-                        aria-hidden="true"
-                        className="pointer-events-none absolute right-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
-                      />
-                    </div>
-                    {step.type !== "delay" && (
-                      <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
-                        超时（秒）
-                        <Input
-                          className="h-7 w-14 px-1.5 shadow-none"
-                          aria-label={`步骤 ${i + 1} 超时（秒）`}
-                          type="number"
-                          min={1}
-                          max={300}
-                          value={step.timeoutMs / 1000}
-                          onChange={e =>
-                            patchStep(step.id, {
-                              timeoutMs: Number(e.target.value) * 1000,
-                            })
-                          }
-                        />
-                      </label>
+              {rows.map((row, i) => {
+                const { step, indent, end } = row;
+                if (
+                  row.ancestors.some(
+                    (ancestor, depth) =>
+                      isBlock(ancestor.type) &&
+                      collapsed.has(ancestor.id) &&
+                      row.path[depth] !== `${ancestor.id}:else`
+                  )
+                )
+                  return null;
+                const folded = isBlock(step.type) && collapsed.has(step.id);
+                const childCount =
+                  (step.type === "if" ? childInsertion(rows, step.id) : end) -
+                  i -
+                  1;
+                const hasPrevious = draft.steps
+                  .slice(0, i)
+                  .some(other => sameScope(other, step));
+                const hasNext = draft.steps
+                  .slice(end)
+                  .some(other => sameScope(other, step));
+                const into = { into: step.id };
+                const insideKey = `into-${step.id}`;
+                const acceptsChildren = isBlock(step.type) && canDrop(into);
+                const hasElse =
+                  step.type === "if" &&
+                  draft.steps.some(
+                    child =>
+                      child.parentId === step.id && child.branch === "else"
+                  );
+                return (
+                  <article
+                    key={step.id}
+                    data-step-id={step.id}
+                    data-step-type={step.type}
+                    data-drop-parent={acceptsChildren ? step.id : undefined}
+                    {...(acceptsChildren ? dropEvents(into, insideKey) : {})}
+                    style={{
+                      marginInlineStart: Math.min(indent * 14, 126),
+                    }}
+                    className={`space-y-1.5 rounded-md border border-border bg-card p-1.5 text-card-foreground ${indent ? "border-l-2 border-l-primary/40" : ""} ${!row.active || dragged === step.id ? "opacity-50" : ""} ${hoverDrop === insideKey ? "ring-2 ring-primary/60" : ""}`}
+                  >
+                    {insertionZone(
+                      { before: step.id },
+                      `before-${step.id}`,
+                      "放在此步骤之前"
                     )}
-                    {isAssertion(step.type) && (
-                      <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span
+                        draggable
+                        aria-label={`拖动步骤 ${i + 1}`}
+                        title={
+                          step.type === "else"
+                            ? "拖到另一个没有 Else 的 If"
+                            : "拖动步骤，靠近列表上下边缘可自动滚动"
+                        }
+                        className="flex size-6 shrink-0 cursor-grab items-center justify-center rounded text-muted-foreground hover:bg-muted active:cursor-grabbing"
+                        onDragStart={event => {
+                          event.dataTransfer.effectAllowed = "move";
+                          event.dataTransfer.setData("text/plain", step.id);
+                          setDragged(step.id);
+                        }}
+                        onDragEnd={stopDragging}
+                      >
+                        <GripVertical aria-hidden="true" className="size-4" />
+                      </span>
+                      <label className="flex shrink-0 items-center gap-1.5 font-mono text-xs">
                         <input
+                          aria-label={`启用步骤 ${i + 1}`}
                           type="checkbox"
-                          checked={step.onFailure === "continue"}
+                          checked={step.enabled}
                           onChange={e =>
-                            patchStep(step.id, {
-                              onFailure: e.target.checked ? "continue" : "stop",
-                            })
+                            patchStep(step.id, { enabled: e.target.checked })
                           }
                         />
-                        断言失败后继续
+                        {String(i + 1).padStart(2, "0")}
                       </label>
-                    )}
-                    <div className="ml-auto flex shrink-0 items-center gap-0.5">
-                      <Button
-                        size="icon-sm"
-                        className="size-7"
-                        variant="ghost"
-                        aria-label="上移步骤"
-                        disabled={i === 0}
-                        onClick={() => move(i, -1)}
-                      >
-                        <ArrowUp className="size-4" />
-                      </Button>
-                      <Button
-                        size="icon-sm"
-                        className="size-7"
-                        variant="ghost"
-                        aria-label="下移步骤"
-                        disabled={i === draft.steps.length - 1}
-                        onClick={() => move(i, 1)}
-                      >
-                        <ArrowDown className="size-4" />
-                      </Button>
-                      <Button
-                        size="icon-sm"
-                        className="size-7"
-                        variant="ghost"
-                        aria-label="删除步骤"
-                        disabled={draft.steps.length === 1}
-                        onClick={() =>
-                          setDraft({
-                            ...draft,
-                            steps: draft.steps.filter((_, j) => j !== i),
-                          })
+                      <Input
+                        className="h-7 min-w-24 flex-1 px-2 shadow-none"
+                        aria-label={`步骤 ${i + 1} 名称`}
+                        placeholder="步骤名称"
+                        maxLength={120}
+                        value={step.name ?? ""}
+                        onChange={event =>
+                          patchStep(step.id, { name: event.target.value })
                         }
-                      >
-                        <Trash2 className="size-4" />
-                      </Button>
-                    </div>
-                  </div>
-                  <UiStepFields
-                    key={step.type}
-                    step={step}
-                    index={i}
-                    canCatalog={canCatalog}
-                    canChannels={canChannels}
-                    screenshots={
-                      step.type === "screenshot_assert"
-                        ? draft.steps.slice(0, i).flatMap((source, index) =>
-                            source.type === "screenshot" && source.enabled
-                              ? [{
-                                  id: source.id,
-                                  label: `第 ${index + 1} 步 · ${source.options?.captureName?.trim() || source.prompt.trim() || "ADB 截图"}`,
-                                }]
-                              : []
-                          )
-                        : []
-                    }
-                    onPickElement={
-                      serial && !deviceRunning
-                        ? () => {
-                            setPickStepId(step.id);
-                            setRightPanel("device");
+                      />
+                      {step.type === "else" ? (
+                        <div className="min-w-28 flex-1 rounded-md bg-muted px-2 py-1 text-sm font-medium">
+                          {stepTypes.else}
+                        </div>
+                      ) : (
+                        <div className="relative min-w-28 flex-1">
+                          <select
+                            aria-label={`步骤 ${i + 1} 类型`}
+                            className={`${selectClass} h-7 appearance-none pr-9`}
+                            disabled={end > i + 1}
+                            title={
+                              end > i + 1 ? "移除子步骤后可更改类型" : undefined
+                            }
+                            value={
+                              step.type === "tap" && step.selector
+                                ? "structured_tap"
+                                : step.type
+                            }
+                            onChange={event =>
+                              patchStep(
+                                step.id,
+                                changeStepType(
+                                  step,
+                                  event.target.value as StepType
+                                )
+                              )
+                            }
+                          >
+                            {stepGroups.map(group => (
+                              <optgroup key={group.label} label={group.label}>
+                                {group.types.map(type => (
+                                  <option key={type} value={type}>
+                                    {stepTypes[type]}
+                                  </option>
+                                ))}
+                                {group.label === "页面操作" &&
+                                  step.type === "tap" &&
+                                  step.selector && (
+                                    <option value="structured_tap">
+                                      结构点击
+                                    </option>
+                                  )}
+                              </optgroup>
+                            ))}
+                          </select>
+                          <ChevronDown
+                            aria-hidden="true"
+                            className="pointer-events-none absolute right-3 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+                          />
+                        </div>
+                      )}
+                      {step.type !== "delay" &&
+                        step.type !== "for" &&
+                        step.type !== "else" && (
+                          <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                            超时（秒）
+                            <Input
+                              className="h-7 w-14 px-1.5 shadow-none"
+                              aria-label={`步骤 ${i + 1} 超时（秒）`}
+                              type="number"
+                              min={1}
+                              max={300}
+                              value={step.timeoutMs / 1000}
+                              onChange={e =>
+                                patchStep(step.id, {
+                                  timeoutMs: Number(e.target.value) * 1000,
+                                })
+                              }
+                            />
+                          </label>
+                        )}
+                      {isAssertion(step.type) && (
+                        <label className="flex shrink-0 items-center gap-1.5 whitespace-nowrap text-xs text-muted-foreground">
+                          <input
+                            type="checkbox"
+                            checked={step.onFailure === "continue"}
+                            onChange={e =>
+                              patchStep(step.id, {
+                                onFailure: e.target.checked
+                                  ? "continue"
+                                  : "stop",
+                              })
+                            }
+                          />
+                          断言失败后继续
+                        </label>
+                      )}
+                      <div className="ml-auto flex shrink-0 items-center gap-0.5">
+                        {isBlock(step.type) && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            className="h-7 gap-1 px-1.5"
+                            variant="ghost"
+                            aria-label={`${folded ? "展开" : "收起"}步骤 ${i + 1}`}
+                            aria-expanded={!folded}
+                            onClick={() => toggleCollapsed(step.id)}
+                          >
+                            {folded ? (
+                              <ChevronRight className="size-4" />
+                            ) : (
+                              <ChevronDown className="size-4" />
+                            )}
+                            {folded && childCount > 0 && (
+                              <span className="text-xs text-muted-foreground">
+                                {childCount} 步
+                              </span>
+                            )}
+                          </Button>
+                        )}
+                        <Button
+                          size="icon-sm"
+                          className="size-7"
+                          variant="ghost"
+                          aria-label="上移步骤"
+                          disabled={!hasPrevious}
+                          onClick={() => move(i, -1)}
+                        >
+                          <ArrowUp className="size-4" />
+                        </Button>
+                        <Button
+                          size="icon-sm"
+                          className="size-7"
+                          variant="ghost"
+                          aria-label="下移步骤"
+                          disabled={!hasNext}
+                          onClick={() => move(i, 1)}
+                        >
+                          <ArrowDown className="size-4" />
+                        </Button>
+                        <Button
+                          size="icon-sm"
+                          className="size-7"
+                          variant="ghost"
+                          aria-label={
+                            end > i + 1 ? "删除步骤及子步骤" : "删除步骤"
                           }
-                        : undefined
-                    }
-                    pickingElement={
-                      rightPanel === "device" && pickTarget === step.id
-                    }
-                    onChange={patch => patchStep(step.id, patch)}
-                  />
-                </article>
-              ))}
+                          disabled={draft.steps.length === end - i}
+                          onClick={() =>
+                            setDraft({
+                              ...draft,
+                              steps: [
+                                ...draft.steps.slice(0, i),
+                                ...draft.steps.slice(end),
+                              ],
+                            })
+                          }
+                        >
+                          <Trash2 className="size-4" />
+                        </Button>
+                      </div>
+                    </div>
+                    {!folded && (
+                      <UiStepFields
+                        key={step.type}
+                        step={step}
+                        index={i}
+                        canCatalog={canCatalog}
+                        canChannels={canChannels}
+                        images={images}
+                        projectId={caseProjectId}
+                        screenshots={
+                          ["screenshot_assert", "assign"].includes(
+                            (step.condition ?? step).type
+                          )
+                            ? priorCaptures(row, i)
+                            : []
+                        }
+                        variables={visibleVariables(row, i)}
+                        imageVariables={assignedVariables(i, "image")}
+                        onPickElement={
+                          serial && !deviceRunning
+                            ? () => {
+                                setPickStepId(step.id);
+                                setRightPanel("device");
+                              }
+                            : undefined
+                        }
+                        pickingElement={
+                          rightPanel === "device" && pickTarget === step.id
+                        }
+                        onChange={patch => patchStep(step.id, patch)}
+                      />
+                    )}
+                    {isBlock(step.type) && !folded && (
+                      <div className="flex flex-wrap gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={stepsFull}
+                          onClick={() => addStep(step.id)}
+                        >
+                          <Plus className="size-3.5" />
+                          {step.type === "for"
+                            ? "添加循环步骤"
+                            : step.type === "else"
+                              ? "添加 Else 子步骤"
+                              : "添加 If 步骤"}
+                        </Button>
+                        {step.type === "if" && !hasElse && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => addStep(step.id, true)}
+                          >
+                            <Plus className="size-3.5" />
+                            添加 Else 步骤
+                          </Button>
+                        )}
+                      </div>
+                    )}
+                    {acceptsChildren && (
+                      <div className="rounded border border-dashed border-primary/50 bg-primary/5 px-2 py-1 text-xs text-primary">
+                        {draggingElse
+                          ? "拖到此处作为 Else 分支"
+                          : "拖到此处作为子步骤"}
+                      </div>
+                    )}
+                  </article>
+                );
+              })}
+              {insertionZone({ into: null }, "root-end", "放到最外层末尾")}
             </div>
             <div className="sticky bottom-0 z-10 flex flex-wrap gap-2 border-t border-border bg-background py-2">
               <Button
@@ -999,14 +1547,14 @@ export default function UITesting() {
                   <div className="py-14 text-center text-muted-foreground">
                     <FlaskConical className="mx-auto mb-4 size-9" />
                     <p>选择设备并执行，步骤结果会显示在这里。</p>
-                    <p className="mt-2 text-xs">首次接入可先运行“只读检查”。</p>
                   </div>
                 ) : (
                   <>
                     <div className="mb-5 space-y-2 text-sm">
                       <h3 className="font-medium">{run.testCase.name}</h3>
                       <p className="text-cyan-400">
-                        {states[run.state] || run.state} · {run.serial || "本机执行"}
+                        {states[run.state] || run.state} ·{" "}
+                        {run.serial || "本机执行"}
                       </p>
                       <p className="text-xs text-muted-foreground">
                         {new Date(run.createdAt).toLocaleString()} · 脚本 v
@@ -1067,21 +1615,34 @@ export default function UITesting() {
                         const log = events.filter(
                           e => e.type === "step" && e.stepId === step.id
                         );
-                        const last = log.at(-1);
+                        const completed = log.filter(
+                          e => !["running", "skipped"].includes(e.state)
+                        );
+                        const last =
+                          log.at(-1)?.state === "running"
+                            ? log.at(-1)
+                            : (completed.at(-1) ?? log.at(-1));
                         const screenshot = [...log]
                           .reverse()
                           .find(e => e.screenshot)?.screenshot;
+                        const stepType =
+                          step.type === "tap" && step.selector
+                            ? "结构点击"
+                            : stepTypes[step.type];
+                        const stepName = step.name?.trim();
                         return (
                           <li
                             key={step.id}
                             className="border-l-2 border-border pl-4"
                           >
                             <div className="flex justify-between gap-3 text-sm">
-                              <span>
-                                {i + 1}.{" "}
-                                {step.type === "tap" && step.selector
-                                  ? "结构点击"
-                                  : stepTypes[step.type]}
+                              <span className="min-w-0 break-words">
+                                {i + 1}. {stepName || stepType}
+                                {stepName && (
+                                  <span className="ml-2 text-xs text-muted-foreground">
+                                    {stepType}
+                                  </span>
+                                )}
                               </span>
                               <span
                                 className={
@@ -1110,6 +1671,14 @@ export default function UITesting() {
                                     )
                                   )
                                     return "[敏感参数]";
+                                  if (
+                                    run.testCase.steps.some(
+                                      item =>
+                                        item.type === "assign" &&
+                                        item.options?.variable === name
+                                    )
+                                  )
+                                    return placeholder;
                                   return run.parameters &&
                                     Object.hasOwn(run.parameters, name)
                                     ? run.parameters[name]
@@ -1192,8 +1761,37 @@ export default function UITesting() {
                               ))}
                             {last && (
                               <p className="mt-1 text-xs text-muted-foreground">
+                                {last.iterations?.length
+                                  ? `循环第 ${last.iterations.join(".")} 轮 · `
+                                  : ""}
                                 {new Date(last.time).toLocaleTimeString()}
                               </p>
+                            )}
+                            {completed.length > 1 && (
+                              <details className="mt-1 text-xs text-muted-foreground">
+                                <summary className="cursor-pointer">
+                                  各轮执行结果（{completed.length}）
+                                </summary>
+                                <ul className="mt-1 space-y-1 pl-4">
+                                  {completed.map(event => (
+                                    <li key={event.seq}>
+                                      {event.iterations?.join(".")} ·{" "}
+                                      {states[event.state] || event.state}
+                                      {event.message && ` · ${event.message}`}
+                                      {event.screenshot && (
+                                        <a
+                                          className="ml-2 underline"
+                                          target="_blank"
+                                          rel="noreferrer"
+                                          href={`${API}/api/ui/runs/${run.id}/artifacts/${event.screenshot}`}
+                                        >
+                                          查看截图
+                                        </a>
+                                      )}
+                                    </li>
+                                  ))}
+                                </ul>
+                              </details>
                             )}
                             {screenshot && (
                               <a
@@ -1237,55 +1835,74 @@ export default function UITesting() {
               尚未保存用例。在“执行与编辑”中创建步骤后保存。
             </p>
           )}
-          <ul className="divide-y divide-border">
-            {cases.map(test => (
-              <li
-                key={test.id}
-                className="flex flex-wrap items-center gap-4 py-4"
+          {projects.map(project => {
+            const projectCases = cases.filter(
+              test => (test.projectId ?? defaultProject.id) === project.id
+            );
+            if (!projectCases.length) return null;
+            return (
+              <section
+                key={project.id}
+                className="mb-5 rounded-md border border-border"
               >
-                <input
-                  aria-label={`选择 ${test.name}`}
-                  type="checkbox"
-                  checked={selected.includes(test.id)}
-                  onChange={e =>
-                    setSelected(
-                      e.target.checked
-                        ? [...selected, test.id]
-                        : selected.filter(id => id !== test.id)
-                    )
-                  }
-                />
-                <div className="flex-1">
-                  <p>{test.name}</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {test.group || "未分组"} · {test.steps.length} 步 · v
-                    {test.version}{" "}
-                    {test.tags
-                      .filter(Boolean)
-                      .map(t => `#${t}`)
-                      .join(" ")}
-                  </p>
-                </div>
-                <Button variant="outline" onClick={() => load(test)}>
-                  编辑 / 复跑
-                </Button>
-                <Button
-                  aria-label={`删除 ${test.name}`}
-                  variant="ghost"
-                  size="icon"
-                  onClick={() =>
-                    void perform(async () => {
-                      await api(`/ui/cases/${test.id}/delete`, {});
-                      setSelected(selected.filter(id => id !== test.id));
-                      await refresh();
-                    })
-                  }
-                >
-                  <Trash2 className="size-4" />
-                </Button>
-              </li>
-            ))}
-          </ul>
+                <h3 className="border-b border-border bg-muted/50 px-4 py-2 text-sm font-medium">
+                  {project.name}{" "}
+                  <span className="text-muted-foreground">
+                    · {projectCases.length} 个用例
+                  </span>
+                </h3>
+                <ul className="divide-y divide-border px-4">
+                  {projectCases.map(test => (
+                    <li
+                      key={test.id}
+                      className="flex flex-wrap items-center gap-4 py-4"
+                    >
+                      <input
+                        aria-label={`选择 ${test.name}`}
+                        type="checkbox"
+                        checked={selected.includes(test.id)}
+                        onChange={e =>
+                          setSelected(
+                            e.target.checked
+                              ? [...selected, test.id]
+                              : selected.filter(id => id !== test.id)
+                          )
+                        }
+                      />
+                      <div className="flex-1">
+                        <p>{test.name}</p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {test.group || "未分组"} · {test.steps.length} 步 · v
+                          {test.version}{" "}
+                          {test.tags
+                            .filter(Boolean)
+                            .map(t => `#${t}`)
+                            .join(" ")}
+                        </p>
+                      </div>
+                      <Button variant="outline" onClick={() => load(test)}>
+                        编辑 / 复跑
+                      </Button>
+                      <Button
+                        aria-label={`删除 ${test.name}`}
+                        variant="ghost"
+                        size="icon"
+                        onClick={() =>
+                          void perform(async () => {
+                            await api(`/ui/cases/${test.id}/delete`, {});
+                            setSelected(selected.filter(id => id !== test.id));
+                            await refresh();
+                          })
+                        }
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            );
+          })}
         </section>
       )}
       {section === "reports" && (
@@ -1310,8 +1927,8 @@ export default function UITesting() {
                     </span>
                   </p>
                   <p className="mt-1 text-xs text-muted-foreground">
-                    {item.serial || "本机执行"} · {new Date(item.createdAt).toLocaleString()}{" "}
-                    ·{" "}
+                    {item.serial || "本机执行"} ·{" "}
+                    {new Date(item.createdAt).toLocaleString()} ·{" "}
                     {item.endedAt
                       ? `${Math.round((item.endedAt - item.createdAt) / 1000)} 秒`
                       : "运行中"}
