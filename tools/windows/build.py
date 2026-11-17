@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import struct
 import subprocess
@@ -36,6 +37,44 @@ RUNTIMES = [
      "https://dl.google.com/android/repository/platform-tools_r37.0.1-win.zip",
      "45f4d63113e895ebde0c90f194099a4676b6ac653bd28d54314a9e022bbc1a99"),
 ]
+PYTHON_SOURCE_DIRS = ("app", "zlg", "Functional", "can_adapters")
+REQUIRED_PROJECT_FILES = (
+    "backend/config/Example.dbc",
+    "backend/vendor/scrcpy/LICENSE",
+    "backend/vendor/scrcpy/README.md",
+    "backend/vendor/scrcpy/scrcpy-server-v3.3.4",
+    "tools/monkey/android_system_blacklist.txt",
+    "tools/ui-test/package.json",
+    "tools/ui-test/package-lock.json",
+)
+
+
+def copy_release_sources(source: Path, destination: Path) -> None:
+    sources = [Path(name) for name in REQUIRED_PROJECT_FILES]
+    for package in PYTHON_SOURCE_DIRS:
+        module_dir = source / "backend" / package
+        sources.extend(path.relative_to(source) for path in module_dir.glob("*.py")
+                       if re.fullmatch(r"[A-Za-z_]\w*\.py", path.name))
+    sources.extend(path.relative_to(source) for path in (source / "tools/ui-test").glob("*.mjs")
+                   if re.fullmatch(r"[a-z][a-z0-9-]*\.mjs", path.name))
+    for relative in sources:
+        origin = source / relative
+        if origin.is_symlink() or not origin.is_file() or not origin.resolve().is_relative_to(source.resolve()):
+            raise RuntimeError(f"Invalid release source: {relative}")
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(origin, target)
+
+
+def is_host_file(path: Path) -> bool:
+    name = path.name.lower()
+    suffix = path.suffix.lower()
+    return (
+        name in {".env", "settings.json", ".ds_store", ".npmrc", ".pypirc"}
+        or name.startswith((".env.", "credentials."))
+        or suffix in {".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm", ".sqlite-wal",
+                      ".sqlite-shm", ".sqlite3-wal", ".sqlite3-shm", ".dylib", ".so", ".bak", ".orig"}
+    )
 
 
 def sha256(path: Path) -> str:
@@ -97,8 +136,12 @@ def audit_bundle(root: Path) -> None:
                  "runtime/platform-tools/adb.exe",
                  "runtime/python/site-packages/uiautomator2/__init__.py",
                  "backend/vendor/scrcpy/scrcpy-server-v3.3.4",
-                 "backend/config/Example.dbc",
+                 *REQUIRED_PROJECT_FILES,
                  "backend/app/ui_element_capture.py",
+                 "backend/app/ui_hierarchy_capture.py",
+                 "backend/app/ui_store.py", "backend/app/ui_metrics.py",
+                 "tools/ui-test/runner.mjs", "tools/ui-test/image-search-worker.mjs",
+                 "tools/ui-test/image-pixels.mjs", "tools/ui-test/variable-flow.mjs",
                  "tools/ui-test/node_modules/@midscene/android/package.json",
                  "tools/ui-test/node_modules/@midscene/test/package.json",
                  "tools/ui-test/node_modules/@img/sharp-win32-x64/package.json",
@@ -106,11 +149,11 @@ def audit_bundle(root: Path) -> None:
         if not (root / name).is_file():
             raise RuntimeError(f"Required bundle file missing: {name}")
     for path in root.rglob("*"):
-        if not path.is_file():
-            continue
         if path.is_symlink():
             raise RuntimeError(f"Symlink would break on Windows: {path}")
-        if path.name in {".env", "settings.json", ".DS_Store"} or path.suffix in {".db", ".sqlite", ".dylib", ".so"}:
+        if not path.is_file():
+            continue
+        if is_host_file(path):
             raise RuntimeError(f"Unexpected host data/binary: {path}")
         if path.suffix.lower() in {".exe", ".dll", ".pyd", ".node"}:
             with path.open("rb") as file:
@@ -134,7 +177,8 @@ def build() -> None:
         archives = list(executor.map(download, RUNTIMES))
     env = os.environ.copy()
     env["VITE_BACKEND_URL"] = "same-origin"
-    command(["pnpm", "exec", "vite", "build"], env=env)
+    frontend = STAGING.parent / "frontend"
+    command(["pnpm", "exec", "vite", "build", "--outDir", str(frontend), "--emptyOutDir"], env=env)
     if STAGING.exists():
         shutil.rmtree(STAGING)
     STAGING.mkdir(parents=True)
@@ -144,33 +188,26 @@ def build() -> None:
     for name in ["Start.cmd", "使用说明.txt"]:
         path = STAGING / name
         path.write_bytes(path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-8"))
-    shutil.copytree(ROOT / "backend/app", STAGING / "backend/app",
-                    ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.bak"))
-    shutil.copytree(ROOT / "backend/vendor", STAGING / "backend/vendor")
-    for name in ("zlg", "Functional", "config"):
-        shutil.copytree(ROOT / "backend" / name, STAGING / "backend" / name,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc", ".DS_Store"))
-    shutil.copytree(ROOT / "tools/monkey", STAGING / "tools/monkey")
-    shutil.copytree(ROOT / "dist/public", STAGING / "dist/public",
+    copy_release_sources(ROOT, STAGING)
+    shutil.copytree(frontend, STAGING / "dist/public",
                     ignore=shutil.ignore_patterns("__manus__", ".gitkeep"))
     index = STAGING / "dist/public/index.html"
     # Optional development analytics is not part of the offline application.
-    import re
     html = re.sub(r'<script\b[^>]*src="[^"]*/umami"[^>]*>\s*</script>', "", index.read_text())
     index.write_text(html, encoding="utf-8")
     runner = STAGING / "tools/ui-test"
-    runner.mkdir(parents=True)
-    for path in (ROOT / "tools/ui-test").iterdir():
-        if path.name in {"package.json", "package-lock.json"} or (path.suffix == ".mjs" and not path.name.endswith(".test.mjs")):
-            shutil.copy2(path, runner / path.name)
     command(["npm", "ci", "--os=win32", "--cpu=x64", "--ignore-scripts", "--omit=dev",
              "--no-bin-links", "--no-audit", "--no-fund"], cwd=runner)
     # Some public npm tarballs ship development .env files; none are runtime config.
-    for path in runner.rglob(".env"):
-        path.unlink()
+    for path in (runner / "node_modules").rglob(".env*"):
+        if path.is_file():
+            path.unlink()
     python = STAGING / "runtime/python"
     extract(archives[0], python)
     extract(archives[1], STAGING / "runtime/node", "node-v22.23.3-win-x64/")
+    # The bundled node executable is used directly. npm's upstream development
+    # settings are unnecessary and would be indistinguishable from host config.
+    (STAGING / "runtime/node/node_modules/npm/.npmrc").unlink(missing_ok=True)
     extract(archives[2], STAGING / "runtime/platform-tools", "platform-tools/")
     (python / "python312._pth").write_text(
         "python312.zip\n.\nsite-packages\n../..\n../../backend\nimport site\n", encoding="utf-8")

@@ -59,11 +59,21 @@ export function findRoute(edges, source, target) {
   }
   return null;
 }
+function isNavigationEntry(tree, node) {
+  if (!node.clickable) return false;
+  const pending = [node];
+  while (pending.length) {
+    const item = pending.pop();
+    if (item.checkable) return false;
+    for (const index of item.children ?? []) pending.push(tree.nodes[index]);
+  }
+  return true;
+}
+
 export function pointSelector(tree, point) {
   const nodes = tree.nodes.filter(
     n =>
-      n.clickable &&
-      !n.checkable &&
+      isNavigationEntry(tree, n) &&
       n.enabled &&
       n.bounds &&
       point.x >= n.bounds[0] &&
@@ -193,17 +203,27 @@ export class NavigationMemory {
       if (route) {
         for (const edge of route) {
           // Missing/ambiguous locators may fall back before sending input.
+          let node;
           try {
-            const n = resolveSelector(current, edge.selector);
-            if (!n.clickable || n.checkable) throw new Error();
+            node = resolveSelector(current, edge.selector);
           } catch {
             edge.stale = true;
             reason = "locator-invalid";
             break;
           }
+          if (!isNavigationEntry(current, node)) {
+            edge.stale = true;
+            reason = "unsafe-entry";
+            return "needs_review";
+          }
           // If sending input fails its outcome is unknown: stop, never repeat through AI.
           await this.device.tap(edge.selector, tree => {
             if (pageKey(tree) !== edge.from) throw new Error("导航来源已变化");
+            if (!isNavigationEntry(tree, resolveSelector(tree, edge.selector))) {
+              edge.stale = true;
+              reason = "unsafe-entry";
+              throw new Error("导航入口当前不可安全点击");
+            }
           });
           current = await this.device.read();
           if (pageKey(current) !== edge.to) {

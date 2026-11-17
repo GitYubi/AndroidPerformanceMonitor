@@ -20,7 +20,7 @@ import urllib.request
 import urllib.parse
 import zipfile
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parent.parent.parent
 HTTP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 

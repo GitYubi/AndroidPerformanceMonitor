@@ -142,7 +142,7 @@ async def capture_frame_metrics(
     serial: str,
     package: str | None,
     sdk_version: int | None,
-    cooldowns: dict[str, int] | None = None,
+    cooldowns: dict[tuple[str, str | None], int] | None = None,
     on_framestats: Callable[[str], None] | None = None,
 ) -> FrameStats | None:
     """按优先级尝试逐帧数据源，返回第一个成功解析的结果；全部失败返回 None。
@@ -150,13 +150,14 @@ async def capture_frame_metrics(
     SurfaceFlinger --latency 与 gfxinfo 计数器属于 monitor 的兜底链路，
     不在此处尝试（前者需要会话内 layer 选择状态）。
 
-    cooldowns：源 → 剩余冷却周期数。冷却中的源直接跳过；解析失败/异常时
-    设置冷却；成功时清除冷却。None 表示不做冷却（巡检等单次调用场景）。
+    冷却计数按来源管理，gfxinfo framestats 额外按应用包名隔离。
+    解析失败时设置冷却，成功时清除。None 表示巡检等单次调用会直接尝试来源。
     """
 
     for source in source_priority(sdk_version):
-        if cooldowns and cooldowns.get(source, 0) > 0:
-            cooldowns[source] -= 1
+        key = (source, package if source == FRAME_SOURCE_FRAMESTATS else None)
+        if cooldowns and cooldowns.get(key, 0) > 0:
+            cooldowns[key] -= 1
             continue
         try:
             if source == FRAME_SOURCE_FRAMETIMELINE:
@@ -175,9 +176,9 @@ async def capture_frame_metrics(
             stats = None
         if stats is not None:
             if cooldowns is not None:
-                cooldowns.pop(source, None)
+                cooldowns.pop(key, None)
             stats.package = package
             return stats
         if cooldowns is not None and source != FRAME_SOURCE_SF_LATENCY:
-            cooldowns[source] = FRAME_SOURCE_COOLDOWN_CYCLES
+            cooldowns[key] = FRAME_SOURCE_COOLDOWN_CYCLES
     return None

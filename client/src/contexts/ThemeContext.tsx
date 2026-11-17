@@ -23,8 +23,12 @@ export function ThemeProvider({
 }: ThemeProviderProps) {
   const [theme, setTheme] = useState<Theme>(() => {
     if (switchable) {
-      const stored = localStorage.getItem("theme");
-      return stored === "light" || stored === "dark" ? stored : defaultTheme;
+      try {
+        const stored = localStorage.getItem("theme");
+        if (stored === "light" || stored === "dark") return stored;
+      } catch {
+        // The workbench can still use its default theme.
+      }
     }
     return defaultTheme;
   });
@@ -38,7 +42,11 @@ export function ThemeProvider({
     }
 
     if (switchable) {
-      localStorage.setItem("theme", theme);
+      try {
+        localStorage.setItem("theme", theme);
+      } catch {
+        // The current theme still applies when storage is unavailable.
+      }
     }
   }, [theme, switchable]);
 

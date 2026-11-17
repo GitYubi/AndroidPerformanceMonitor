@@ -1,7 +1,10 @@
 import { BACKEND_URL } from "@/lib/backend";
 import {
-  nodesAtPoint,
+  boundsStyle,
+  candidateLabel,
+  pointCandidates,
   screenPixel,
+  treeSourceLabel,
   type MapNode as Node,
   type Observation,
 } from "@/lib/uiObservation";
@@ -147,6 +150,7 @@ export default function PageMapWorkbench({
   const [graph, setGraph] = useState<Graph>(empty),
     [pick, setPick] = useState<Pick | null>(null),
     [candidates, setCandidates] = useState<Node[]>([]);
+  const [hovered, setHovered] = useState<Node[]>([]);
   const [busy, setBusy] = useState(false),
     [live, setLive] = useState(false),
     [mode, setMode] = useState("inspect");
@@ -240,12 +244,15 @@ export default function PageMapWorkbench({
   function accept(o: Observation) {
     if (o.serial !== serialRef.current) return;
     setCandidates([]);
+    setHovered([]);
     setPick(null);
     setObs(o);
     setFrame(o);
   }
   async function read() {
-    const o: Observation = await api("observe", { serial });
+    inspectionPaused.current = true;
+    setLive(false);
+    const o: Observation = await api("observe", { serial, inspectWindows: true });
     accept(o);
     return o;
   }
@@ -321,43 +328,29 @@ export default function PageMapWorkbench({
       y: Math.max(8, Math.min(y, window.innerHeight - 360)),
     });
   }
-  async function screenClick(
+  function screenClick(
     e: React.MouseEvent<HTMLImageElement>,
     right = false
   ) {
     e.preventDefault();
-    if (selectingRegion || !serial || busy || !obs || mode !== "inspect")
+    if (selectingRegion || !serial || busy || !obs?.nodes.length || mode !== "inspect")
       return;
-    const rect = e.currentTarget.getBoundingClientRect(),
-      rx = (e.clientX - rect.left) / rect.width,
-      ry = (e.clientY - rect.top) / rect.height,
-      mx = e.clientX,
-      my = e.clientY;
+    if (live || frame !== obs) {
+      setStatus("请先读取画面与控件，再在对应截图上选择元素。");
+      return;
+    }
     setMenu(null);
-
-    const select = async () => {
-      const o = obs;
-      inspectionPaused.current = true;
-      setLive(false);
-      setFrame(o);
-      const x = rx * o.width,
-        y = ry * o.height;
-      const list = nodesAtPoint(o, x, y);
-      setCandidates(list);
-      if (!list.length) {
-        setPick(null);
-        setStatus("该区域没有可见结构节点；不能保存为稳定元素。");
-        return;
-      }
-      const n = list[0];
-      choose(o, n);
-      if (right) {
-        menuAt(mx, my, { kind: "screen", pick: { obs: o, node: n } });
-        return;
-      }
-      setStatus("已选中元素，可切换节点层级或保存到所选父节点。");
-    };
-    await select();
+    const list = pointCandidates(obs, e);
+    setCandidates(list);
+    const node = list[0];
+    if (!node) {
+      setPick(null);
+      setStatus("该区域没有可见结构节点。");
+      return;
+    }
+    choose(obs, node);
+    if (right) menuAt(e.clientX, e.clientY, { kind: "screen", pick: { obs, node } });
+    else setStatus("已选中元素，可切换同点候选或保存到所选父节点。");
   }
   function startRegion(event: PointerEvent<HTMLImageElement>) {
     if (
@@ -760,8 +753,11 @@ export default function PageMapWorkbench({
           onClick={() =>
             job(async () => {
               try {
-                await read();
-                setStatus("已读取当前页画面与控件，未操作设备。");
+                const observation = await read();
+                if (serialRef.current !== serial) return;
+                setStatus(observation.treeSource === "screenshot"
+                  ? "已读取屏幕截图，可框选并保存基准图。"
+                  : "已读取当前页画面与控件。");
               } catch (e) {
                 setObs(null);
                 setPick(null);
@@ -792,7 +788,7 @@ export default function PageMapWorkbench({
           实时显示（截图刷新）
         </label>
         <label className="flex min-w-0 max-w-full items-center gap-2 text-sm">
-          <span className="shrink-0">节点层级</span>
+          <span className="shrink-0">同点候选</span>
           <select
             className="w-64 min-w-0 max-w-full rounded border bg-background p-2 disabled:opacity-50"
             disabled={
@@ -817,13 +813,14 @@ export default function PageMapWorkbench({
             ) : (
               candidates.map(n => (
                 <option key={n.index} value={n.index}>
-                  {n.label || n.className} ·{" "}
+                  {candidateLabel(n)} ·{" "}
                   {n.clickable ? "可点击" : "不可点击"} · {n.index}
                 </option>
               ))
             )}
           </select>
         </label>
+        {obs?.treeSource && <span className="text-xs text-muted-foreground">{treeSourceLabel[obs.treeSource]}</span>}
       </div>
       <div className="grid gap-5 lg:grid-cols-[260px_minmax(0,1fr)]">
         <aside className="max-h-[800px] overflow-auto rounded border p-3">
@@ -897,7 +894,7 @@ export default function PageMapWorkbench({
             <div className="flex flex-wrap gap-2 rounded border p-3 text-sm">
               <Button
                 variant="outline"
-                disabled={!obs || busy}
+                disabled={!obs?.nodes.length || busy}
                 onClick={() => {
                   setDialogName("");
                   setDialog("app");
@@ -925,7 +922,7 @@ export default function PageMapWorkbench({
               <Button
                 variant="outline"
                 disabled={
-                  !obs || !appId || busy || (!pendingEntryId && !draftToken)
+                  !obs?.nodes.length || !appId || busy || (!pendingEntryId && !draftToken)
                 }
                 title="先将已保存元素设为父元素，操作进入后绑定打开结果"
                 onClick={() => {
@@ -1082,7 +1079,13 @@ export default function PageMapWorkbench({
                 onClick={e => screenClick(e)}
                 onContextMenu={e => screenClick(e, true)}
                 onPointerDown={startRegion}
-                onPointerMove={drawRegion}
+                onPointerMove={event => {
+                  drawRegion(event);
+                  setHovered(!selectingRegion && !busy && !live && obs && frame === obs
+                    ? pointCandidates(obs, event)
+                    : []);
+                }}
+                onPointerLeave={() => setHovered([])}
                 onPointerUp={drawRegion}
                 onPointerCancel={event => {
                   if (dragStart.current?.pointerId !== event.pointerId) return;
@@ -1090,6 +1093,11 @@ export default function PageMapWorkbench({
                   setRegion(null);
                 }}
               />
+              {!selectingRegion && !busy && !live && frame === obs && hovered.map(node => node.bounds && (
+                <span key={node.index} aria-hidden="true"
+                  className="pointer-events-none absolute border border-dashed border-cyan-400/70"
+                  style={boundsStyle(frame, node.bounds)} />
+              ))}
               {selectingRegion && region && (
                 <div
                   className="pointer-events-none absolute border-2 border-cyan-400 bg-cyan-400/15"
@@ -1108,12 +1116,7 @@ export default function PageMapWorkbench({
                 pick.node.bounds && (
                   <div
                     className="pointer-events-none absolute border-2 border-cyan-400"
-                    style={{
-                      left: `${(pick.node.bounds[0] / frame.width) * 100}%`,
-                      top: `${(pick.node.bounds[1] / frame.height) * 100}%`,
-                      width: `${((pick.node.bounds[2] - pick.node.bounds[0]) / frame.width) * 100}%`,
-                      height: `${((pick.node.bounds[3] - pick.node.bounds[1]) / frame.height) * 100}%`,
-                    }}
+                    style={boundsStyle(frame, pick.node.bounds)}
                   />
                 )}
             </div>

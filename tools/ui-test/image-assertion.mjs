@@ -1,85 +1,34 @@
+import { Worker } from "node:worker_threads";
 import sharp from "sharp";
-
-async function decode(image, colorMode) {
-  let pipeline = sharp(image, { limitInputPixels: 16_000_000 }).toColourspace(
-    "srgb"
-  );
-  if (colorMode === "grayscale") pipeline = pipeline.greyscale();
-  return pipeline.ensureAlpha().raw().toBuffer({ resolveWithObject: true });
-}
+import { decodeImage } from "./image-pixels.mjs";
 
 export async function searchScreenshot(
   actual,
   baseline,
   pixelTolerance,
   minSimilarity,
-  colorMode = "grayscale"
+  colorMode = "grayscale",
+  signal
 ) {
-  const [screen, template] = await Promise.all([
-    decode(actual, colorMode),
-    decode(baseline, colorMode),
-  ]);
-  const { width, height, channels } = template.info;
-  if (width > screen.info.width || height > screen.info.height)
-    return {
-      similarity: null,
-      found: false,
-      message: `基准图 ${width}×${height} 超出截图 ${screen.info.width}×${screen.info.height}`,
+  signal?.throwIfAborted();
+  // Keep worst-case template matching off the runner's deadline timer thread.
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./image-search-worker.mjs", import.meta.url), {
+      workerData: [actual, baseline, pixelTolerance, minSimilarity, colorMode],
+      execArgv: [],
+    });
+    const abort = () => {
+      void worker.terminate();
+      reject(signal.reason);
     };
-  const maxMismatch = Math.floor(
-    (width * height * (100 - minSimilarity)) / 100 + 1e-9
-  );
-  // Check less common template pixels first. Every pixel is still checked
-  // before accepting a match, and rejection only happens past the threshold.
-  const frequency = new Uint32Array(256);
-  for (let i = 0; i < template.data.length; i += channels)
-    frequency[template.data[i]]++;
-  const order = Array.from({ length: width * height }, (_, index) => index);
-  order.sort(
-    (a, b) =>
-      frequency[template.data[a * channels]] -
-      frequency[template.data[b * channels]]
-  );
-  const screenOffsets = new Int32Array(order.length);
-  const templateOffsets = new Int32Array(order.length);
-  for (let i = 0; i < order.length; i++) {
-    const index = order[i];
-    screenOffsets[i] =
-      (Math.floor(index / width) * screen.info.width + (index % width)) *
-      channels;
-    templateOffsets[i] = index * channels;
-  }
-  for (let y = 0; y <= screen.info.height - height; y++) {
-    for (let x = 0; x <= screen.info.width - width; x++) {
-      let mismatches = 0;
-      const start = (y * screen.info.width + x) * channels;
-      for (let i = 0; i < order.length && mismatches <= maxMismatch; i++) {
-        const a = start + screenOffsets[i];
-        const b = templateOffsets[i];
-        for (let channel = 0; channel < channels; channel++) {
-          if (
-            Math.abs(screen.data[a + channel] - template.data[b + channel]) >
-            pixelTolerance
-          ) {
-            mismatches++;
-            break;
-          }
-        }
-      }
-      if (mismatches <= maxMismatch)
-        return {
-          similarity: 100 * (1 - mismatches / (width * height)),
-          found: true,
-          x,
-          y,
-        };
-    }
-  }
-  return {
-    similarity: null,
-    found: false,
-    message: "全屏未找到满足相似度阈值的基准图",
-  };
+    signal?.addEventListener("abort", abort, { once: true });
+    worker.once("message", resolve);
+    worker.once("error", reject);
+    worker.once("exit", code => {
+      signal?.removeEventListener("abort", abort);
+      if (code !== 0) reject(new Error(`图像搜索进程退出（${code}）`));
+    });
+  });
 }
 
 export async function cropScreenshot(image, { left, top, right, bottom }) {
@@ -104,8 +53,8 @@ export async function compareScreenshots(
   colorMode = "color"
 ) {
   const [current, expected] = await Promise.all([
-    decode(actual, colorMode),
-    decode(baseline, colorMode),
+    decodeImage(actual, colorMode),
+    decodeImage(baseline, colorMode),
   ]);
   const { width, height } = expected.info;
   if (current.info.width !== width || current.info.height !== height)

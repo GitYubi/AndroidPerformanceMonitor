@@ -20,7 +20,7 @@ from zlg.paths import data_path
 import binascii
 from ctypes import *
 import json
-from itertools import count
+from itertools import chain, count
 import os
 import platform
 from pathlib import Path
@@ -36,7 +36,7 @@ from cantools.database import Message
 from can.io import BLFWriter
 from can import Message as can_Message
 from zlg.FunctionRely import FunctionRely
-from zlg.backend import CanBackend, LoopbackBackend, validate_channel
+from zlg.backend import CanBackend, LoopbackBackend, attempt_cleanup, validate_channel
 from zlg.wake import encode_wake_message
 from zlg.periodic import HardwarePeriodicSend, PeriodicSend, PulseSend
 from zlg.tx_timing import TxSample, TxTiming
@@ -375,13 +375,22 @@ class IProperty(Structure):
                 ("GetValue", c_void_p),
                 ("GetPropertys", c_void_p)]
 
+def require_sdk_ok(status, operation):
+    if status != ZCAN_STATUS_OK:
+        raise RuntimeError(f"{operation}失败（SDK 状态 {status}）")
+
+
 class ZCAN(object):
 
 
     def __init__(self):
         self.__log = Logs()
-        self.__dll = load_vendor_library("zlgcan_x64", "zlgcan.dll")
-        configure_zcan(self.__dll)
+        try:
+            self.__dll = load_vendor_library("zlgcan_x64", "zlgcan.dll")
+            configure_zcan(self.__dll)
+        except Exception:
+            self.__log.close()
+            raise
 
     def close_log(self):
         self.__log.close()
@@ -424,7 +433,8 @@ class ZCAN(object):
         info = ZCAN_DEVICE_INFO()
         ret = self.__dll.ZCAN_GetDeviceInf(device_handle, byref(info))
         self.__log.debug(f"设备{device_handle}信息:\n{info}操作结果{ret}")
-        return info if ret == ZCAN_STATUS_OK else None
+        require_sdk_ok(ret, "读取设备信息")
+        return info
         
 
     @FunctionRely.try_func_comments("Exception on ZCAN_ZCAN_IsDeviceOnLine!")
@@ -501,7 +511,8 @@ class ZCAN(object):
         ErrInfo = ZCAN_CHANNEL_ERR_INFO()
         ret = self.__dll.ZCAN_ReadChannelErrInfo(chn_handle, byref(ErrInfo))
         self.__log.debug(f"查询通道{chn_handle}错误信息{ret}")
-        return ErrInfo if ret == ZCAN_STATUS_OK else None
+        require_sdk_ok(ret, "读取通道错误信息")
+        return ErrInfo
 
         
     @FunctionRely.try_func_comments("Exception on ZCAN_ReadChannelStatus!")
@@ -514,7 +525,8 @@ class ZCAN(object):
         status = ZCAN_CHANNEL_STATUS()
         ret = self.__dll.ZCAN_ReadChannelStatus(chn_handle, byref(status))
         self.__log.debug(f"查询通道{chn_handle}状态信息{ret}")
-        return status if ret == ZCAN_STATUS_OK else None
+        require_sdk_ok(ret, "读取通道状态")
+        return status
         
     @FunctionRely.try_func_comments("Exception on ZCAN_GetReceiveNum!")
     def GetReceiveNum(self, chn_handle, can_type = ZCAN_TYPE_CAN):
@@ -704,16 +716,24 @@ class DBC():
     def close(self):
         self.__log.close()
 
-    def get_message_by_id(self, message_id: str) -> Message:
+    def get_message_by_id(self, message_id: int | str) -> Message:
         """
         根据报文id获取当前dbc的报问
         :param message_id: 报文id
         :return: 报文
         """
-        message = self.db.get_message_by_frame_id(int(message_id, 16))
+        frame_id = self.frame_id(message_id)
+        message = self.db.get_message_by_frame_id(frame_id)
         self.__log.debug(f"message信息：{message}")
 
         return message
+
+    @staticmethod
+    def frame_id(value: int | str) -> int:
+        frame_id = int(value, 16) if isinstance(value, str) else value
+        if type(frame_id) is not int or not 0 <= frame_id <= 0x1fffffff:
+            raise ValueError(f"无效 CAN 报文 ID：{value!r}")
+        return frame_id
 
 
     def get_message_by_name(self, message_name: str) -> Message:
@@ -737,7 +757,7 @@ class DBC():
         """
 
         # 在dbc中找到该信号供解析使用
-        select_message = self.db.get_message_by_frame_id(int(select_data['message_id'], 16))
+        select_message = self.get_message_by_id(select_data['message_id'])
 
         message_key: bytes = b""
         for i in select_data['data']:
@@ -826,13 +846,18 @@ class WindowsCanBackend:
     def __init__(self, device_index):
         self._sdk = ZCAN()
         self._channels = {}
-        self._handle = self._sdk.OpenDevice(ZCAN_USBCANFD_200U, device_index, 0)
-        if not self._handle:
+        self._unreleased_channels = {}
+        self._error_log = Logs()
+        try:
+            self._handle = self._sdk.OpenDevice(ZCAN_USBCANFD_200U, device_index, 0)
+            if not self._handle:
+                raise RuntimeError("打开设备失败，请检查周立功驱动、USB 连接及设备占用情况。")
+        except Exception:
             self._sdk.close_log()
-            raise RuntimeError("打开设备失败，请检查周立功驱动、USB 连接及设备占用情况。")
+            self._error_log.close()
+            raise
         self._epoch = time.time()
         self._tx_echo = os.environ.get("ZCAN_WINDOWS_TX_ECHO", "1") != "0"
-        self._error_log = Logs()
         self._device_error_counts = Counter()
         self._device_error_samples = {}
         self._last_device_error_log = float("-inf")
@@ -842,36 +867,53 @@ class WindowsCanBackend:
         return tuple(sorted(self._channels))
 
     def open_channel(self, channel):
-        validate_channel(channel)
+        validate_channel(channel, 2)
         if channel in self._channels:
             return
+        if channel in self._unreleased_channels:
+            raise RuntimeError(f"通道 {channel} 未确认释放，请先关闭设备。")
         if not self._handle:
             raise RuntimeError("设备已关闭。")
 
-        self._sdk.GetDeviceInf(self._handle)
         properties = self._sdk.GetIProperty(self._handle)
         if not properties:
             raise RuntimeError("无法读取设备属性接口。")
+        errors = []
         try:
+            # Some revisions choose the controller clock internally. The
+            # requested CAN timing below still needs explicit acceptance.
+            try:
+                require_sdk_ok(self._sdk.SetValue(properties, f"{channel}/clock", "60000000"), "设置控制器时钟")
+            except RuntimeError as exc:
+                self._error_log.warning(f"通道 {channel} 使用 SDK 默认控制器时钟：{exc}")
             for name, value in (
-                ("clock", "60000000"),
                 ("canfd_standard", "0"),
                 ("initenal_resistance", "1"),
                 ("canfd_abit_baud_rate", "500000"),
                 ("canfd_dbit_baud_rate", "2000000"),
                 ("set_device_recv_merge", "1"),
             ):
-                self._sdk.SetValue(properties, f"{channel}/{name}", value)
+                require_sdk_ok(self._sdk.SetValue(properties, f"{channel}/{name}", value), f"设置通道 {channel} {name}")
+        except Exception as exc:
+            errors.append(str(exc))
         finally:
-            self._sdk.ReleaseIProperty(properties)
+            attempt_cleanup(errors, "释放设备属性接口",
+                            lambda: require_sdk_ok(self._sdk.ReleaseIProperty(properties), "释放属性接口"))
+        if errors:
+            raise RuntimeError("；".join(errors))
 
         handle = self._sdk.InitCAN(self._handle, channel)
         if not handle:
             raise RuntimeError(f"初始化通道 {channel} 失败。")
-        self._sdk.ClearBuffer(handle)
-        if self._sdk.StartCAN(handle) != ZCAN_STATUS_OK:
-            self._sdk.ResetCAN(handle)
-            raise RuntimeError(f"启动通道 {channel} 失败。")
+        try:
+            require_sdk_ok(self._sdk.ClearBuffer(handle), f"清除通道 {channel} 缓冲区")
+            require_sdk_ok(self._sdk.StartCAN(handle), f"启动通道 {channel}")
+        except Exception as exc:
+            errors = [str(exc)]
+            if not attempt_cleanup(errors, f"复位通道 {channel}",
+                                   lambda: require_sdk_ok(self._sdk.ResetCAN(handle), "通道复位")):
+                self._unreleased_channels[channel] = handle
+            raise RuntimeError("；".join(errors)) from exc
         self._channels[channel] = handle
 
     def close_channel(self, channel):
@@ -910,14 +952,17 @@ class WindowsCanBackend:
             raise RuntimeError(f"通道 {message.channel} 发送失败。")
 
     def poll_raw(self, limit):
-        count = max((self._sdk.GetReceiveNum(handle, 2) or 0
+        count = max((self._sdk.GetReceiveNum(handle, 2)
                      for handle in self._channels.values()), default=0)
+        if count == 0xffffffff:
+            raise RuntimeError("查询设备接收队列失败。")
         if not count:
             return None
-        batch = self._sdk.ReceiveData(self._handle, min(count, limit), 0)
-        if batch is None:
+        requested = min(count, limit)
+        items, received = self._sdk.ReceiveData(self._handle, requested, 0)
+        if not 0 <= received <= requested:
             raise RuntimeError("读取设备接收队列失败。")
-        return batch
+        return items, received
 
     def poll(self, limit):
         return self.decode_poll(self.poll_raw(limit))
@@ -985,14 +1030,24 @@ class WindowsCanBackend:
         return bool(self._handle and self._sdk.DeviceOnLine(self._handle) == ZCAN_STATUS_ONLINE)
 
     def close(self):
+        errors = []
+        for channel in tuple(self._channels):
+            attempt_cleanup(errors, f"关闭通道 {channel}", lambda: self.close_channel(channel))
+        for channel, handle in tuple(self._unreleased_channels.items()):
+            if attempt_cleanup(errors, f"复位未登记通道 {channel}",
+                               lambda: require_sdk_ok(self._sdk.ResetCAN(handle), "通道复位")):
+                del self._unreleased_channels[channel]
         if self._handle:
-            if self._sdk.CloseDevice(self._handle) != ZCAN_STATUS_OK:
-                raise RuntimeError("关闭设备失败。")
-            self._handle = None
-        self._channels.clear()
-        self._sdk.close_log()
-        self._flush_device_errors(force=True)
-        self._error_log.close()
+            if attempt_cleanup(errors, "释放设备",
+                               lambda: require_sdk_ok(self._sdk.CloseDevice(self._handle), "关闭设备")):
+                self._handle = None
+                self._channels.clear()
+                self._unreleased_channels.clear()
+        attempt_cleanup(errors, "关闭 SDK 日志", self._sdk.close_log)
+        attempt_cleanup(errors, "保存设备错误日志", lambda: self._flush_device_errors(force=True))
+        attempt_cleanup(errors, "关闭设备错误日志", self._error_log.close)
+        if errors:
+            raise RuntimeError("；".join(errors))
 
 
 def backend_mode() -> str:
@@ -1002,8 +1057,11 @@ def backend_mode() -> str:
     return mode
 
 
-def open_backend(device_index: int) -> CanBackend:
+def open_backend(device_index: int, *, device_id=None) -> CanBackend:
     mode = backend_mode()
+    if mode == "hirain":
+        from can_adapters.hirain import HirainCanBackend
+        return HirainCanBackend(device_id)
     if mode == "simulation":
         return LoopbackBackend()
     if mode == "mac-usb":
@@ -1018,11 +1076,12 @@ def open_backend(device_index: int) -> CanBackend:
 class zlgCan:
     """DBC, scheduling and logging shared by all CAN backends."""
 
-    def __init__(self, device_index: int, dbc_path: str, *, hardware_periodic=None):
+    def __init__(self, device_index: int, dbc_path: str, *, hardware_periodic=None, device_id=None):
         self.db = DBC(dbc_path)
         self.__log = Logs()
         try:
-            self._backend = open_backend(device_index)
+            self._backend = (open_backend(device_index, device_id=device_id) if device_id is not None
+                             else open_backend(device_index))
             supports_hardware_periodic = getattr(self._backend, "supports_hardware_periodic", False)
             if hardware_periodic is None:
                 hardware_periodic = supports_hardware_periodic
@@ -1039,13 +1098,15 @@ class zlgCan:
                            if os.environ.get("ZCAN_TX_TIMING") == "1" else None)
         self._io_lock = threading.Lock()
         self._rx_lock = threading.Lock()
+        self._diagnostic_lock = threading.RLock()
         self._poll_raw = getattr(self._backend, "poll_raw", None)
         self._closed = False
+        self._backend_closed = False
         self.hardware_periodic = hardware_periodic
         self._periodic_faults = set()
         self._open_channels = self._backend.channels
         self._pending = deque(maxlen=4096)
-        self._diagnostic_frames = {channel: deque(maxlen=512) for channel in (0, 1)}
+        self._diagnostic_frames = {channel: deque(maxlen=512) for channel in range(4)}
         self._continuous_rx = getattr(self._backend, "continuous_rx", False)
         self._receive_stop = threading.Event()
         self._receive_thread = None
@@ -1067,6 +1128,8 @@ class zlgCan:
 
     def chn_open(self, chn_index):
         with self._state_lock:
+            if self._closed:
+                raise RuntimeError("CAN 设备已关闭。")
             with self._io_lock:
                 self._backend.open_channel(chn_index)
                 self._open_channels = self._backend.channels
@@ -1089,19 +1152,19 @@ class zlgCan:
 
     def close(self):
         with self._state_lock:
+            errors = []
             if not self._closed:
-                self.chn_close_setup(software_only=True)
-                self.blf_stop()
-                self._stop_receiver()
-                with self._rx_lock:
-                    with self._io_lock:
-                        try:
-                            self._backend.close()
-                        finally:
-                            self._open_channels = self._backend.channels
-                            if not self._open_channels:
-                                self._forget_hardware_tasks()
-                    self._closed = True
+                self._closed = True
+                for key, task in tuple(self.thread_messages.items()):
+                    if isinstance(task["func"], PeriodicSend):
+                        attempt_cleanup(errors, f"停止周期 {key}", lambda: self._stop_periodic_tasks((key,)))
+                attempt_cleanup(errors, "关闭 BLF", self.blf_stop)
+                attempt_cleanup(errors, "停止接收线程", self._stop_receiver)
+            if not self._backend_closed:
+                with self._rx_lock, self._io_lock:
+                    self._backend_closed = attempt_cleanup(errors, "关闭 CAN 后端", self._backend.close)
+                    self._open_channels = ()
+                    self._forget_hardware_tasks()
                     self._pending.clear()
                     for frames in self._diagnostic_frames.values():
                         frames.clear()
@@ -1111,8 +1174,12 @@ class zlgCan:
                         self.__log.info(f"周期发送统计已保存：{path}")
                     except OSError as exc:
                         self.__log.error(f"无法保存周期发送统计：{exc}")
-                self.db.close()
-                self.__log.close()
+                    finally:
+                        self._tx_timing = None
+                attempt_cleanup(errors, "关闭 DBC", self.db.close)
+                attempt_cleanup(errors, "关闭 CAN 日志", self.__log.close)
+            if errors:
+                raise RuntimeError("；".join(errors))
         return 1
 
     def is_online(self):
@@ -1133,6 +1200,8 @@ class zlgCan:
 
     def _send(self, message):
         with self._io_lock:
+            if self._closed:
+                raise RuntimeError("CAN 设备已关闭。")
             self._backend.send(message)
 
     def message_create(self, chn_index, message, data_final, can_type=1):
@@ -1143,6 +1212,9 @@ class zlgCan:
         sample = None
         try:
             with self._io_lock:
+                if self._closed:
+                    worker.cancel()
+                    return
                 acquired = time.perf_counter_ns()
                 pending = worker.pending(acquired)
                 if pending is None:
@@ -1334,7 +1406,7 @@ class zlgCan:
         return message, self._message(channel, message, payload, bool(can_fd), bool(fd_brs))
 
     def _require_send_channel(self, channel):
-        if channel not in self.channels:
+        if self._closed or channel not in self.channels:
             raise RuntimeError(f"通道 {channel} 未打开。")
         if channel in self._periodic_faults:
             raise RuntimeError(f"通道 {channel} 的定时状态未知，请先关闭通道或设备。")
@@ -1488,7 +1560,8 @@ class zlgCan:
             if self.custom_log is not None:
                 self.custom_log.on_message_received(frame)
             self._pending.append(frame)
-            if frame.is_rx and frame.arbitration_id == 0x7b3 and frame.channel in self._diagnostic_frames:
+            if (frame.is_rx and frame.arbitration_id == 0x7b3 and frame.channel in self._diagnostic_frames
+                    and not (frame.is_extended_id or frame.is_error_frame or frame.is_remote_frame)):
                 self._diagnostic_frames[frame.channel].append(list(frame.data))
         return len(frames)
 
@@ -1516,24 +1589,24 @@ class zlgCan:
         :param  messgae_info: 接收到的单条can log
         :return:
         """
+        if messgae_info.get('is_error_frame') or messgae_info.get('is_remote_frame'):
+            return
+        frame_id = DBC.frame_id(messgae_info['arbitration_id'])
         for signal, info in self.mir_msgs.items():
-            # 监听到can log中有此报文ID，进入判断
-            if info['R_MessageID'] == messgae_info['arbitration_id']:  
-                # 获取can log 该报文的目前值 键值对
-                signal_data = self.db.get_single_value({"message_id":messgae_info['arbitration_id'], 
-                                                        'data': messgae_info['data']}, True)
-                # 获取指定信号的信号值，如果满足进入处理程序。
-                if signal_data[signal] == int(info['R_Coding'], 16):  
-                    # 根据ID获取要返回报文的报文名
-                    name = self.db.get_message_by_id(info['T_MessageID']).name 
-                    # 获取要发送报文类型
-                    can_fd = info['T_CanType'] == 'CANFD'
-                    # 获取发送间隔
-                    cycle_time = int(info['T_Period'][:-2])
-                    # print(cycle_time)
-                    self.single_send(messgae_info['channel'], name,
-                                     {info['T_SignalName']: int(info['T_Coding'], 16)},
-                                     can_fd=can_fd, cycle_time=cycle_time)
+            if DBC.frame_id(info['R_MessageID']) != frame_id:
+                continue
+            received = self.db.get_message_by_id(frame_id)
+            if received.is_extended_frame != bool(messgae_info.get('is_extended_id', frame_id > 0x7ff)):
+                continue
+            try:
+                signals = received.decode(bytes(messgae_info['data']), decode_choices=False)
+            except (cantools.database.DecodeError, ValueError):
+                continue
+            if signals.get(signal) == int(info['R_Coding'], 16):
+                name = self.db.get_message_by_id(info['T_MessageID']).name
+                self.single_send(messgae_info['channel'], name,
+                                 {info['T_SignalName']: int(info['T_Coding'], 16)},
+                                 can_fd=info['T_CanType'] == 'CANFD', cycle_time=int(info['T_Period'][:-2]))
                     
                 
     def blf_start(self, logfilename: Optional[str] = ""):
@@ -1646,72 +1719,93 @@ class zlgCan:
                 raise RuntimeError("模拟模式不支持 ECU 诊断。")
             raise RuntimeError("当前 USB 后端尚未开放 ECU 诊断。")
 
-    def diag_send(self, chn_index: int, data: list):
+    def _diagnostic_channel(self, channel):
         self._require_diagnostics()
+        if type(channel) is not int or channel != 0:
+            raise ValueError("历史配置字诊断只支持 CAN0。")
+        self._require_send_channel(channel)
+
+    def _send_diagnostic_frame(self, channel, data):
+        self._diagnostic_channel(channel)
         if len(data) != 8:
             raise ValueError("诊断请求必须为 8 字节。")
-        # The existing Windows diagnostic wiring uses CAN0.
-        def send(payload):
-            self._send(can_Message(
-                channel=0, arbitration_id=0x773, is_extended_id=False,
-                data=payload, check=True,
-            ))
-        send(data)
-        if data[1] == 0x22:
-            time.sleep(0.01)
-            send([0x30, 0, 0x14, 0, 0, 0, 0, 0])
+        self._send(can_Message(channel=channel, arbitration_id=0x773, is_extended_id=False,
+                               data=data, check=True))
 
-    def diag_receive(self, chn_index: int) -> list:
-        self._require_diagnostics()
-        validate_channel(chn_index)
-        with self._rx_lock:
+    def diag_send(self, chn_index: int, data: list):
+        with self._diagnostic_lock:
+            self._send_diagnostic_frame(chn_index, data)
+            # Preserve automatic flow control for the raw legacy read API.
+            if data[1] == 0x22:
+                time.sleep(0.01)
+                self._send_diagnostic_frame(chn_index, [0x30, 0, 0x14, 0, 0, 0, 0, 0])
+
+    def diag_receive(self, chn_index: int) -> list[list[int]]:
+        with self._diagnostic_lock, self._rx_lock:
+            self._diagnostic_channel(chn_index)
             self._collect_frames()
-            pending = self._diagnostic_frames[0]
+            pending = self._diagnostic_frames[chn_index]
             frames = list(pending)
             pending.clear()
             return frames
 
-    def diag_config_analysis_list(self, chn_index: int)-> list:
-        """
-        解析成数字列表格式的配置字
-        :param data: 诊断数据
-        :return:  数字列表格式的配置字
-        """
+    def _diagnostic_frames_until(self, channel, deadline):
+        while time.monotonic() < deadline:
+            for frame in self.diag_receive(channel):
+                if frame:
+                    yield bytes(frame)
+            time.sleep(0.01)
 
-        config_data = self.diag_receive(chn_index)
-        config_content = []
-        for num, data in enumerate(config_data):
-            if num == 0:
-                config_content += [i for i in data['data'][3:]]
-            elif num == len(config_data) - 1:
-                config_content += [data['data'][1]]
-            else:
-                config_content += [i for i in data['data'][1:]]
-        
-        return config_content
-    
-    def diag_config_analysis_chars(self, chn_index: int)-> str:
-        """
-        解析成字符串格式的配置字
-        :return:  字符串格式的配置字
-        """
-        data = self.diag_config_analysis_list(chn_index)
-        # print(len(data))
-        return " ".join(hex(i)[2:].upper() if len(hex(i)[2:]) > 1 else "0"+hex(i)[2:].upper() for i in data)
+    @staticmethod
+    def _config_payload(frames):
+        first = next(frames, None)
+        if first is None:
+            raise RuntimeError("没有收到配置字响应。")
+        # F1B1 is 200 bytes plus the service byte and two-byte DID.
+        if len(first) < 5 or first[:5] != bytes((0x10, 0xcb, 0x62, 0xf1, 0xb1)):
+            raise RuntimeError("配置字响应的服务、标识或长度无效。")
+        content = bytearray(first[5:])
+        sequence = 1
+        for frame in frames:
+            if len(frame) < 2 or frame[0] != (0x20 | (sequence & 0xf)):
+                raise RuntimeError("配置字响应的连续帧无效。")
+            content.extend(frame[1:])
+            if len(content) >= 200:
+                return list(content[:200])
+            sequence += 1
+        raise RuntimeError("配置字响应不完整。")
 
-    def __diag_seed_analysis(self, chn_index: int) -> list:
-        """
-        该函数用于种子解析
-        :return:  None
-        """
-        config_data = self.diag_receive(chn_index)
+    def diag_config_analysis_list(self, chn_index: int) -> list[int]:
+        return self._config_payload(iter(map(bytes, self.diag_receive(chn_index))))
 
-        config_content = config_data[0]['data'][3:-1]
+    def diag_config_analysis_chars(self, chn_index: int) -> str:
+        return " ".join(f"{value:02X}" for value in self.diag_config_analysis_list(chn_index))
 
-        self.__log.debug(f"种子为{config_content}")
-        return config_content
+    def diag_read_config(self, channel: int) -> str:
+        with self._diagnostic_lock:
+            self.diag_receive(channel)
+            self._send_diagnostic_frame(channel, [0x03, 0x22, 0xf1, 0xb1, 0, 0, 0, 0])
+            frames = self._diagnostic_frames_until(channel, time.monotonic() + 3)
+            first = next(frames, None)
+            if first is None:
+                raise RuntimeError("没有收到配置字响应。")
+            if first[:5] != bytes((0x10, 0xcb, 0x62, 0xf1, 0xb1)):
+                raise RuntimeError("ECU 未返回有效的 F1B1 配置字首帧。")
+            self._send_diagnostic_frame(channel, [0x30, 0, 0x14, 0, 0, 0, 0, 0])
+            data = self._config_payload(chain((first,), frames))
+            return " ".join(f"{value:02X}" for value in data)
 
-    
+    def _diagnostic_reply(self, channel, expected):
+        for frame in self._diagnostic_frames_until(channel, time.monotonic() + 3):
+            if not 1 <= frame[0] <= min(7, len(frame) - 1):
+                continue
+            payload = frame[1:1 + frame[0]]
+            if payload.startswith(expected):
+                return payload
+            if len(payload) >= 3 and payload[:2] == bytes((0x7f, expected[0] - 0x40)) and payload[2] != 0x78:
+                raise RuntimeError(f"ECU 拒绝诊断服务（NRC {payload[2]:#04x}）。")
+        raise RuntimeError(f"未收到诊断响应 {expected.hex(' ')}。")
+
     def __seed_to_key(self, seed: int, mask: hex= 0x48205554) -> str:
         """
         该函数用于计算解密的key
@@ -1728,71 +1822,57 @@ class zlgCan:
                     seed = seed ^ mask
                 else:
                     seed = seed << 1
-            key = hex(seed)[-8:]
+            key = f"{seed & 0xffffffff:08x}"
 
-        self.__log.debug(f"种子解析结果：{key}")
         return key
 
-    
-    def _diag_send_key_27_02(self, chn_index: int) -> None:
-        """
-        该函数用于发送解密诊断
-        """
-        seed_array = self.__diag_seed_analysis()
-        seed = seed_array[0] << 24
-        seed += seed_array[1] << 16
-        seed += seed_array[2] << 8
-        seed += seed_array[3]
-        key = self.__seed_to_key(seed)
-        key1 = int("0x" + key[0:2], 16)
-        key2 = int("0x" + key[2:4], 16)
-        key3 = int("0x" + key[4:6], 16)
-        key4 = int("0x" + key[6:], 16)
-        send_27_02 = [0x06, 0x27, 0x02, key1, key2, key3, key4, 0x00]
-        self.diag_send(send_27_02)
-        time.sleep(1)
-        send_result = self.diag_receive(chn_index)
-        self.__log.debug(f"发送27_02的结果是：{send_result}")
+    def _diagnostic_flow_control(self, channel):
+        for frame in self._diagnostic_frames_until(channel, time.monotonic() + 3):
+            if len(frame) < 3 or frame[0] >> 4 != 3:
+                continue
+            if frame[0] == 0x31:
+                continue
+            if frame[0] != 0x30:
+                raise RuntimeError("ECU 拒绝接收配置字。")
+            st_min = frame[2]
+            if st_min <= 0x7f:
+                return frame[1], st_min / 1000
+            if 0xf1 <= st_min <= 0xf9:
+                return frame[1], (st_min - 0xf0) / 10000
+            raise RuntimeError("ECU 返回的配置字帧间隔无效。")
+        raise RuntimeError("未收到配置字流控帧。")
 
-    
-    def _diag_seng_config(self, chn_index: int, config_array: list) -> None:
-        """
-        该函数用于写入配置字
-        :param config_array: 配置字列表
-        :return:
-        """
-        if len(config_array) != 200:
-            self.__log.error(f"配置字数量有误，请检查配置字")
-            return
-        config_array += [0,0,0,0,0,0,0]
-        conf = lambda : config_array.pop(0)
-        self.diag_send([0x10, 0xCB, 0x2E, 0xF1, 0xB1]+[conf() for i in range(3)])
-        for i in range(15):
-            self.diag_send([0x21+i] + [conf() for i in range(7)])
-        for i in range(14):
-            self.diag_send([0x20+i] + [conf() for i in range(7)])
-        time.sleep(3)
-        self.diag_receive(chn_index)
-
-
-    
     def diag_seng_configs(self, chn_index: int, config_array: list) -> None:
-        """
-        该函数用于写如配置字
-        :param config_array: 配置字列表
-        :return:
-        """
-        self._require_diagnostics()
-        self.diag_send([0x02, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
-        time.sleep(1)
-        self.diag_send([0x02, 0x10, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00])
-        time.sleep(1)
-        self.diag_receive(chn_index)
-        self.diag_send([0x02, 0x27, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
-        time.sleep(1)
-        self._diag_send_key_27_02(chn_index)
-        self._diag_seng_config(chn_index, config_array)
-    
+        if len(config_array) != 200 or any(type(value) is not int or not 0 <= value <= 255
+                                           for value in config_array):
+            raise ValueError("配置字必须包含 200 个有效字节。")
+        with self._diagnostic_lock:
+            self.diag_receive(chn_index)
+            for request, expected in ((b"\x10\x01", b"\x50\x01"), (b"\x10\x03", b"\x50\x03"),
+                                      (b"\x27\x01", b"\x67\x01")):
+                self._send_diagnostic_frame(chn_index, (bytes([len(request)]) + request).ljust(8, b"\0"))
+                reply = self._diagnostic_reply(chn_index, expected)
+            if len(reply) != 6:
+                raise RuntimeError("ECU 返回的诊断种子长度无效。")
+            seed = int.from_bytes(reply[2:], "big")
+            if seed:
+                key = bytes.fromhex(self.__seed_to_key(seed))
+                self._send_diagnostic_frame(chn_index, bytes((6, 0x27, 2)) + key + b"\0")
+                self._diagnostic_reply(chn_index, b"\x67\x02")
+
+            payload = bytes(config_array)
+            self._send_diagnostic_frame(chn_index, bytes((0x10, 0xcb, 0x2e, 0xf1, 0xb1)) + payload[:3])
+            block, delay = self._diagnostic_flow_control(chn_index)
+            count = 0
+            for sequence, offset in enumerate(range(3, len(payload), 7), start=1):
+                if block and count == block:
+                    block, delay = self._diagnostic_flow_control(chn_index)
+                    count = 0
+                time.sleep(delay)
+                frame = bytes((0x20 | (sequence & 0xf),)) + payload[offset:offset + 7]
+                self._send_diagnostic_frame(chn_index, frame.ljust(8, b"\0"))
+                count += 1
+            self._diagnostic_reply(chn_index, b"\x6e\xf1\xb1")
 
     def chn_close_setup(self, channel=None, *, software_only=False):
         with self._state_lock:

@@ -12,6 +12,7 @@ from .ui_map import Device
 router = APIRouter(prefix='/api/ui/map')
 SERVER = Path(__file__).resolve().parents[1] / 'vendor/scrcpy/scrcpy-server-v3.3.4'
 VERSION = '3.3.4'
+HANDSHAKE_TIMEOUT = 15
 
 
 def touch_packet(action, x, y, width, height):
@@ -62,21 +63,27 @@ async def stream(ws: WebSocket, serial: str):
                 logs.extend(chunk)
                 del logs[:-8000]
         tasks.append(asyncio.create_task(drain_logs()))
-        for _ in range(100):
-            try:
-                video, vw = await asyncio.open_connection('127.0.0.1', int(port))
-                await asyncio.wait_for(video.readexactly(1), .3)
-                writers.append(vw)
-                break
-            except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
-                if 'vw' in locals(): vw.close()
-                if proc.returncode is not None: raise ValueError(logs.decode(errors='replace'))
-                await asyncio.sleep(.05)
-        else:
-            raise ValueError('scrcpy 视频连接超时：' + logs.decode(errors='replace')[-500:])
-        control, cw = await asyncio.open_connection('127.0.0.1', int(port)); writers.append(cw)
-        await asyncio.wait_for(video.readexactly(64), 10)
-        codec, width, height = struct.unpack('>III', await video.readexactly(12))
+        async with asyncio.timeout(HANDSHAKE_TIMEOUT):
+            for _ in range(100):
+                vw = None
+                try:
+                    video, vw = await asyncio.open_connection('127.0.0.1', int(port))
+                    writers.append(vw)
+                    await asyncio.wait_for(video.readexactly(1), .3)
+                    break
+                except (OSError, TimeoutError, asyncio.IncompleteReadError):
+                    if vw is not None:
+                        writers.remove(vw)
+                        vw.close()
+                    if proc.returncode is not None:
+                        raise ValueError(logs.decode(errors='replace'))
+                    await asyncio.sleep(.05)
+            else:
+                raise ValueError('scrcpy 视频连接超时：' + logs.decode(errors='replace')[-500:])
+            _, cw = await asyncio.open_connection('127.0.0.1', int(port))
+            writers.append(cw)
+            await video.readexactly(64)
+            codec, width, height = struct.unpack('>III', await video.readexactly(12))
         if codec != 0x68323634: raise ValueError('视频编码不是 H264')
         await ws.send_json({'ready': True, 'token': token, 'width': width, 'height': height})
         async def video_loop():
@@ -112,7 +119,8 @@ async def stream(ws: WebSocket, serial: str):
         done, _ = await asyncio.wait([video_task, input_task], return_when=asyncio.FIRST_COMPLETED)
         for task in done: task.result()
     except Exception as exc:
-        try: await ws.send_json({'error': str(exc)[:800] or '设备连接已断开'})
+        message = 'scrcpy 握手超时' if isinstance(exc, TimeoutError) else str(exc)[:800] or '设备连接已断开'
+        try: await ws.send_json({'error': message})
         except Exception: pass
     finally:
         for task in tasks: task.cancel()
@@ -121,17 +129,28 @@ async def stream(ws: WebSocket, serial: str):
             try:
                 cw.write(touch_packet(3, *touching)); await asyncio.wait_for(cw.drain(), .2)
             except Exception: pass
-        for writer in writers: writer.close()
-        if proc and proc.returncode is None:
-            proc.terminate()
-            try: await asyncio.wait_for(proc.wait(), 3)
-            except asyncio.TimeoutError: proc.kill(); await proc.wait()
-        if port:
-            try: await dev.command('forward', '--remove', f'tcp:{port}')
-            except Exception: pass
-        if 'remote' in locals():
-            try: await dev.command('shell', 'rm', '-f', remote)
-            except Exception: pass
-        lock.release()
-        try: await ws.close()
-        except Exception: pass
+        try:
+            for writer in writers:
+                writer.close()
+            if proc and proc.returncode is None:
+                try:
+                    proc.terminate()
+                    await asyncio.wait_for(proc.wait(), 3)
+                except TimeoutError:
+                    try: proc.kill()
+                    except ProcessLookupError: pass
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+        finally:
+            try:
+                if port:
+                    try: await dev.command('forward', '--remove', f'tcp:{port}')
+                    except Exception: pass
+                if 'remote' in locals():
+                    try: await dev.command('shell', 'rm', '-f', remote)
+                    except Exception: pass
+            finally:
+                lock.release()
+                try: await ws.close()
+                except Exception: pass

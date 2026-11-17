@@ -1,0 +1,219 @@
+# CODE-AUDIT-001 逐文件审计台账
+
+- .agent/PLANS.md | REVIEWED | 92cf60a64b482c04e2ce44d76e39cfb68637518285b37f3cf91fbaff898f3f48 | 与根指令、模板和校验器比对阶段、恢复、验证模式及授权排除
+- .gitignore | REVIEWED | 923e69985904d21452a1f261ca38004f621c01bd059f6f62648c918ea1ee13c6 | 核对源码与运行数据枚举边界，现有规则未忽略开发收集器写出的 .manus-logs A50
+- .gitkeep | REVIEWED | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 空文件，无运行逻辑
+- .prettierignore | REVIEWED | 22816e742d51eac0b9e746ac37ce0ba581ef90c899e2d24f4506bb312e589161 | 跳过依赖、构建及压缩资产；仅影响格式化
+- .prettierrc | REVIEWED | 087532218269eb851c22dcc3d5234ea46bfa513b494a3d7b167b1c1f48c410c5 | 核对两空格、LF、ES5 尾逗号等既有风格，未出现解析问题
+- AGENTS.md | REVIEWED | f1ac7a02a69cb327cb087536b4fc44c6c64cc2db4c5cd6aada3816508ce45eaa | 核对职责、范围、停机条件和下游规范，未发现下级 AGENTS 冲突
+- README.md | REVIEWED | 56f35e247b739bec110fb935a2494ba22120ade8ad0063c5726a2fae748cf8c4 | 核对依赖、开发与便携入口、日志/采样和历史验证；run-local 安装文案与实现不同 A05
+- UITest.md | REVIEWED | 51dc9188c471416e22a3d1934a377014e11c8afdea5e1970707e80fc1c7f2669 | 核对历史计划、限制、工具定版、阶段验收及示例；真实证据时间仅适用原快照
+- backend/.gitignore | REVIEWED | 420bd16ee5a2fb8ddb465cb596dd0ffeb40ea90cdb9231cb69ae44823ef28792 | 排除 venv、Python 缓存和运行数据，反向保留 data 桩
+- backend/Functional/Functional.py | REVIEWED | d3063de4752fad0929f55504aa71082f454000d07dd052f9aac080120224a300 | 核对旧 classmethod 设备/通道、报文发送/查值、历史诊断、记录/日志和样例入口；A32 复现诊断契约差异，外部使用者待确认
+- backend/Functional/__init__.py | REVIEWED | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 空包，无初始化副作用，公开旧程序入口位于 Functional.py，当前构建直接包含本包
+- backend/app/__init__.py | REVIEWED | 54ea163e43aaeec89d5f3b132203a1fd72b1b84e27b803fc3a5c7dd416059fad | 后端包声明仅文档字符串，无导入副作用；服务状态由 main.lifespan 装配
+- backend/app/adb.py | REVIEWED | 6faf8ff7d7dc660f27c5f203a2dd32cf9b52ca5e89bab166a26ac8027751f495 | 核对 ADB 寻址、超时/取消、设备发现、CPU/进程与内存、SF 帧/framestats/FrameTimeline、渲染摘要以及前台层选择；A38 边界与 A39 分母反例
+- backend/app/can_service.py | REVIEWED | 49fd6346e0c8c767a2e1d9f291310cb1b3aad51b840b370660d90c286b5f1fa3 | 核对 DBC、接收会话、关闭、趋势及 UI CAN 生命周期；A15/A29 的回环证据为范围调整前历史。恒润专有选项排除
+- backend/app/device_logs.py | REVIEWED | bf581c95987286eb77bb81e73568170faef49f894ef34610a82a6c1e2bd87b5a | 全文件核对路径筛选、类型循环、列表/拉取/清理、保留模式和失败出口；A17/A27 已在内存替身及临时目录复验，真实设备 shell 条件见 V05
+- backend/app/fps_probe.py | REVIEWED | 5ea6e52e2e53fd1031e5f95d95bf59cb745cdc8097fb041717f2d2dfd96387f9 | 核对 R/P/J 能力与 SF 兜底、全局基线与锁、自包含页面的设备选择与轮询；复验 A19，重叠/过期响应纳入轮询专项
+- backend/app/frame_sources.py | REVIEWED | d8ce6b42c617b3edc6d291cf5aae542d4b4b505d0131cd3e91024da7cee20819 | 核对 SDK 优先级、探测推荐、包名与可用性判定、回调和冷却；A24 文档差异保留，A26 证实前台包名切换期间跳过合法样本
+- backend/app/interaction.py | REVIEWED | ca73a7195c1ef57e69117d5c5cc0ae0534bd51a624a39c8f62dccc0d4f73cddc | 核对任务、Perfetto 配置与状态、命令超时、诊断下载和可达性；A10/A11 取消边界及 A40 Android 11 模拟器默认配置权限失败
+- backend/app/interaction.py.pre-timeout-fix.bak | REVIEWED | 67b897da6a369b5fda29dd9cfd816f5f44ff7fbb7788c5c6ee73febdb0bde07c | 与正式诊断对比确认旧超时处理，未发现运行入口使用，历史候选 A08
+- backend/app/main.py | REVIEWED | 21a8195927012799346fa095d442bd17e28b9b0f01e1bdb7248fbe546a5c4aeb | 核对管理器启动/关闭、CORS、设备会话、项目归属、导入、删除、报告及诊断入口；A25、A34、A35、A36 通过实际处理函数或 lifespan 离线复核
+- backend/app/models.py | REVIEWED | 99868d99d58dcf7322e15bc4dbcf1b4d7932326b675897ed177c0a7580256d5f | 核对设备序列号与项目 ID、时长/频率/指标的校验以及日志选项、样本/进程及单位字段；日志路径的进一步验证在 device_logs.py，项目名称以 main.py 绑定为准
+- backend/app/models.py.orig | REVIEWED | 654a32ec567cdc6a0faded5bcd5a6e6c82c911d124189b1a78fc4d86a0a3d40a | 与当前会话、内存和帧类型对比，旧 ZIP 含此备份，风险 A08/A28
+- backend/app/monitor.py | REVIEWED | 64fa9533d4e644d99f98d28576e921dc69cc3091d9ab2098c15c94ee2225a452 | 全文件核对单会话预约/启动、停止/取消、SQLite 出口、UI 日志锁、采样任务集与 CPU/内存/帧率回退；A25 由实际 stop 入口与临时库复现，A17/A26 见第四轮
+- backend/app/monkey.py | REVIEWED | df1e72399bcb8d41ed584b629cb053914776b87a0923d4cbb709c8d0405946ee | 核对参数与设备脚本、约束/租约、启动停止、日志轮转、分段、归档恢复及 API；A10、A42/A43 有证据，未在模拟器运行随机输入
+- backend/app/monkey_records.py | REVIEWED | 66f8b0caa60a93f6f5347a49e5b71a9982891f1398ee72f1d233fbb839a57165 | 核对索引状态、合并事务与重复归档、流式小时/合并 CSV、旧记录、时间权重和 PSS/占用率、报告兼容及断点 A43
+- backend/app/record_cleanup.py | REVIEWED | 25b17594fef67a23d158950628017112cd3566663434cb55c47f47bcab76e81a | 核对同父目录暂存、拒绝 symlink 及反向迁移、删除错误返回；A16 的三类调用级事务边界分别追踪
+- backend/app/report.py | REVIEWED | ca9914a75d3dd8633578ee997517ef6f22bf044235d8e7ac62bf1b7d19511434 | 核对主题和指标过滤、总览、抽稀 SVG、USS、进程/事件及导出 PNG；A02/A03/A07 及导入数据插入标记 A34
+- backend/app/storage.py | REVIEWED | 65db66b3840973182c4c0dd676a3892cadc984790d13b4c3ca961c5870081f34 | 核对 SQLite schema 和 WAL、会话聚合与回收、有界/全量查询、进程/事件/CSV、项目、兼容查找与导入；A01/A06/A20、A34/A36/A37 证据见第八轮
+- backend/app/ui_element_capture.py | REVIEWED | f940123a60b74a6d114727d50a5902ed4fed9b56e6d4f4540efd90daeb9b5a94 | 核对 CLI/PNG 返回、XPath 白名单、多条件唯一定位、密码标签处理、坐标和错误码；与 Node 调用协议在执行器批次核对
+- backend/app/ui_images.py | REVIEWED | 8fe25d643436c446e2daeaba8ce748a1890360d221de982c53c00f433b8cf21c | 核对 PNG 维度及 Pillow 校验、项目与历史兼容、同名覆盖/别名、ROI 更新、SQLite 与字节补偿；A44 复现可变图片路径
+- backend/app/ui_map.py | REVIEWED | 0e76110ce81028bf87442baddcb241d34df4751c6fadf5a2c27f3d6d5292acb0 | 核对数据迁移、唯一定位和身份、设备操作和安全锁、显式录制、路径执行、软删恢复；A47/A48 有复现，通过模拟器读取观察的证据见 Android 记录
+- backend/app/ui_navigation.py | REVIEWED | 34b9bf59cb0d4d5a949cb67fe319cb83f4e716cb9d57161673f5e33a414cb4f0 | 核对知识记录的设备键、大小上限、从 MapStore 的已观察/验证边生成唯一属性选择器；仍需与 Node 侧的缓存语义合并审视
+- backend/app/ui_stream.py | REVIEWED | 5b59f5a2e1449ace94428b4e4a7fa724f7e5f2b96c2b4358f6467465ad5cb40e | 核对本地 Origin、设备互斥、启动/转发、视频长度、触摸二进制与清理；部分握手缺截止的替身复现 A41
+- backend/app/ui_testing.py | REVIEWED | bd31b4d69a4190e870c5ed33f11bca72799bb8ebb78188dd6c2c37618da4f20b | 核对 Python 步骤契约、用例/运行/设置数据、设备与 worker、跨项目图片、清理及传输；A16/A44/A45/A46 用正常业务入口复现；恒润专有部分排除
+- backend/can_adapters/__init__.py | REVIEWED | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 空包入口，无导入副作用；使用点为设备枚举及 zlgCan 后端选取
+- backend/can_adapters/device_manager.py | REVIEWED | 576b21e293bb523b0a315bbad114ef256d7bb49e28e356a69afbd8195e9fe9a7 | 限定审阅通用响应形态和 ZLG 无可靠枚举的状态；恒润专有发现与异常分支经用户确认排除
+- backend/can_adapters/hirain.py | EXCLUDED | fb44ad800571f6b0677d3041fe5bce12ba687b4b6429dee9e10e4c7c131ca996 | 2026-11-16 用户确认整文件属于恒润 CAN 专有范围，本轮排除；历史审核保留在报告和 CAN 复现记录
+- backend/config/Example.dbc | REVIEWED | 30ed4193272c5b2d0c7f44f22d37a4c9cd41d8bf1b894e10060918d0d4bf3468 | 静态枚举 7 帧 9 信号、长度 8/12，测试示例用途；按范围未运行 CAN
+- backend/data/.gitkeep | REVIEWED | 01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b | 保留空运行目录，不包含设备记录或代码
+- backend/requirements.txt | REVIEWED | dfda2743d747f77245680aabd40921f063f66700d27cc47b9c49374c41cde9ab | 核对 FastAPI/uvicorn multipart 与 CAN 和 uiautomator 依赖用途；后端范围版本与 Windows 固定清单的构建语义不同
+- backend/tests/test_low_overhead_capture.py | REVIEWED | 271034e42802dfe2add9ea415c981f1f4816289450a131ea8b31b5d9705ed291 | 核对 /proc/stat 的 iowait/guest、两次差量与不支持时 top 回退、复用帧摘要及补拉；尚无暂态 ADB 错误解除后恢复 /proc/stat 的用例
+- backend/tests/test_monkey.py | REVIEWED | ff8044061d09d01c6dacffc9b9c45e7549c0811f17a7034f89b15d063a7fabf9 | 核对参数/命令、临时 SQLite、带替身子进程的分段、停止、恢复、空间和日志限制及跨项目分页；故障写入和恢复二次失败反例另记
+- backend/tests/test_parsers.py | REVIEWED | 2b7dc0b6e67af96b115ab7f049514ca57a310de022f83b1275f0df87517550ac | 核对 CPU/PSS、三帧源、旧帧表、OEM 缺呈现、进程合并、SDK 和前台提取。日志正则和目录名测试复制实现条件，未走实际接口；新增 A38/A39 证据另存
+- backend/tests/test_project_association.py | REVIEWED | 368228e08078c4a5de7b94221509c67de5ac33ca650c60058a35d318515eaded | 核对真实项目校验与替身启动、活跃状态拒绝删除、UI 索引失败回滚及缓存目录清理；跨项目中途清理留 A16
+- backend/tests/test_report.py | REVIEWED | 66babf39073fe2f3a6f8eb909851f68ae72e278477092a7607b8f2ecd99152ca | 核对主题、指标筛选、图表与 USS 交互、排名/事件和缺会话；A02、A34 有独立审计反例
+- backend/tests/test_storage.py | REVIEWED | 772e1f375aeb90136ced3e8374450e69605606c3a8bad0fdb555c88beee8da89 | 核对设备路径、窗口与全量、重复导入、项目和旧 schema；旧 UUID 测试没有执行注释中的目录迁移，补证 A37
+- backend/tests/test_system_memory.py | REVIEWED | b7c7b15dd2ed287b4af018da1277d2e0371d1e6021ad7e68a36536d60854a1f3 | 核对 MemAvailable 边界参数、PSS 与占用率口径、SQLite/CSV/报告、旧记录兼容、Monkey 混编和慢 PSS 隔离；使用临时路径及替身
+- backend/tests/test_ui_map.py | REVIEWED | 6d5851a2ebabb1865104743e9000e313a9d0a1c01b5e12adeb491c9b93c4d011 | 核对树不变量、回放和迁移、变化拒绝、扫码、父元素绑定/重定位与跨应用；缺少回放入口变为开关和有子页面的删除
+- backend/tests/test_ui_navigation.py | REVIEWED | 899b1a5b3cc6ad1a0ef995287999e7290cc4de7d70c6c43f3b4ded37a86cda6b | 核对学习库按设备隔离、超限更新保留、读操作不改正常地图语义；Node 回放另审
+- backend/tests/test_ui_testing.py | REVIEWED | 8ccd1fc215a34133452691dd22eeb7081acf34f211a7acea1e24acfa40a6ea78 | 核对非 CAN 步骤的 schema/IPC、密钥/取消、导出和项目/图片/历史删除；两项 CAN 回归未执行，见范围决定
+- backend/tests/zcan/test_can_bench.py | REVIEWED | 1346e87c9bcf0afdb3964b98d28c3fc9aab003f7a1614461fa18623ed15ae96d | 核对无确认拒绝访问、回环更新、JSON 的未观测字段。当前阶段仅审代码，历史回环结果保留
+- backend/tests/zcan/test_can_service_lifecycle.py | REVIEWED | 08750fc1995394498cff1c10071f202f07d5ecff13f86cce38dd35218cc80b56 | 核对模拟断线后停止任务、关闭并用新对象重开；手动 close 失败补证见 A15
+- backend/tests/zcan/test_catalog.py | REVIEWED | d7bc21d2e6f046526c531e536949262235edfec3b21331c18eecde46cdf94d7a | 核对目录过滤、DBC 无设备加载、内容摘要配置、唤醒接管、并发限制和旧 ini 兼容；证据使用临时文件及回环
+- backend/tests/zcan/test_hirain.py | EXCLUDED | 6bc62dafa5fd3ecb6c6f0c747047973df798fdc8c7a461ef5e20636f1b063b7f | 2026-11-16 用户确认整文件属于恒润 CAN 专有范围，本轮排除；历史审核保留在报告和 CAN 复现记录
+- backend/tests/zcan/test_integration.py | REVIEWED | 0ef3035c988ee358a8b74a861f06c1da5315be7587cb466df2a33d5ef7dcf6cd | 核对两通道独立、更新时间触发被接管、定量提交和两阶段复位；均为回环证据
+- backend/tests/zcan/test_macos_usb.py | REVIEWED | 0dce8a0405951a2f7112dfb043d8273274c2ce9a0330406da2dbabafb68f0320 | 核对合成 USB 包、CRC、数据分片、时间戳、连接参数和硬件槽更新、清理与未知定时状态；补充 21 帧测试仅覆盖无会话帧数上限，sleep 由替身取代
+- backend/tests/zcan/test_periodic.py | REVIEWED | fcc69c2dc19ae7d07816b969921ad4ea6e116e31f005e09d68dba449054fdf42 | 核对单调截止、更新重置、并发取消、BLF I/O 隔离和退出尾部、Windows 布局与返回码及计时有界；模型和 ctypes 对齐不是 Windows 驱动实测
+- backend/tests/zcan/test_signal_series.py | REVIEWED | 404616d8b50da372a66b71cc689ee8eefd0a2ea55a6bc7918548fd2963cee2e9 | 核对 Rx/Tx、通道、标准扩展和坏帧过滤、缩放、序号及重连接游标，合成帧不代表台架接收
+- backend/tools/can_bench.py | REVIEWED | cc6ac1f037df229cacfb44385b67dbbc902e5f7d24b14c8476e07ff0ef803b42 | 核对确认开关、ID/通道、独立监听、发送更新/截止、关闭、CSV 与时间间隔；A31 非有限时长、需要独立监听才能核对总线时间
+- backend/tools/can_discover.py | REVIEWED | e87f9de393c60f1432f87983833fdb9f8b95d5e033b0ef09e0be85d14b6e3b62 | 核对 CLI 的 backend 导入根和 JSON 输出，保留 ZLG 不能枚举的结果；恒润专有调用经用户确认排除
+- backend/zlg/FunctionRely.py | REVIEWED | aa101f38cf11c3de0f27af7ed440df6943267f5543af14e8a154f32e3d081a5d | 核对日志装饰器、广泛异常捕获与查询默认值；A14 catch-all 返回 None，调用者的具体后果继续核对 ZLG 底层
+- backend/zlg/__init__.py | REVIEWED | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 空包入口，无隐式后端初始化；查找在显式导入/连接入口
+- backend/zlg/backend.py | REVIEWED | e997931e8e20932723a454cbc4d381d314ccaff4cec0613598b7567cf320842e | 核对传输协议、四通道校验、回环有界队列、复制数据、防已关闭操作；旧注释称两通道，现行上限四通道
+- backend/zlg/logutil.py | REVIEWED | d384b192b49a144248cbfb88558bd5a9d5d282e7c8fe374ca8e3e08c05bda3a4 | 核对数据根目录、每日文件名、延迟打开和处理器关闭；此文件只设日志处理器，没有滚动上限
+- backend/zlg/macos_usb.py | REVIEWED | d7ca567097caddb879aeb04c009874136e2c729d4e4107f439825d34741bd850 | 全文件核对 Profile/接口/端点、CRC 和分包、启停、调度槽、软件节流、应答、时间戳和 USB 释放；线上只读开放标志，实物断连与独立监听留 V05
+- backend/zlg/native.py | REVIEWED | a04a42fe5817be31bccf5d7b3ee64988af1eecb08385b6ebbdc752ae35a06bd9 | 核对 Windows/64 位检查、冻结与源目录查找、DLL 目录 cookie 与原生符号类型；缺 DLL 分支用平台替身验证，实际装载留给 V04
+- backend/zlg/paths.py | REVIEWED | bc0ed913dc935251a11349a9b05be33b15910895b4d0bb52cff179518a0432ed | 核对以 backend 为默认根、ZCAN_DATA_DIR 覆盖、冻结版在应用数据目录、资源按模块位置定位；A23 非冻结 SDK 路径与启动说明存在差别
+- backend/zlg/periodic.py | REVIEWED | 2eb7d0c2287f6425e51063e3a2cbd1b21483e070b374405ed9fee96e0f93b732 | 核对单调时钟、超期跳过、更新/唤醒、发送数量、PulseSend 触发/复位/恢复与取消；进入 I/O 前释放条件锁
+- backend/zlg/tx_timing.py | REVIEWED | d4c8a042682303b63d954aa3954befeb8630f60623bffc76e05a7bff0fd758cb | 核对定长缓冲、按任务连续区间和时间统计、过期与失败计数、JSON 导出；明确主机调用与总线时间戳的边界
+- backend/zlg/ucfd_identity.py | REVIEWED | 0ae4ca4579226b9c0b8880b5d94d69932877a13b9af2b03880ee24899d64362c | 核对协议版本、设备身份字段、命令头/数据与 CRC、拒绝响应的读取顺序、长度与状态匹配；实际设备版本留 V05
+- backend/zlg/wake.py | REVIEWED | caad9e9f432b9a47bf2ea5dc6d4dda32b5c4cc2cf95f4b788945aa8e5d489c1e | 核对数值和枚举、物理范围/步长、初始值或原始零、保留既有信号、复用活跃分支和编码异常，区别普通发送默认值
+- backend/zlg/zlgcan.py | REVIEWED | 6d85852ddc84d4dc6d6ffc4d1f34290966ce0eea8c552bc0e8820e259b89d2f6 | 全文件核对 SDK ctypes 与返回码、DBC 字符与报文契约、后端选择、通道/周期/触发/脉冲、接收轮转和日志、历史监控与 ECU 路径；A14/A15/A21/A29 和 A32/A33 见报告与 CAN 替身
+- client/index.html | REVIEWED | 4bc1a27679f99d48995f3f34ff6676c7f188f7e9d02271853c874695777f3490 | 核对前端挂载和分析模板；构建日志证实无环境时分析占位无法解析
+- client/public/.gitkeep | REVIEWED | e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 | 空 public 路径占位，无运行逻辑
+- client/public/__manus__/debug-collector.js | REVIEWED | e95d3246bc3757b46286221060b7346ea59fb6a9c94aa05f5eae7e7e09877d1b | 检查控制台、UI 及 Fetch/XHR 包装与缓冲；VM 合成凭据复现 A50
+- client/src/App.tsx | REVIEWED | 432ebada403bb9702d211b26a1b163957d9f797b7b7e9d0c08244ddb9febc433 | 路由、主题、侧栏和三组状态轮询，核对根边界及 query 跳转；慢响应可重叠
+- client/src/components/CanSignalTrend.tsx | REVIEWED | 022008172e4c1539862f6df3382141d014ef460d1eda2daed39935d48fa6cc57 | 核对 ZLG 通用趋势游标、连接代际、600 点限长、停止条件及格式，未执行 CAN
+- client/src/components/DeleteRecordButton.tsx | REVIEWED | 264f9be7f33902c5d8c89e9ef6a9b02628096aab4068f204fdef35a3b31eac8f | 核对删除确认、忙态、结果回调和清理部分失败提示，与各后端路由对照
+- client/src/components/ErrorBoundary.tsx | REVIEWED | 3b0bdb7a19758fcd440138ccfb5f306b96836564f15d7c8c9663d7dd7417e972 | 捕获子树渲染异常，显示跟踪及 reload；根主题异常导致整个工作台兜底 A51
+- client/src/components/InteractionDiagnostic.tsx | REVIEWED | eaea657daab754db8ad42da8ba15aa201463b1b617200ea1389022e810b3608b | 核对真实操作录制请求、状态轮询和 trace 下载，与 A40 模拟器失败对照
+- client/src/components/ManusDialog.tsx | REVIEWED | a22b0cb5c1db5cedda6b2c70b3cb4a1a443101e03e90de188ce11156c24c25db | 模板受控/非受控登录对话框，回调由外部提供，当前产品无能到达的入口
+- client/src/components/Map.tsx | REVIEWED | 931413fea95936e68f872bc34733138f9e11a656446b1a56a98fba9532954e22 | 模板地图 script 加载、延迟初始化和缺失错误拒绝；未接入产品，无网络执行
+- client/src/components/PageMapWorkbench.tsx | REVIEWED | 3f56c1e5f1a7498212f72a24e84aebc115398cc15bd90383148c482538247a90 | 核对观察、标定、操作/检查模式、地图保存/移动/回放、区域导出和页面树，追踪 A41/A47/A48
+- client/src/components/PageStructure.tsx | REVIEWED | 1b55dfbc8f84197985cf7f995aa621d93e2ac4f4c3810ed5810a40e331bff85e | 历史结构扫描实现，核对运行请求、历史轮询、报告图，当前页面地图入口不导入它
+- client/src/components/PerformanceReportDialog.tsx | REVIEWED | 436eebcceaac2b98f1cf8235b16a57b2319ba1faf1b6770920ce8b04e4bc9b45 | 核对指标来源过滤、theme 参数、多 metrics 值和 HTML 预览/下载，和 API 参数一致
+- client/src/components/ScrcpyScreen.tsx | REVIEWED | d99a590bde6bf604760c30b762b12212e902e675f1c3d9af3f6e34d4f2830b89 | 核对 WebCodecs H264 帧、SPS、排队限制、socket 生命周期、画面与触点映射；stop 等待后端 close 的边界 A41
+- client/src/components/UiCanStepFields.tsx | REVIEWED | 5dc7f70361abad717b85004cd42ea1e267a0f456e96f2fe8c56ce45fae0ab156 | 核对共用数据目录约束、信号 raw/物理输入、通道及周期编辑，未操作 CAN
+- client/src/components/UiCaseLibrary.tsx | REVIEWED | 1474f0d53a1f48a455aa27670de7824d07e348efa4b9644aa361349ce20b2941 | 核对项目分组、选中、用例操作回调、图片/控件引用及请求取消隔离
+- client/src/components/UiDevicePreview.tsx | REVIEWED | a8c79040a90b3d52ea07e78369d7792e9632e3eb9259131a88c94679226ba856 | 核对按 serial 分实例、按需读取、缩放定位和停止投屏，启动前需等待 socket 退出
+- client/src/components/UiImageLibrary.tsx | REVIEWED | e9f31a61c2ca18d3a481055e04f7f9b8f78583ee68b2d4dee6e0b2ddbf255f6c | 核对跨项目图片引用、删除目标快照、已删但残留提示和图片路径，关联 A44
+- client/src/components/UiProjectManagement.tsx | REVIEWED | c19a055982c786c8268dcfc06057df489e871e7831272866d05e7368fcec36e2 | 核对概览按项目/请求忙态保护、资源统计和删除确认，与 A16 的部分清理结果对照
+- client/src/components/UiStepFields.tsx | REVIEWED | 2e6d12b8d3365acde2c55e044d49d17f188f54238cc36bd52468e290cac3c45a | 核对递归 If 条件字段、数字边界、基准图/ROI/结构和变量选项，与 Python/Node 契约 A13
+- client/src/components/ui/accordion.tsx | REVIEWED | 7b96cf50388ad3d07be64924ab33ba5f63b79a6a5749ebe4d31c789c0bc00d44 | Root/Item 保留 Radix 键盘语义，Trigger 组合 Header 与展开图标
+- client/src/components/ui/alert-dialog.tsx | REVIEWED | aeecd7967eb0be3bad2753b6633d9a43cc4c08cb35de872ffdc0b9f2b6a9b26c | Portal、遮罩、确认和取消复用 Radix 及按键变体，DeleteRecordButton 使用
+- client/src/components/ui/alert.tsx | REVIEWED | eccfc7f6ca9d51407cb413a3ca4b5ac721898ac93d38e95c02c35188ad674abe | 原生 role=alert，标题/描述走样式槽，变体区分默认和破坏态
+- client/src/components/ui/aspect-ratio.tsx | REVIEWED | 654f5d6e9ed17472305d7e6fc5de30453875ffae585f5d064aedc9e6945bdbb0 | 单层传播 Radix Root 参数，比例由调用方给定
+- client/src/components/ui/avatar.tsx | REVIEWED | c2382ff71d7ef3492096ed6ef35bf82e1fd421a81d55ca80453f5f5138eac360 | Root、图片和失败回退分别封装，保持 primitive 图像加载语义
+- client/src/components/ui/badge.tsx | REVIEWED | 51fd797c59e63d164ade736769f19f26e41c157daba29aa0b327b3b226f4d4ac | CVA 变体及可选 Slot，不持有业务状态
+- client/src/components/ui/breadcrumb.tsx | REVIEWED | dd84657e30691ea7f14a785c13b660d6cd626c08ba1df8439c3eca858ee3cd7e | nav、列表和当前页有可访问语义，分隔和省略图标处理 aria
+- client/src/components/ui/button-group.tsx | REVIEWED | ba1d824f0f4d8b5dd78a80fa766e3543eefb9173143652be2c7cb765af1864f5 | 组角色及水平/垂直变体，借用统一 separator
+- client/src/components/ui/button.tsx | REVIEWED | b08b4785e03566c7a6063b3d57234deae41649676870cbbb9ab2448d816e1739 | CVA variant/size 与 asChild Slot，保留原生按键调用入口
+- client/src/components/ui/calendar.tsx | REVIEWED | 89308bce82e8b23b611cfbc88bc19f7b341d7109ab9a2838c04cb50922113501 | 覆盖 DayPicker 子组件、locale 和焦点恢复，涉及日按钮及范围样式
+- client/src/components/ui/card.tsx | REVIEWED | 1397e7d264d90162220ea7473b311e434651886267c71e7f58d4488be9d8ff39 | header/action/content/footer 仅布局槽，无状态或 API
+- client/src/components/ui/carousel.tsx | REVIEWED | 42f66e6fde568c209df5d58a4ca13c3ae92d120a04fd99f7be695d6a570ef0a9 | 检查 Embla 轴、选中监听、前后按钮与键盘；清理只移除 select，当前入口不可达
+- client/src/components/ui/chart.tsx | REVIEWED | 47c4de202fe1dc229af94d2c86197251d279bee131d2a6fb75ab9e58cec71aab | 检查 Recharts 容器、配色和 tooltip，样式插值须依赖可信配置，当前入口不可达
+- client/src/components/ui/checkbox.tsx | REVIEWED | 4fc309590e66d3c41e3be5fb73f988b0e916e7bf5fff321c22c3a64cd4fe97cf | Radix 复选框及指示图标，状态由 primitive 传播
+- client/src/components/ui/collapsible.tsx | REVIEWED | 95b5b9ea89a4105045c58b7eba539e57a1f4abc5a54d43ea0f7168f46b645eeb | 三个 Radix 组件的透传封装，无额外状态
+- client/src/components/ui/command.tsx | REVIEWED | 47910540789d4de9e890de63bfc0046f9cf6bfaa86d496a98c79622900f8520c | 对话框内适配 cmdk、搜索框、列表/空态和选项，保留键盘导航
+- client/src/components/ui/context-menu.tsx | REVIEWED | fe63c0a0dcabe749874ad19e07dee8418337c62dd64452fc08b5abf27b49b9eb | Radix 子菜单层及 radio/checkbox 选中指示，Portal/Trigger 分工
+- client/src/components/ui/dialog.tsx | REVIEWED | 3ffd83bd2940c1191fde091bc47311aebc2b79d78824965a5c446115e58190aa | Radix dialog 与中文输入法状态，核对 Escape 拦截和延迟窗口
+- client/src/components/ui/drawer.tsx | REVIEWED | 573deecc31f90fcd96f53a37b2e5363eb326fe737cbdb28cac38a5d014734fc8 | Vaul 移动抽屉，方向、遮罩和标题分层，无业务状态
+- client/src/components/ui/dropdown-menu.tsx | REVIEWED | ede99252b737a29eb1f05370956e2b842be161b6a661f1429155ac561653d029 | Radix portal 和层级菜单，核对 disabled、radio 和 SubTrigger 包装
+- client/src/components/ui/empty.tsx | REVIEWED | c0b612929b15fd498b984d8d98d1b082a3eb294be5aa8eb9cb53b67cf152f465 | 描述、内容、媒体和标题各布局槽，媒体样式由 CVA
+- client/src/components/ui/field.tsx | REVIEWED | f093424ca5eadf43d46b020ed780aee7aa5f6d90d0b48fb50c031e3d7b0528c7 | 检查字段集、横纵布局、描述与聚合错误分支
+- client/src/components/ui/form.tsx | REVIEWED | 0157362d572713567d989b726277879e75c60c24684ade4aef854867dc2fac48 | React Hook Form 上下文派生字段 ID，连接 aria-describedby 和错误消息
+- client/src/components/ui/hover-card.tsx | REVIEWED | bdfe831708e7de6b9fbb14d8fe5af5a0985f67cff3c2b5755b4b570c3b4e7ad5 | Radix anchor、Portal 和偏移，显示状态委托组件库
+- client/src/components/ui/input-group.tsx | REVIEWED | f62f2be2ad4c2c7711e7b25b0d6c03572f7871cb4022e9f4f6860dcd77dd9e57 | 附加区点击聚焦组内 input，复用 Input/Textarea/Button
+- client/src/components/ui/input-otp.tsx | REVIEWED | 45fc7fed882aa5024d8eea52d9b392d13b1d80f2b7f846365bc2586e3d16253d | OTP 库上下文按索引取 slot，空 slot 有兜底和伪光标
+- client/src/components/ui/input.tsx | REVIEWED | 0aaad971269e84519fb14928a70777db539b4cacf9f145fecd905ba483a199c6 | 透传原生 input 并衔接 Dialog 输入法状态，与 Textarea 行为重复
+- client/src/components/ui/item.tsx | REVIEWED | 89f2ed48c2270064d63e0a40f755c1da14e99e7db46bceac56d6dee7b45b8798 | Slot 与项目媒体、分隔、动作槽，无应用状态
+- client/src/components/ui/kbd.tsx | REVIEWED | 4f8f3e521b2b007643b8a2c8f86cf547bd87e703dc2bed067083ca48f901d6ad | 使用 kbd 标签表示按键及组合，纯布局
+- client/src/components/ui/label.tsx | REVIEWED | 7fdad17d8e83912ad0cfc372c551a901ab98523ef17c0792a17c592a147db732 | 保留 Radix label 及 disabled 样式，表单辅助组件使用
+- client/src/components/ui/menubar.tsx | REVIEWED | 53fb1c058fabaf0cfb3fb2cfdb9b17ccc8762376d62cc011150d919209b82c1a | Radix 菜单栏、分组、快捷键与多层项是菜单模板
+- client/src/components/ui/navigation-menu.tsx | REVIEWED | aafccbe2b05d9f80b7d007301b51aaede4692efc468304c5fb11b21cd0c0ef43 | Radix 导航菜单、可选 viewport、触发器与 indicator
+- client/src/components/ui/pagination.tsx | REVIEWED | 8f0d822b4688eb131e37fbf2330e19b269ab6487583be3249b98f3b68bb07928 | 导航、当前页、前后页和省略组件，跳转由调用方提供
+- client/src/components/ui/popover.tsx | REVIEWED | 5e7bec05904d9091a7b53963f5b49660bf3564b02a057ef8640ab6855d6e32fd | Radix portal 层与默认位置，用户侧用来包裹弹出字段
+- client/src/components/ui/progress.tsx | REVIEWED | 2297e3c13d5b2a04a9164c3900c8cae2e477c07ebed35c4bbda98d1232ab7b7e | 传 value 给指示条计算但未传 Radix Root，进度可访问性缺口，当前入口不可达
+- client/src/components/ui/radio-group.tsx | REVIEWED | 025f03d81d4e304eb27d94e6517f37072a3941df8f8603ac55cfb42b17cd99ef | 保留 Radix 组联动与选定指示，无业务逻辑
+- client/src/components/ui/resizable.tsx | REVIEWED | 52e1027a4b4a5f70f0479f69fe40046dfa112952b7e568292727e1618348ee80 | PanelGroup、Panel 和 ResizeHandle，按方向切换手柄布局
+- client/src/components/ui/scroll-area.tsx | REVIEWED | 793c5d69e6e5ce8bcbe453b8834d53f3a90839fc8e8e1f9fe5f77e7626566677 | Viewport、Scrollbar/Thumb、Corner 分层，滚动交给 primitive
+- client/src/components/ui/select.tsx | REVIEWED | 40945665ec8363e55ae38f26115ee763cbc5548bed585eed569d406cbc4b7a75 | Radix 触发器、列表项、上下滚动和选中值；业务页存在原生 select
+- client/src/components/ui/separator.tsx | REVIEWED | 23bbf3f74d01f55533f6f22ebbc2b299137421e07896cb7af21245756a10c27e | Radix 方向及 decorative 参数透传，检查组内使用
+- client/src/components/ui/sheet.tsx | REVIEWED | ab22e38f2cf312a31a84fb91f7e912f0da66e809f6e1ae675ec6cf0c8ec0ba61 | 复用 Radix dialog 定义四向覆盖布局，通用 Sidebar 引用
+- client/src/components/ui/sidebar.tsx | REVIEWED | 782ec3ba8a570c9a0f6ec12d7e1c1efdee5e02eb2da7aa46131c734e7f7bbea8 | 替代侧栏模板，检查受控状态、快捷键清理、cookie 写入与移动抽屉，实际 App 用 WorkspaceNav
+- client/src/components/ui/skeleton.tsx | REVIEWED | 1f75b999a5ad2f65e8fb807faa2b3fccef9eb333996fb4c9030575dac7393091 | 仅占位块动画，通用 Sidebar 使用
+- client/src/components/ui/slider.tsx | REVIEWED | 9c458646597836916678a9bce2f3064d4d5cdb0c65d32d92bc71f57d7569fb6b | 核对受控值数组与 thumb 数量、轨道和方向，Home 状态边界
+- client/src/components/ui/sonner.tsx | REVIEWED | ff0719b6cfe71113bfa7cdd13f4e55611ab7fc60283566d69b867e8952d1c21b | 跟随仓库 ThemeProvider 的通知容器，App 初始化
+- client/src/components/ui/spinner.tsx | REVIEWED | ecd836d476573adb4403747c3457339276805433c20eacf3408303b76ec283ff | 状态角色与屏阅读标签，当前入口不可达
+- client/src/components/ui/switch.tsx | REVIEWED | 688cccb52220e05f6770fb5e8296375f2a784bcf6585eb26a721a9f29361ab60 | Radix 开关、焦点和轨道动画，状态由调用方/primitive
+- client/src/components/ui/table.tsx | REVIEWED | 085566291cf03c9fea590aa9b77339feebf04cf8ce23494a3667f84bf4811e29 | 真实 table/thead/tbody/caption 包装并提供溢出容器
+- client/src/components/ui/tabs.tsx | REVIEWED | 394b62295cee5185e858bcabfafcd5a7287910944c962fbd9c1c06444b22cedb | Tabs 四个 primitive 的样式包装，实际导航用查询参数
+- client/src/components/ui/textarea.tsx | REVIEWED | ffbad961ec02f9ca23f4157daa1a4139960c4477a245c216a793b4692dec142c | 复用输入法 hook 并允许 Shift+Enter，检查上下文计时与 Input 重复
+- client/src/components/ui/toggle-group.tsx | REVIEWED | 92e7640e30c4ae3ffd775e9a3d845327c26d9ce0f9f39555c2e7cfc2c8671c4d | Radix 多选/单选组传递 CVA 大小及风格，组件上下文兜底
+- client/src/components/ui/toggle.tsx | REVIEWED | a922c5e0534b9fd556ff8a8b56e25f7d24544be6050472cdd1ea003b8a0f3e47 | Radix Toggle 及 CVA 角色，供 toggle-group 复用
+- client/src/components/ui/tooltip.tsx | REVIEWED | 6f0c581e2018d676e43c0b4b5aeb62d3fe68e65907cf748548208d75ac212677 | Provider、默认延迟、Portal 定位与 arrow，App 在路由外注册
+- client/src/const.ts | REVIEWED | 65400a775381cec4ae19f68373550f1318fb45970313ad91e91a1adc42b0bacc | OAuth 模板常量与回调构造无当前路由消费者，不能视为产品登录
+- client/src/contexts/ThemeContext.tsx | REVIEWED | b9fce740136ea04547e825272ac2fd32fecdddd3421538ebb0449e12cad8bec7 | 根主题与 document class/本地持久化，复现存储拒绝使根渲染异常 A51
+- client/src/hooks/useComposition.ts | REVIEWED | 674c515075a2f318d4ec2291313ba552488de0b2c1aac7f36f3d71c4e34d434e | IME 跨回调计时和 Escape/Enter 传播，核对 Input/Textarea 共享
+- client/src/hooks/useMobile.tsx | REVIEWED | 464e778a9da49481e3c6dac4f92ff589e01349b33063a74c45435cfeed81e1c0 | 监听 768px media query 及卸载移除，只有不可达通用侧栏使用
+- client/src/hooks/usePersistFn.ts | REVIEWED | 60cc14f39a3f8b212d7baf4beeaf35f81e09a7c78e4154bcca3477e010879511 | ref 保持回调引用并更新逻辑，支持原始 this/参数，供 IME 使用
+- client/src/index.css | REVIEWED | 5cb52a87ebdb2024f239b681fb327257391e890905b827cdc7360ec848796516 | 核对 Tailwind token、浅色覆盖、reduced-motion 与重布局，隔离生产 CSS 构建通过
+- client/src/lib/backend.ts | REVIEWED | ab9a614e780c9d9438d25270d99e156df352b1ab0237e37e0d2376cf7b0e10d4 | 核对 same-origin 便携端、环境地址和默认 8090 对应启动路径
+- client/src/lib/canCatalog.ts | REVIEWED | 0647620b3a9c52142937781437cf5b476c22b1d9055d3b260406b58da4215611 | 通用/ZLG 消息与信号类型，和读取/编辑数据形状对照，类型限定导入
+- client/src/lib/canNavigation.ts | REVIEWED | 4a924c0daa4912c79c76fa348c7ed467abd98a2bc86dacfebdc26713bc54d947 | 通用 CAN 标签和 query 白名单 fallback，保留现有路径；仅代码审查
+- client/src/lib/uiImages.ts | REVIEWED | 0d82f90234f938b373f57da118f4aad718a91991a005656f798b7335d8ff8984 | 检查项目默认值、图片类型、路径拼接和 ID 转义
+- client/src/lib/uiNavigation.ts | REVIEWED | f79f357578b0ae72747bde094d62896fb55414fa44dbd6d68cfa6bbd80a0a158 | 核对 UI query 白名单、默认 execute 和侧栏链接
+- client/src/lib/uiObservation.ts | REVIEWED | ed445ea93673e02f83ecee23d9a6d1b0a59d954b753e877fdc376ed62f4b784b | 屏幕到物理像素转换、坐标裁剪和最小 bbox 命中，供地图/截图选择
+- client/src/lib/uiSteps.ts | REVIEWED | 0c9c805743c71196af891129d634f141590c58a20022d1b7f1275319b725ec06 | 核对语义分类、树布局、移动同级及分支边界、旧 Else 迁移和默认配置
+- client/src/lib/utils.ts | REVIEWED | d1f1e0d62cb8d8d1e04c26e14de842d8a151f75812d81b046c65b5d1fe8e4b27 | 组合 clsx 和 tailwind-merge，验证 UI 样式入口一致
+- client/src/lib/workspaceProjects.ts | REVIEWED | f1270e6660c74dada67b11de0d054ebafa09a3fa26841bb3bc8ed4d750c39c50 | 项目选择 localStorage/事件、项目列表加载与取消；按照调用方核对默认回退
+- client/src/main.tsx | REVIEWED | 29946f51942fba11605c7595fd82b50b0d7e50148e0194fd356dacbc958f18ec | createRoot 挂载与 CSS 导入，index.html 静态挂载 id 对应
+- client/src/pages/CanBus.tsx | REVIEWED | f6e4b744f8581658a946b56376f937fda92f53c87d208a5c67b5e3c0dd4a6dd4 | 静态审阅 ZLG/通用打开与发送、唤醒、帧、任务、录制和路径编辑；未执行 CAN，恒润专块排除
+- client/src/pages/Home.tsx | REVIEWED | e3571c3ef527ce70a97e562b519505d6310f35703004ee622aed78c339f43d99 | 核对设备、采集设置、项目/历史、实时图表和导出，模拟延迟响应复现 A52
+- client/src/pages/MonkeyTesting.tsx | REVIEWED | 55ff10b24402330cd81d8612e153fad6d89cec1214013ecfd88d98a307c4801a | 核对项目、设备、草稿、受限配置、防重入和归档结果及下载，追踪 A42/A43
+- client/src/pages/NotFound.tsx | REVIEWED | 62707e991d7d9ec7c3a04c32b7404360419cd15c723f1d07fe088bf997b0d060 | 兜底路由、提示和回首页，核对 wouter 导航
+- client/src/pages/UITesting.tsx | REVIEWED | 30869b680f36c4ac974d2ee901d7bb287328af0d5212f24932e332d019ef7523 | 核对用例编辑、树拖动、项目/图片、启动取消、投屏、事件/指标和清理，验证 UI 变量可见性问题 A13
+- components.json | REVIEWED | 8be0e54515838be398164884e96319b52bcfcbd52b2e63171d51df4131cfcb03 | 核对 shadcn 初始化别名和样式入口，与 TS 路径及组件目录一致
+- docs/ARCHITECTURE.md | REVIEWED | dfc291e164fc4b079268428bc8a89c5755197146a8e834cf5046ba6d52de42ae | 对照 FastAPI、监测、ADB、SQLite 与会话 API；保留架构历史及当前 UI/CAN/Monkey 扩展边界
+- docs/CODE_AUDIT_FILE_INDEX.md | REVIEWED | b8742b98524025432b0323ef73f382da1e593d41005f33c46f8a1e6e990457d7 | 校验初始文件行 214 条均唯一且现存，与当前独立枚举和台账的边界区分
+- docs/CODE_AUDIT_REPORT.md | REVIEWED | b4d496624492398c89271b14634462fbc2f69d6868d4c3a38239845620000ae0 | 核对历史记录、现行范围、50 项分级、专项结论和四项已验证证据；原生 Windows 独立待验
+- docs/CODE_AUDIT_SYMBOL_INDEX.md | REVIEWED | 90292fc434d829910ecf99f0f475ae20ccc63f55343375d4b6b68ffbce1f2b42 | 校验 174 个唯一源码条目均在原文件索引，记录顶层自动化索引的局限
+- docs/LIMITATIONS.md | REVIEWED | c6451df49b5691a43839ca896abf9eb66a37865caf3a64f644495ff7c584983b | 对照已落地冷却、报告和指标，以及 OEM/触屏能力边界，确认 A24 文档滞后
+- docs/UI-MAP-WORKBENCH.md | REVIEWED | b9656fd9c93081386844b2cdf9dbd5aca976b8264e2c6210ad9802901d44c06d | 核对单次入口、证据、迁移、scrcpy 和模拟器历史；删除后应用可见兜底与结构引用 A48 分开
+- docs/UI-NAVIGATION-DESIGN.md | REVIEWED | 6c266e516588d9aa537cf2846a43a2d31c6b0b1af118d0498caaf7b7d3f55383 | 对照已经实现的人工树、入口和回放，区分多入口/多屏/适配及系统键的设计约束
+- docs/ZCAN-INTEGRATION.md | REVIEWED | 5c84164888234473a9ca566cc8281d5914567c0dece696160846ee08037158cf | 核对回环/原生 SDK 和历史 macOS USB、BLF 记录的证据等级；2026-11-16 用户限定本轮 ZLG 只审代码
+- docs/can-hirain-investigation.md | EXCLUDED | b3764486d42af89027648421f36457e38a24463b1e2058ec8c0a80f94096d7d4 | 2026-11-16 用户确认整文件属于恒润 CAN 专有范围，本轮排除；历史审核保留在报告和 CAN 复现记录
+- package.json | REVIEWED | 391028cdaba93af22e08fb3f6e852521089ec395d384888735d142b8ed164330 | 核对 React/Vite/Express/pnpm 依赖和检查入口；本机 pnpm 的旧字段警告已登记
+- patches/wouter@3.7.1.patch | REVIEWED | 4e16e6ff3fde7d6c1024d3e0c8605dc9eb6afb690d0d49958c2f449091813072 | 确认扩展 Switch 暴露路由集合；首方业务无静态消费者，外部 Manus 待确认
+- pnpm-lock.yaml | REVIEWED | a4190b27f57edc05941a2f75982789b76c4402c38ccd7c6842b0650fad7ca296 | 锁格式 9，核对 importer、override、patchedDependencies 与实际 pnpm 警告
+- resources/BAIC_3.0平台_IBUS_ICC_CANFD_V1.23_20260430.dbc | REVIEWED | 9192a20bbcd55384dadd3997b38fa2dcda3fc1e21210eb7e05c9f815eb502bb9 | 静态枚举 GB18030 数据，135 个唯一帧 ID、1872 信号、长度 8–64；与加载回退对照，不执行 CAN
+- run-local.sh | REVIEWED | de322796ab54a43b0f87ddfebfdc9f744c1f2cb11159393ce4409d7c16ff4cdd | 全文件核对 ADB 预检、venv 建立、前后端端口同步与 trap；A05 的 uvicorn 依赖已注释且异步启动未验证，失败可误报成功
+- scripts/test_verify_tasks.py | REVIEWED | 5e46ebb9c3c51a080c3d393dffab76b4bd890b0c0e9697648fec7914ebc06199 | 检查临时 Git fixture、失效摘要、未经声明排除及状态反例，16 项通过
+- scripts/verify_tasks.py | REVIEWED | fb0b7058a9ef4f23a68296683aa1fdb9e20610d38f6645bf2b5909f17d56994a | 检查独立枚举、摘要及完成约束；证据字段语法校验保留人工真实性边界
+- server/index.ts | REVIEWED | 1173c62861b9c60b2a3f55fd4189917813cdaa16f1eff6fc2f860a0e020db215 | 核对生产/开发静态根和 SPA fallback；与 FastAPI 路由及便携启动分别核查
+- shared/const.ts | REVIEWED | cc8cc322a6549244df90260eb5ec4472c13fb82357b0a2b1002935ea34d2985e | 原模板会话键和期限，经客户端常量导出，业务入口无引用
+- template.json | REVIEWED | dcecb0d5f954163e6a7e35f47eeedaee4a3adb36daa00434b760775e8721b5dd | 比较内嵌 6 文件，5 个不同，当前脚本和构建未读取，属模板候选
+- tools/monkey/android_system_blacklist.txt | REVIEWED | 33e525cde751ee1fcaf0d7dc388e8867b94d845e6170ef3151aeb5b7f43075e1 | 核对默认名单加载和包名过滤，样本涉及系统、Car 服务、网络、内容提供程序及 WebView；黑名单按已知包枚举，不等同于任意车机的隔离边界
+- tools/setup-scrcpy.sh | REVIEWED | d7aaa04d4e785c0cfe1dcc5277210923acf38de0d638fa051add541d45b3136f | 核对固定版本、下载、哈希及临时路径；bash -n 和本地 vendor SHA 均通过
+- tools/ui-test/.env.example | REVIEWED | e524c1b6fcc0530eea65eb8f71086d6a27d9a12f4946f6b9f9cf12f37ae3711d | 模型配置示例仅含占位键和可覆盖地址，配置边界与 config 对照
+- tools/ui-test/config.mjs | REVIEWED | 56ad188302f3fd6e7598115369401f19f59a6675ccfe755e5695508225209325 | 模型配置加载与公开字段核对，公开值以布尔标志反映密钥存在
+- tools/ui-test/doctor.mjs | REVIEWED | 4695bb2c59121f3d925d60dd3ac517f0ee92e20b446e9df2893d64eb09b9b706 | 检查运行时、SDK 解析、ADB 及密钥；成功代表可用性探测，不等同模型请求成功
+- tools/ui-test/element-capture.mjs | REVIEWED | 60b223999f468f223303725e62cf55403bfab823c33ea46dfe32ce4a38a78fee | 子进程参数、输出缓冲和失败状态核对，与 Python 元素裁切边界对照
+- tools/ui-test/explore.mjs | REVIEWED | ff8c6d9b5d071235099b590d12f17ef75326bfc733c5202a2ca5df942a72ee31 | 检查动作、深度与包范围及恢复链，复现点击后首次树读取异常遗漏返程 A49
+- tools/ui-test/explore.test.mjs | REVIEWED | cb450b885465fb3d23f4663ed2f931e4bea1ba2c7cb9def5a0e092d612d2e440 | 核对 DFS、预算、返程和开关复位替身，缺点击后观察异常反例 A49
+- tools/ui-test/framework.mjs | REVIEWED | 82fd2891a1159412ac63361b53a4c14bfa69087781116aade192e3c0ce74153f | 检查顺序、条件、循环索引与失败策略；循环乘积仍受 runner 总时限
+- tools/ui-test/framework.test.mjs | REVIEWED | fb82a6fb60cd1c00c89f3d238ab004b1a7f07f19e1e01af829fe87854e66b188 | 核对跳过、If/Else、循环索引、条件错误和缺乏断言；未覆盖仅存在于未执行分支的变量
+- tools/ui-test/hierarchy.mjs | REVIEWED | 7c92c6283857e54c0a466d722ca13a7cb943aacfd36e7507dbf94bd8e6dbb922 | 核对 XML、控件定位、密码脱敏和稳定读取，身份及操作风险 A12/A47
+- tools/ui-test/hierarchy.test.mjs | REVIEWED | 7d48a1b1b4d6bc111c32ca2170a207b07ee9137c155080cccfb1157e0956f049 | 核对密码脱敏、歧义和 XML 反例；没有模拟两次读取间界面语义变化
+- tools/ui-test/image-assertion.mjs | REVIEWED | a2a3eac2e84d8b9c4348c036b22a3681787dfec77a0eb936ada0527a9a0d46b8 | 核对像素阈值、颜色、全屏搜索与 ROI；同步匹配时限风险 A22
+- tools/ui-test/inspect-tree.mjs | REVIEWED | 3939cd4d811f623ea46713513620cd7eea43796488ea6070730aea652d2f847a | 前台工具校验序列号并用 JSON/stdout 报告树，捕获设备错误并退出 1
+- tools/ui-test/live-check.mjs | REVIEWED | 58a2a0f01b663889b3a81750efd8e74115c18042aa872fb9e9ed27b4281493fa | 核对本机 API 地址约束、示例写入、轮询、终态预期和记录副作用；本轮不运行此入口
+- tools/ui-test/navigation.mjs | REVIEWED | 63ec5c43eb7639dc165f9ff6aea11266145638c9bccfa75876dd2aaf1e5484ac | 核对最短路、种子、观察、陈旧路径和回退，最终点击回调只核页面身份 A47 同类风险
+- tools/ui-test/navigation.test.mjs | REVIEWED | 37e576c131c8f3f6cadba462c3ddad8427565049fd62fb26559e7bed39359945 | 核对导航命中、误落点、异常不可重试、种子与已安装 SDK Tap mock
+- tools/ui-test/package-lock.json | REVIEWED | 53344ca7b300c7a4bcbb40053f5556d92bd6501454f05c06f39f52e7dea111a7 | 锁版本 3，清单首层依赖与引擎一致，457 条冻结记录均含 integrity、npm registry 来源
+- tools/ui-test/package.json | REVIEWED | 5eea396afc3a1a174d8596c42fa2359192fde5b0edeb503c1b881a2ca69165c8 | 核对 Node 22+、生产依赖和 doctor、测试、执行入口
+- tools/ui-test/protocol.mjs | REVIEWED | fbcebe500a2d70fcdfb712893d9978f99b20397bb912da59a5a8299822f3d0b8 | 核对输入、控制流及图像校验；与 Python 共存未赋值分支漏洞 A13
+- tools/ui-test/protocol.test.mjs | REVIEWED | fb504c5a30944a7545b2498909b94b7ef89372bad008088316f3859fa48f4940 | 核对字段、超时、截图与穷举匹配对照；跨语言分支变量验证缺口 A13
+- tools/ui-test/runner.mjs | REVIEWED | 6f63dd9b095747e2248d04953b8c4fc030567d582cff80a40dc0880656e68cf6 | 核对 JSONL、总时限、退出、SDK 生命周期、敏感输出以及赋值路径，实跑 A13
+- tools/windows/Start.cmd | REVIEWED | f4c6a1046e94629beb456796e3a70435321ac7436b209c38483288b61d22d104 | 核对完整解压预检、带引号的内嵌 Python 和 launcher 路径、参数转发、错误退出码及暂停；V04 核验实际 Windows 命令行为
+- tools/windows/build.py | REVIEWED | aede10b9046b222782eaded6bb0e50f24128d942ed39af0c8d79c474db0bbed0 | 核对摘要下载、路径受限解包、源目录复制、Windows 原生依赖选择、PE 机器类型、清单与 ZIP 输出；A18/A23/A28 和 A08 的实际发布清单见第五轮
+- tools/windows/launcher.py | REVIEWED | 15cfb21203b7a0dba39020b654c11962d37c579f09272b8cbef187282e76596e | 核对跨平台文件锁、回环端口、根目录实例标识、路由路径约束、自检条件、环境设置和关闭；旧 ZIP 的相同 launcher 已执行 macOS smoke，V04 保留 Windows 路径
+- tools/windows/requirements.txt | REVIEWED | 85625e4559c66d6d38c31236aba1e0fd597ee8e37abf0b291832b6248a936775 | 核对 CPython 3.12 Windows x64 安装边界、FastAPI 与 I/O 直接依赖、CAN 和 uiautomator2；仍有传递依赖由 pip 解析，包含包与驱动要分别验证
+- tools/windows/smoke.py | REVIEWED | e874034850b81aeab309ea3bc47545ca8eb718feec487bb439dc90ddd79f449f | 核对 ZIP CRC、中文路径、端口占用、同源页面/接口、404、重复启动与退出证据；缺少当前适配发现和 SDK 覆盖，A18/A23
+- tools/windows/使用说明.txt | REVIEWED | 66db4e11f2660cb818c8ba1cbe9bad21327db24a2db6b4b08c06fe77a78a8a26 | 核对端口、单实例、迁移的数据目录、离线与 AI 联网差异、自检范围、Windows x64 和 ADB 授权；未说明 A23 的 ZLG SDK 路径
+- tsconfig.json | REVIEWED | 4bea0e0003e3c943f455346abc4854d1666d604adbaa6aa8eda11f94fb8f1396 | 核对路径映射、编译包含集和增量缓存；主 tsc 检查通过
+- tsconfig.node.json | REVIEWED | 1a270cb8020d1fa879262423b9c222fa38d94b830ec61164a46b558ea9d2a526 | 核对仅覆盖 Vite 配置的独立严格设置，根 pnpm check 使用主 tsconfig
+- vite.config.ts | REVIEWED | 2ad9e7df2928221e116c2e5348afc368b5e22c606caef5b6670a54d8d1b4f5e4 | 核对构建、主机和日志/存储插件；开发与普通生产的日志/资源路径不同，见 A50

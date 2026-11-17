@@ -7,6 +7,7 @@ import json
 import re
 import sqlite3
 import struct
+import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
@@ -18,21 +19,47 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix='/api/ui/map', tags=['page-map'])
+MULTI_WINDOW = 'uiautomator2'
+ACTIVE_WINDOW = 'adb'
+SCREENSHOT_ONLY = 'screenshot'
+SYSTEM_PACKAGES = {'android', 'com.android.systemui'}
 
 
 def uid():
     return uuid.uuid4().hex
 
 
+def label_tree_nodes(nodes):
+    """Label extraction shared with the Node hierarchy contract."""
+    labels = [''] * len(nodes)
+    for node in reversed(nodes):
+        if node.get('password') or node['resourceId'].rsplit('/', 1)[-1].lower() in ('summary', 'widget_summary'):
+            continue
+        labels[node['index']] = node['text'] or node['description'] or next(
+            (labels[i] for i in node['children'] if labels[i]), ''
+        )
+    for node, label in zip(nodes, labels):
+        if node['checkable'] and not node.get('password') and not label:
+            parent = node['parent']
+            for _ in range(3):
+                if parent is None:
+                    break
+                label = labels[parent]
+                if label:
+                    break
+                parent = nodes[parent]['parent']
+        node['label'] = label
+
+
 def parse_tree(xml: str):
-    if len(xml) > 8_000_000 or '<!DOCTYPE' in xml or '<!ENTITY' in xml:
+    if len(xml.encode()) > 8_000_000 or '<!DOCTYPE' in xml or '<!ENTITY' in xml:
         raise ValueError('XML 超限或包含不支持的定义')
     root = ET.fromstring(xml)
     if root.tag != 'hierarchy':
         raise ValueError('不是 Android hierarchy')
     nodes = []
     def visit(raw, parent, path, depth):
-        if depth > 80 or len(nodes) > 5000:
+        if depth > 80 or len(nodes) >= 5000:
             raise ValueError('控件树过深或过大')
         a = raw.attrib
         bounds = re.fullmatch(r'\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]', a.get('bounds', ''))
@@ -43,21 +70,57 @@ def parse_tree(xml: str):
                  bounds=list(map(int, bounds.groups())) if bounds else None,
                  clickable=a.get('clickable') == 'true', enabled=a.get('enabled') == 'true',
                  checkable=a.get('checkable') == 'true', checked=a.get('checked') == 'true',
-                 scrollable=a.get('scrollable') == 'true', selected=a.get('selected') == 'true', children=[])
+                 scrollable=a.get('scrollable') == 'true', selected=a.get('selected') == 'true',
+                 password=a.get('password') == 'true', children=[])
         nodes.append(n)
         for i, child in enumerate(raw.findall('node')):
             n['children'].append(visit(child, n['index'], f'{path}/node[{i+1}]', depth+1))
-        n['label'] = n['text'] or n['description'] or next((nodes[i]['label'] for i in n['children'] if nodes[i]['label']), '')
         return n['index']
     for i, raw in enumerate(root.findall('node')):
         visit(raw, None, f'/hierarchy/node[{i+1}]', 0)
+    label_tree_nodes(nodes)
+    geometry = hashlib.sha256(json.dumps([(n['bounds'], n['enabled']) for n in nodes]).encode()).hexdigest()
+    result = {'nodes': nodes, 'signature': tree_signature(nodes), 'geometry': geometry, 'rotation': root.get('rotation', '0')}
+    app_root = root.get('application-root')
+    if app_root is not None:
+        roots = [n['index'] for n in nodes if n['parent'] is None]
+        ordinal = int(app_root) if app_root.isdecimal() else -1
+        result['applicationRoot'] = roots[ordinal] if 0 <= ordinal < len(roots) else None
+    return result
+
+
+def tree_signature(nodes):
     # Exact conservative signature: dynamic text may produce a new candidate, never guessed identity.
-    content = nodes
     signature = hashlib.sha256(json.dumps([(n['parent'], n['package'], n['className'], n['resourceId'],
         '' if n['package'] == 'com.android.systemui' or n['resourceId'].endswith('/summary') or 'EditText' in n['className'] else n['text'],
-        '' if n['package'] == 'com.android.systemui' else n['description'], n['selected']) for n in content], ensure_ascii=False).encode()).hexdigest()
-    geometry = hashlib.sha256(json.dumps([(n['bounds'], n['enabled']) for n in nodes]).encode()).hexdigest()
-    return {'nodes': nodes, 'signature': signature, 'geometry': geometry, 'rotation': root.get('rotation', '0')}
+        '' if n['package'] == 'com.android.systemui' else n['description'], n['selected']) for n in nodes], ensure_ascii=False).encode()).hexdigest()
+    return signature
+
+
+def application_nodes(obs):
+    if obs.get('treeSource') != MULTI_WINDOW:
+        return obs['nodes']
+    roots = [n for n in obs['nodes'] if n['parent'] is None
+             and n['package'] and n['package'] not in SYSTEM_PACKAGES]
+    if 'applicationRoot' in obs:
+        roots = [n for n in roots if n['index'] == obs['applicationRoot']]
+    if len(roots) != 1:
+        return []
+    selected = []
+    indices = {}
+    for node in obs['nodes']:
+        if node['index'] == roots[0]['index'] or node['parent'] in indices:
+            indices[node['index']] = len(selected)
+            selected.append({**node, 'parent': indices.get(node['parent'])})
+    return selected
+
+
+def page_signature(obs):
+    return tree_signature(application_nodes(obs)) if obs.get('treeSource') == MULTI_WINDOW else obs['signature']
+
+
+def snapshot_key(obs):
+    return obs['signature'], obs['geometry'], obs['rotation'], obs.get('applicationRoot')
 
 
 def identity(obs):
@@ -70,28 +133,34 @@ def identity(obs):
         if re.fullmatch(r'\s*\d+(?:[.,]\d+)?\s*(?:%|MB|GB|TB|分钟|分钟前|小时|秒|seconds?|minutes?|hours?)\s*', value, re.I):
             return '<value>'
         return value
-    fields = [(n['parent'], n['package'], n['className'], n['resourceId'], text(n, 'text'), text(n, 'description'), n.get('selected', False)) for n in obs['nodes']]
+    fields = [(n['parent'], n['package'], n['className'], n['resourceId'], text(n, 'text'), text(n, 'description'), n.get('selected', False)) for n in application_nodes(obs)]
     return hashlib.sha256(json.dumps(fields, ensure_ascii=False).encode()).hexdigest()
 
 
 def observation_package(obs):
     # Multiple application windows are ambiguous; do not guess a launch target.
-    packages = {n['package'] for n in obs['nodes'] if n['package'] and n['package'] not in ('android', 'com.android.systemui')}
+    packages = {n['package'] for n in application_nodes(obs) if n['package'] and n['package'] not in SYSTEM_PACKAGES}
     return next(iter(packages)) if len(packages) == 1 else None
 
 
 def locator(tree, node):
     def matches(fields):
         return [n for n in tree['nodes'] if all(n[k] == v for k, v in fields.items())]
-    for fields in ({'package': node['package'], 'resourceId': node['resourceId']},
-                   {k: node[k] for k in ('package', 'resourceId', 'className', 'text', 'description', 'label')}):
-        if (fields.get('resourceId') or len(fields) > 2) and len(matches(fields)) == 1:
-            return {'fields': fields, 'xpath': node['xpath'], 'strategy': 'attributes'}
-    return {'fields': {k: node[k] for k in ('package', 'resourceId', 'className', 'text', 'description', 'label')},
-            'xpath': node['xpath'], 'strategy': 'xpath', 'fragile': True}
+    source = {'treeSource': tree['treeSource']} if tree.get('treeSource') in (MULTI_WINDOW, ACTIVE_WINDOW) else {}
+    preferred = {key: node[key] for key in ('package', 'resourceId', 'className') if node[key]}
+    if not source:
+        preferred = {'package': node['package'], 'resourceId': node['resourceId']}
+    if preferred.get('resourceId') and len(matches(preferred)) == 1:
+        return {'fields': preferred, 'xpath': node['xpath'], 'strategy': 'attributes', **source}
+    fields = {k: node[k] for k in ('package', 'resourceId', 'className', 'text', 'description', 'label')}
+    if len(matches(fields)) == 1:
+        return {'fields': fields, 'xpath': node['xpath'], 'strategy': 'attributes', **source}
+    return {'fields': fields, 'xpath': node['xpath'], 'strategy': 'xpath', 'fragile': True, **source}
 
 
 def resolve(tree, loc):
+    if tree.get('treeSource', ACTIVE_WINDOW) != loc.get('treeSource', ACTIVE_WINDOW):
+        raise ValueError('控件树来源与保存的定位条件不同')
     candidates = [n for n in tree['nodes'] if all(n[k] == v for k, v in loc['fields'].items())
                   and (loc['strategy'] != 'xpath' or n['xpath'] == loc['xpath'])]
     if len(candidates) != 1:
@@ -101,6 +170,16 @@ def resolve(tree, loc):
     if not n['enabled'] or not b or b[2] <= b[0] or b[3] <= b[1]:
         raise ValueError('元素禁用或不在可操作区域')
     return n
+
+
+def is_navigation_entry(tree, node):
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if current['checkable']:
+            return False
+        pending.extend(tree['nodes'][index] for index in current['children'])
+    return node['clickable']
 
 
 def route(graph, source, target, allow_observed=False):
@@ -123,8 +202,8 @@ class Device:
     def __init__(self, serial):
         self.serial = serial
 
-    async def command(self, *args):
-        proc = await asyncio.create_subprocess_exec('adb', '-s', self.serial, *args,
+    async def run(self, *args):
+        proc = await asyncio.create_subprocess_exec(*args,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         try:
             out, err = await asyncio.wait_for(proc.communicate(), 20)
@@ -134,8 +213,20 @@ class Device:
             await proc.communicate()
             raise
         if proc.returncode:
-            raise ValueError(err.decode(errors='replace')[:500] or 'ADB 命令失败')
+            raise ValueError(err.decode(errors='replace')[:500] or '设备命令失败')
         return out
+
+    async def command(self, *args):
+        return await self.run('adb', '-s', self.serial, *args)
+
+    async def multi_window_tree(self):
+        helper = Path(__file__).with_name('ui_hierarchy_capture.py')
+        return parse_tree((await self.run(sys.executable, str(helper), self.serial)).decode())
+
+    async def active_window_tree(self):
+        helper = Path(__file__).with_name('ui_hierarchy_capture.py')
+        await self.run(sys.executable, str(helper), self.serial, '--check-active-display')
+        return await self.tree()
 
     async def tree(self):
         path = '/data/local/tmp/ui-map-' + uid() + '.xml'
@@ -150,21 +241,42 @@ class Device:
 
     async def frame(self):
         png = await self.command('exec-out', 'screencap', '-p')
+        if png.startswith(b'[Warning] Multiple displays were found'):
+            helper = Path(__file__).with_name('ui_hierarchy_capture.py')
+            png = await self.run(sys.executable, str(helper), self.serial, '--capture-default')
         if not png.startswith(b'\x89PNG\r\n\x1a\n') or len(png) < 24:
             raise ValueError('设备没有返回 PNG 截图')
         w, h = struct.unpack('>II', png[16:24])
         return {'image': 'data:image/png;base64,' + base64.b64encode(png).decode(), 'width': w, 'height': h}
 
-    async def observe(self):
+    async def observe(self, source=None):
         start = time.time()
+        read = {MULTI_WINDOW: self.multi_window_tree, ACTIVE_WINDOW: self.active_window_tree}.get(source, self.tree)
         for _ in range(2):
-            before = await self.tree()
+            before = await read()
             frame = await self.frame()
-            after = await self.tree()
-            if (before['signature'], before['geometry'], before['rotation']) == (after['signature'], after['geometry'], after['rotation']):
-                return {**after, **frame, 'identity': identity(after), 'capturedAt': time.time(), 'captureStartedAt': start,
-                        'id': uid(), 'serial': self.serial, 'displayId': 0}
+            after = await read()
+            if after['nodes'] and snapshot_key(before) == snapshot_key(after):
+                obs = self.snapshot({**after, **frame, 'treeSource': source or ACTIVE_WINDOW}, start)
+                # Existing navigation captures keep their untagged selector semantics.
+                if source is None:
+                    obs.pop('treeSource')
+                return {**obs, 'identity': identity(obs)}
         raise ValueError('截图期间布局发生变化，请等待页面稳定后刷新')
+
+    def snapshot(self, content, started):
+        return {**content, 'capturedAt': time.time(), 'captureStartedAt': started,
+                'id': uid(), 'serial': self.serial, 'displayId': 0}
+
+    async def inspect(self):
+        for source in (MULTI_WINDOW, ACTIVE_WINDOW):
+            try:
+                return await self.observe(source)
+            except (TimeoutError, ValueError, OSError, ET.ParseError):
+                continue
+        start = time.time()
+        return self.snapshot({**await self.frame(), 'nodes': [], 'treeSource': SCREENSHOT_ONLY,
+                              'signature': '', 'geometry': '', 'rotation': ''}, start)
 
     async def tap(self, node, width, height):
         x1, y1, x2, y2 = node['bounds']
@@ -213,6 +325,7 @@ class MapStore:
             self.migrate(serial, g)
         if g.get('entryVersion') != 1:
             self.migrate_entries(serial, g)
+        reconcile_page_links(g)
         return g
 
     def migrate(self, serial, g):
@@ -296,7 +409,9 @@ class MapStore:
         return json.loads(row[0])
 
     def page(self, graph, obs):
-        candidates = [p for p in graph['pages'] if p.get('identity', p['signature']) == (identity(obs) if p.get('identity') else obs['signature'])]
+        if not application_nodes(obs):
+            return None
+        candidates = [p for p in graph['pages'] if p.get('identity', p['signature']) == (identity(obs) if p.get('identity') else page_signature(obs))]
         if len(candidates) > 1:
             raise ValueError('多个页面匹配，需修复页面身份')
         return candidates[0] if candidates else None
@@ -311,7 +426,7 @@ class MapStore:
             rows = c.execute('SELECT body FROM evidence WHERE serial=? ORDER BY rowid DESC', (serial,))
             for row in rows:
                 obs = json.loads(row[0])
-                if obs['signature'] == page['signature']:
+                if page_signature(obs) == page['signature']:
                     package = observation_package(obs)
                     if package:
                         break
@@ -327,14 +442,20 @@ class MapStore:
             if not page.get("package"):
                 page["package"] = observation_package(obs)
             return page
-        label = next((n['text'] for n in obs['nodes'] if n['text'] and n['package'] != 'com.android.systemui'), '未命名页面')
-        page = {'id': uid(), 'name': label[:80], 'signature': obs['signature'], 'parentEdgeId': None, 'identity': identity(obs), 'observationId': obs['id'], 'package': observation_package(obs)}
+        label = next((n['text'] for n in application_nodes(obs) if n['text'] and n['package'] != 'com.android.systemui'), '未命名页面')
+        page = {'id': uid(), 'name': label[:80], 'signature': page_signature(obs), 'parentEdgeId': None, 'identity': identity(obs), 'observationId': obs['id'], 'package': observation_package(obs)}
+        if obs.get('treeSource') == MULTI_WINDOW:
+            page['treeSource'] = MULTI_WINDOW
         graph['pages'].append(page)
         return page
 
 
 class Serial(BaseModel):
     serial: str = Field(pattern=r'^[a-zA-Z0-9._:-]{1,128}$')
+
+
+class ObserveRequest(Serial):
+    inspectWindows: bool = False
 
 
 class ElementRequest(Serial):
@@ -403,9 +524,11 @@ async def graph(value: Serial, request: Request):
 
 
 @router.post('/observe')
-async def observe(value: Serial, request: Request):
+async def observe(value: ObserveRequest, request: Request):
     async with guard(request, value.serial):
-        obs = await Device(value.serial).observe()
+        device = Device(value.serial)
+        obs = await device.inspect() if getattr(value, 'inspectWindows', False) else await device.observe()
+        obs.setdefault('treeSource', ACTIVE_WINDOW)
         store(request).remember(obs)
         return obs
 
@@ -484,17 +607,18 @@ async def tap(value: TapRequest, request: Request):
         db = store(request); dev = Device(value.serial)
         obs = db.observation(value.serial, value.observationId)
         loc = locator(obs, get_node(obs, value.nodeIndex))
-        before = await dev.observe()
-        if identity(before) != identity(obs) or before['rotation'] != obs['rotation']:
+        source = obs.get('treeSource')
+        before = await dev.observe(source) if source else await dev.observe()
+        if (identity(before) != identity(obs) or before['rotation'] != obs['rotation']
+                or (source == MULTI_WINDOW and snapshot_key(before) != snapshot_key(obs))):
             raise ValueError('设备页面与检查快照不同，已阻止点击；请重新读取控件')
         n = resolve(before, loc)
         if not n['clickable']:
             raise ValueError('该节点不可点击，请从候选层级中选择可点击父节点')
-        descendants = list(n['children'])
-        for index in descendants:
-            descendants.extend(before['nodes'][index]['children'])
-        if value.recordNavigation and (n['checkable'] or any(before['nodes'][i]['checkable'] for i in descendants)):
+        if value.recordNavigation and not is_navigation_entry(before, n):
             raise ValueError('开关不能作为导航入口，请关闭录制后操作')
+        if value.recordNavigation and source == MULTI_WINDOW and n['package'] != observation_package(before):
+            raise ValueError('导航录制只使用当前应用的节点')
         g = db.graph(value.serial)
         db.remember(before)
         run_id = uid()
@@ -502,9 +626,10 @@ async def tap(value: TapRequest, request: Request):
             c.execute('INSERT INTO executions VALUES (?,?,?)', (run_id, value.serial, json.dumps({'state': 'outcome_unknown', 'before': before['id'], 'locator': loc})))
         await dev.tap(n, before['width'], before['height'])
         await asyncio.sleep(.3)
-        after = await dev.observe(); db.remember(after)
-        if value.recordNavigation and not n['checkable'] and not any(before['nodes'][i]['checkable'] for i in descendants):
-            if before['signature'] != after['signature']:
+        after = await dev.inspect() if source else await dev.observe()
+        db.remember(after)
+        if value.recordNavigation:
+            if application_nodes(after) and page_signature(before) != page_signature(after):
                 a = db.ensure_page(g, before); b = db.ensure_page(g, after)
                 e = next((e for e in g['edges'] if e['from'] == a['id'] and e['to'] == b['id'] and e.get('locator') == loc), None)
                 if not e:
@@ -522,6 +647,48 @@ async def tap(value: TapRequest, request: Request):
         return {'observation': after, 'graph': g, 'message': '点击已发送并刷新；页面归属和入口需在选择元素模式中显式保存。'}
 
 
+def reconcile_page_links(graph):
+    pages = {page['id']: page for page in graph['pages']}
+    edges = {edge['id']: edge for edge in graph['edges']}
+    elements = {element['id']: element for element in graph['elements']}
+    for page in pages.values():
+        edge_id = page.get('parentEdgeId')
+        entry = page.get('entry') or {}
+        parent_id = page.get('parentPageId')
+        if ((parent_id and parent_id not in pages) or
+                (edge_id and (edge_id not in edges or edges[edge_id]['to'] != page['id'])) or
+                (entry.get('sourcePageId') and entry['sourcePageId'] not in pages)):
+            page['detachedParent'] = {name: page[name] for name in (
+                'parentPageId', 'parentEdgeId', 'navigationStatus', 'entry') if name in page}
+            page.update(parentPageId=None, parentEdgeId=None, navigationStatus='missing')
+            page.pop('entry', None)
+
+    for page in pages.values():
+        link = page.get('detachedParent')
+        if not link:
+            continue
+        parent_id = link.get('parentPageId')
+        edge_id = link.get('parentEdgeId')
+        edge = edges.get(edge_id)
+        entry = link.get('entry') or {}
+        if ((parent_id and parent_id not in pages) or
+                (edge_id and (not edge or edge['to'] != page['id'] or edge['from'] not in pages)) or
+                (entry.get('sourcePageId') and entry['sourcePageId'] not in pages)):
+            continue
+        seen = {page['id']}
+        cursor = parent_id
+        while cursor and cursor not in seen:
+            seen.add(cursor)
+            cursor = pages[cursor].get('parentPageId')
+        if cursor:
+            continue
+        recovered = dict(link)
+        if entry.get('elementId') and entry['elementId'] not in elements:
+            recovered['entry'] = {name: value for name, value in entry.items() if name != 'elementId'}
+        page.update(recovered)
+        page.pop('detachedParent')
+
+
 @router.post('/edit')
 async def edit(value: EditRequest, request: Request):
     async with guard(request, value.serial):
@@ -535,12 +702,14 @@ async def edit(value: EditRequest, request: Request):
                     raise ValueError('名称不能为空')
                 obj['name'] = value.name.strip()
             elif value.action == 'delete':
-                removed_elements = [e for e in g['elements'] if collection == 'pages' and (e['pageId'] == obj['id'] or e['id'] == obj.get('entry', {}).get('elementId'))]
+                removed_elements = [e for e in g['elements'] if collection == 'pages' and e['pageId'] == obj['id']]
                 removed_edges = [e for e in g['edges'] if collection == 'pages' and (e['from'] == obj['id'] or e['to'] == obj['id'])]
                 g['elements'] = [e for e in g['elements'] if e not in removed_elements]
                 g['edges'] = [e for e in g['edges'] if e not in removed_edges]
                 g[collection].remove(obj)
                 g['deleted'].append({'collection': collection, 'object': obj, 'elements': removed_elements, 'edges': removed_edges})
+                if collection == 'pages':
+                    reconcile_page_links(g)
             else:
                 raise ValueError('此操作不适用于对象')
             db.put(value.serial, g); return g
@@ -551,9 +720,22 @@ async def edit(value: EditRequest, request: Request):
                 if obj['collection'] == 'elements' and obj['object']['pageId'] not in page_ids:
                     raise ValueError('所属页面已删除，请先恢复页面')
                 g[obj['collection']].append(obj['object'])
-                g['elements'].extend(obj.get('elements', []))
-                g['edges'].extend(e for e in obj.get('edges', []) if e['from'] in page_ids and e['to'] in page_ids)
                 g['deleted'].remove(obj)
+                deleted_pages = {saved['object']['id']: saved for saved in g['deleted']
+                                 if saved['collection'] == 'pages'}
+                for element in obj.get('elements', []):
+                    if element['pageId'] in page_ids:
+                        g['elements'].append(element)
+                    elif owner := deleted_pages.get(element['pageId']):
+                        owner.setdefault('elements', []).append(element)
+                for edge in obj.get('edges', []):
+                    unavailable = next((endpoint for endpoint in (edge['from'], edge['to'])
+                                        if endpoint not in page_ids), None)
+                    if unavailable is None:
+                        g['edges'].append(edge)
+                    elif owner := deleted_pages.get(unavailable):
+                        owner.setdefault('edges', []).append(edge)
+                reconcile_page_links(g)
                 db.put(value.serial, g); return g
         raise ValueError('对象不存在')
 
@@ -573,7 +755,38 @@ async def execute(value: ExecuteRequest, request: Request):
             target = element['pageId'] if element else value.targetId
             if not any(p['id'] == target for p in g['pages']):
                 raise ValueError('目标页面不存在')
-            obs = await dev.observe(); db.remember(obs)
+            async def read_page(page_id):
+                page = next(p for p in g['pages'] if p['id'] == page_id)
+                preferred = page.get('treeSource', ACTIVE_WINDOW)
+                other = MULTI_WINDOW if preferred == ACTIVE_WINDOW else ACTIVE_WINDOW
+                async def read(source):
+                    return await dev.observe() if source == ACTIVE_WINDOW else await dev.observe(source)
+                try:
+                    current = await read(preferred)
+                except (TimeoutError, ValueError, OSError, ET.ParseError):
+                    return await read(other)
+                if db.page(g, current) is None and any(
+                    p.get('treeSource', ACTIVE_WINDOW) == other for p in g['pages']
+                ):
+                    try:
+                        alternate = await read(other)
+                        if db.page(g, alternate):
+                            return alternate
+                    except (TimeoutError, ValueError, OSError, ET.ParseError):
+                        pass
+                return current
+
+            async def resolve_current(current, loc):
+                required = loc.get('treeSource', ACTIVE_WINDOW)
+                actual = current.get('treeSource')
+                if actual != required and (loc.get('treeSource') or actual):
+                    matching = await dev.observe(required)
+                    if identity(matching) != identity(current) or matching['rotation'] != current['rotation']:
+                        raise ValueError('控件树与当前导航页面不同，已停止')
+                    current = matching
+                return current, resolve(current, loc)
+
+            obs = await read_page(target); db.remember(obs)
             source = db.page(g, obs)
             try:
                 if not source:
@@ -585,7 +798,7 @@ async def execute(value: ExecuteRequest, request: Request):
                     raise ValueError(str(missing_path) + '；目标页尚无可靠包名，请重新读取并保存目标页元素') from missing_path
                 await dev.launch(package)
                 logs.append('已启动应用：' + package)
-                obs = await dev.observe(); db.remember(obs)
+                obs = await read_page(target); db.remember(obs)
                 source = db.page(g, obs)
                 if not source:
                     raise ValueError(f'已启动 {package}，但落地页尚未记录；请读取画面并走一次应用内部路径')
@@ -597,17 +810,18 @@ async def execute(value: ExecuteRequest, request: Request):
                 raise ValueError('路径超过 12 步，请选择更近起点')
             for edge in path:
                 source_page = next(p for p in g['pages'] if p['id'] == edge['from'])
-                if (source_page.get('identity') != identity(obs) if source_page.get('identity') else obs['signature'] != source_page['signature']):
+                if (source_page.get('identity') != identity(obs) if source_page.get('identity') else page_signature(obs) != source_page['signature']):
                     raise ValueError('导航来源页不匹配')
                 if edge.get('action') == 'swipe':
                     await dev.swipe(edge['gesture'], obs['width'], obs['height'])
                 else:
-                    n = resolve(obs, edge['locator'])
-                    if not n['clickable']:
-                        raise ValueError('导航入口当前不可点击')
-                    await dev.tap(n, obs['width'], obs['height'])
+                    action_observation, n = await resolve_current(obs, edge['locator'])
+                    if not is_navigation_entry(action_observation, n):
+                        edge['status'] = 'stale'; db.put(value.serial, g)
+                        raise ValueError('导航入口当前不可安全点击，已标记路径失效')
+                    await dev.tap(n, action_observation['width'], action_observation['height'])
                 await asyncio.sleep(.3)
-                obs = await dev.observe(); db.remember(obs)
+                obs = await read_page(edge['to']); db.remember(obs)
                 found = db.page(g, obs)
                 if not found or found['id'] != edge['to']:
                     edge['status'] = 'stale'; db.put(value.serial, g)
@@ -618,12 +832,12 @@ async def execute(value: ExecuteRequest, request: Request):
             if element and element.get('validation') == 'recapture' and value.intent != 'navigate':
                 raise ValueError('跨应用移动后必须先在新页面重新标定，不能沿用旧定位')
             if element and element.get('validation') == 'pending':
-                resolve(obs, element['locator'])
+                await resolve_current(obs, element['locator'])
                 element['validation'] = 'verified'; db.put(value.serial, g)
             if value.intent != 'navigate':
                 if not element:
                     raise ValueError('请选择元素')
-                n = resolve(obs, element['locator'])
+                action_observation, n = await resolve_current(obs, element['locator'])
                 if not n['clickable']:
                     raise ValueError('元素不可点击，请保存可点击节点')
                 desired = value.intent == 'on'
@@ -632,11 +846,13 @@ async def execute(value: ExecuteRequest, request: Request):
                 if value.intent in ('on', 'off') and n['checked'] == desired:
                     logs.append('目标状态已满足：零点击')
                 else:
-                    await dev.tap(n, obs['width'], obs['height'])
+                    await dev.tap(n, action_observation['width'], action_observation['height'])
                     await asyncio.sleep(.3)
-                    obs = await dev.observe(); db.remember(obs)
+                    obs = await read_page(target); db.remember(obs)
                     if value.intent in ('on', 'off'):
-                        if db.page(g, obs) is None or db.page(g, obs)['id'] != target or resolve(obs, element['locator'])['checked'] != desired:
+                        found = db.page(g, obs)
+                        checked = found and found['id'] == target and (await resolve_current(obs, element['locator']))[1]['checked'] == desired
+                        if not checked:
                             raise ValueError('点击已发送，但不能确认目标状态；未重试')
                         logs.append('开关目标状态验证通过')
                     else:
@@ -656,13 +872,17 @@ async def swipe(value: SwipeRequest, request: Request):
     async with guard(request, value.serial):
         db = store(request); dev = Device(value.serial)
         old = db.observation(value.serial, value.observationId)
-        before = await dev.observe()
-        if (old['signature'], old['geometry'], old['rotation']) != (before['signature'], before['geometry'], before['rotation']):
+        source = old.get('treeSource')
+        if source == SCREENSHOT_ONLY:
+            raise ValueError('当前快照没有控件树，请重新读取画面与控件')
+        before = await dev.observe(source) if source else await dev.observe()
+        if snapshot_key(old) != snapshot_key(before):
             raise ValueError('页面已变化，未发送滑动，请重新读取画面')
         gesture = {k: getattr(value, k) for k in ('startX', 'startY', 'endX', 'endY')}
         await dev.swipe(gesture, before['width'], before['height'])
         await asyncio.sleep(.3)
-        after = await dev.observe(); db.remember(after)
+        after = await dev.inspect() if source else await dev.observe()
+        db.remember(after)
         g = db.graph(value.serial)
         return {'observation': after, 'graph': g, 'message': '滑动已发送并刷新，尚未保存页面。'}
 
@@ -727,7 +947,7 @@ async def save_page(value: PageSave, request: Request):
         if entry_element:
             source_obs = db.observation(value.serial, entry_element['observationId'])
             source_node = get_node(source_obs, entry_element['nodeIndex'])
-            if not source_node['clickable'] or source_node['checkable']:
+            if not is_navigation_entry(source_obs, source_node):
                 raise ValueError('请选择可点击的导航入口；图标可在节点层级中切换到可点击父控件')
             entry_info = {'elementId': entry_element['id'], 'sourcePageId': parent['id'], 'observationId': source_obs['id'], 'nodeIndex': source_node['index'], 'locator': entry_element['locator']}
         edge_data = None
@@ -743,12 +963,11 @@ async def save_page(value: PageSave, request: Request):
                         step = draft['steps'][0]
                         if step['action'] == 'tap':
                             x, y = step['startX'] * before['width'], step['startY'] * before['height']
-                            hits = [n for n in before['nodes'] if n['clickable'] and n['enabled'] and n['bounds'] and n['bounds'][0] <= x < n['bounds'][2] and n['bounds'][1] <= y < n['bounds'][3]]
+                            hits = [n for n in application_nodes(before) if n['clickable'] and n['enabled'] and n['bounds'] and n['bounds'][0] <= x < n['bounds'][2] and n['bounds'][1] <= y < n['bounds'][3]]
                             hits.sort(key=lambda n: (n['bounds'][2]-n['bounds'][0])*(n['bounds'][3]-n['bounds'][1]))
                             if hits:
-                                n = hits[0]; descendants = list(n['children'])
-                                for i in descendants: descendants.extend(before['nodes'][i]['children'])
-                                if n['checkable'] or any(before['nodes'][i]['checkable'] for i in descendants):
+                                n = hits[0]
+                                if not is_navigation_entry(before, n):
                                     raise ValueError('这次动作是开关操作，不能作为页面入口保存')
                                 if entry_element and resolve(before, entry_element['locator'])['index'] != n['index']:
                                     raise ValueError('实际进入动作与选定父元素不同，请选择实际点击的元素')
@@ -766,6 +985,11 @@ async def save_page(value: PageSave, request: Request):
                 if not existing or existing.get('parentPageId') != parent['id'] or not existing.get('parentEdgeId'):
                     raise ValueError(reason)
         page = existing or db.ensure_page(g, obs)
+        detached = page.pop('detachedParent', None) or {}
+        if detached.get('parentEdgeId'):
+            for saved in g['deleted']:
+                saved['edges'] = [edge for edge in saved.get('edges', [])
+                                  if edge['id'] != detached['parentEdgeId']]
         page.update(appId=app['id'], package=app['package'], identity=identity(obs), observationId=obs['id'])
         if value.name.strip(): page['name'] = value.name.strip()
         elif entry_element: page['name'] = entry_element['name']
@@ -785,6 +1009,7 @@ async def save_page(value: PageSave, request: Request):
                 page['parentEdgeId'] = None; page['navigationStatus'] = 'missing'; page.pop('entry', None)
         else:
             page['parentPageId'] = None; page['parentEdgeId'] = None; page['navigationStatus'] = 'app-entry'
+            page.pop('entry', None)
         if entry_info: page['entry'] = entry_info
         db.put(value.serial, g)
         return {'graph': g, 'pageId': page['id']}

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import { vitePluginManusRuntime } from "vite-plugin-manus-runtime";
+import { redactDebugField } from "./client/public/__manus__/debug-redaction.mjs";
 
 // =============================================================================
 // Manus Debug Collector - Vite Plugin
@@ -58,7 +59,7 @@ function writeToLogFile(source: LogSource, entries: unknown[]) {
   // Format entries with timestamps
   const lines = entries.map((entry) => {
     const ts = new Date().toISOString();
-    return `[${ts}] ${JSON.stringify(entry)}`;
+    return `[${ts}] ${JSON.stringify(entry, redactDebugField)}`;
   });
 
   // Append to log file
@@ -89,7 +90,7 @@ function vitePluginManusDebugCollector(): Plugin {
             tag: "script",
             attrs: {
               src: "/__manus__/debug-collector.js",
-              defer: true,
+              type: "module",
             },
             injectTo: "head",
           },

@@ -1,4 +1,5 @@
 import type { CanValue } from "@/lib/canCatalog";
+export { assignmentsOnEntry } from "../../../tools/ui-test/variable-flow.mjs";
 
 const canStepTypes = ["can_send_once", "can_send_loop", "can_stop"] as const;
 const assertions = [
@@ -67,7 +68,14 @@ export type Selector = {
   resourceId?: string;
   label?: string;
   xpath?: string;
+  treeSource?: "" | "uiautomator2" | "adb";
 };
+
+export function hasSelectorFields(selector?: Selector | null) {
+  if (!selector) return false;
+  const { package: pkg, className, resourceId, label, xpath } = selector;
+  return [pkg, className, resourceId, label, xpath].some(value => value?.trim());
+}
 
 export type StepOptions = {
   x?: number;

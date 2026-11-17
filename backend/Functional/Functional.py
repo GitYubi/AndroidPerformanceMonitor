@@ -250,15 +250,13 @@ class zlgCanFuncs():
         cls.log.info(f"写入配置字：{configs_array}")
 
     @classmethod
-    def get_diag_configs_by_zlg(cls) -> list:
+    def get_diag_configs_by_zlg(cls) -> str:
         """
         查询配置字
         :param configs_array: 配置字列表，必输数字格式的元素
         :return: None
         """
-        cls._require_device().diag_send(cls.chn, [0x03, 0x22, 0xF1, 0xB1, 0x00, 0x00, 0x00, 0x00])
-        time.sleep(1)
-        configs_array = cls._require_device().diag_config_analysis_chars(cls.chn)
+        configs_array = cls._require_device().diag_read_config(cls.chn)
         cls.log.info(f"查询配置字：{configs_array}")
         return configs_array
 

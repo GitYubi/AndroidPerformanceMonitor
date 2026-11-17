@@ -8,7 +8,7 @@ type InteractionRecord = {
   interaction_id: string;
   serial: string;
   duration_seconds: number;
-  state: "queued" | "preparing" | "pushing_config" | "recording" | "pulling_trace" | "completed" | "failed";
+  state: "queued" | "preparing" | "pushing_config" | "recording" | "pulling_trace" | "completed" | "failed" | "interrupted";
   started_at_ms?: number | null;
   ended_at_ms?: number | null;
   trace_ready: boolean;
@@ -94,7 +94,7 @@ export function InteractionDiagnostic({ serial }: { serial: string }) {
       {record && <div className="mt-2.5 border-t border-amber-300/10 pt-2.5 text-[10px] leading-4 text-slate-400">
         <p><span className="font-telemetry text-amber-100">{record.state.toUpperCase()}</span> · {record.notice}</p>
         {record.state === "completed" && <Button variant="ghost" onClick={download} className="mt-1.5 h-7 px-0 text-[10px] text-cyan-200 hover:bg-transparent hover:text-cyan-100"><Download size={12} /> 下载 Perfetto trace</Button>}
-        {record.state === "failed" && <p className="mt-1 text-rose-300">{record.error || "诊断失败"}</p>}
+        {(record.state === "failed" || record.state === "interrupted") && <p className="mt-1 text-rose-300">{record.error || "诊断未完成"}</p>}
       </div>}
     </section>
   );

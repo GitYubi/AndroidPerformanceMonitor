@@ -9,7 +9,7 @@ import {
   type UiImage,
   type UiProject,
 } from "@/lib/uiImages";
-import { stepLayout, stepTypes, type Step } from "@/lib/uiSteps";
+import { hasSelectorFields, stepLayout, stepTypes, type Step } from "@/lib/uiSteps";
 
 export type LibraryCase = {
   id: string;
@@ -145,7 +145,7 @@ export function UiCaseLibrary<T extends LibraryCase>({
       }
       if (
         operation.selector &&
-        Object.values(operation.selector).some(Boolean)
+        hasSelectorFields(operation.selector)
       ) {
         const selector = operation.selector;
         const key = JSON.stringify(

@@ -8,9 +8,11 @@ import sys
 import time
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
 
-from app import adb, monkey as m
+from app import adb, main, monkey as m
+from app.interaction import InteractionRuntime, InteractionTraceManager
 from app.models import MetricsConfig, ProcessSample, SamplePayload, StartSessionRequest
 from app.monitor import MonitorManager
 from app.monkey_records import MonkeyRecords, connect
@@ -258,6 +260,70 @@ def test_failure_paths_release_ownership_and_keep_records(fake_adb, failure):
     asyncio.run(scenario())
 
 
+def test_stop_releases_device_after_stopping_state_write_fails(fake_adb, monkeypatch):
+    tmp, children = fake_adb
+
+    async def scenario():
+        manager, monitor, ui = managers(tmp)
+        run = await manager.start(config(duration_hours=None))
+        await running(manager, run)
+        put = manager.store.put
+
+        def put_with_failure(record):
+            if record["state"] == "stopping":
+                raise sqlite3.OperationalError("fixture stopping write denied")
+            put(record)
+
+        monkeypatch.setattr(manager.store, "put", put_with_failure)
+        runtime = manager.active[run["id"]]
+        runtime.stop.set()
+        result = await settled(manager, run)
+        assert result["state"] == "stopped"
+        assert "fixture stopping write denied" in result["cleanup_warning"]
+        assert runtime.cleanup_task.done()
+        assert all(child.returncode is not None for child in children)
+        assert not monitor.active and monitor.reserved_by is None
+        assert not manager.active and not ui.external_busy
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["queued", "preparing", "pushing_config", "recording", "pulling_trace"])
+def test_diagnostic_ownership_blocks_conflicting_starts(fake_adb, monkeypatch, phase):
+    from types import SimpleNamespace
+
+    root, _ = fake_adb
+
+    async def scenario():
+        manager, _, ui = managers(root)
+        manager.interactions = diagnostics = InteractionTraceManager(root)
+
+        async def simulated_capture(runtime):
+            diagnostics.active.pop(runtime.interaction_id, None)
+
+        monkeypatch.setattr(diagnostics, "_capture", simulated_capture)
+        serial = config().serial
+        diagnostics.active["existing"] = InteractionRuntime("existing", serial, 5, state=phase)
+        with pytest.raises(ValueError, match="正在运行的交互诊断"):
+            await diagnostics.start(serial, 5)
+        with pytest.raises(ValueError, match="正在录制交互诊断"):
+            await manager.start(config(duration_hours=None))
+        assert await diagnostics.start("other", 5)
+        del diagnostics.active["existing"]
+        monkey = await manager.start(config(duration_hours=None))
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=ui, interactions=diagnostics)))
+        try:
+            with pytest.raises(HTTPException) as blocked:
+                await main.start_interaction({"serial": serial, "duration_seconds": 5}, request)
+            assert blocked.value.status_code == 409
+        finally:
+            manager.stop(monkey["id"])
+            await settled(manager, monkey)
+        assert await diagnostics.start(serial, 5)
+
+    asyncio.run(scenario())
+
+
 def test_shutdown_and_recovery_archive_without_resuming_inputs(fake_adb):
     tmp, children = fake_adb
     async def scenario():
@@ -279,6 +345,58 @@ def test_shutdown_and_recovery_archive_without_resuming_inputs(fake_adb):
         assert (fresh.store.directory(run["id"]) / "combined.csv").is_file()
         assert fresh.active == {}
         assert children and all(child.returncode is not None for child in children)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["merge", "hourly_csv"])
+def test_recovery_retries_pending_archive_without_repeating_input(tmp_path, monkeypatch, fault):
+    from unittest.mock import AsyncMock, Mock
+
+    async def scenario():
+        manager, monitor, _ = managers(tmp_path)
+        request = config(duration_hours=None)
+        run = {
+            "id": "archive-retry", "serial": request.serial, "created_at_ms": 1,
+            "state": "running", "config": request.model_dump(), "segment_count": 0,
+            "current_session_id": "source", "pending_session_id": None,
+        }
+        manager.store.put(run)
+        manager.store.initialize(run)
+        writer = monitor.store.create_session("source", {
+            "session_id": "source", "serial": request.serial, "created_at_ms": 1, "duration_seconds": 60,
+            "interval_ms": 1000, "enabled_metrics": {"cpu": True},
+        })
+        writer.write_sample(SamplePayload(ts_ms=1000, cpu_total_pct=12))
+        writer.finish("interrupted")
+        original_replace = Path.replace
+
+        def fail_csv(path, target):
+            if str(target).endswith("hour-0001.csv"):
+                raise OSError("fixture CSV commit failure")
+            return original_replace(path, target)
+
+        cleanup = AsyncMock()
+        monkeypatch.setattr(manager, "cleanup", cleanup)
+        with monkeypatch.context() as failures:
+            if fault == "merge":
+                failures.setattr(manager.store, "archive", Mock(side_effect=sqlite3.OperationalError("fixture merge failure")))
+            else:
+                failures.setattr(Path, "replace", fail_csv)
+            await manager.recover()
+        interrupted = manager.store.get(run["id"])
+        assert interrupted["state"] == "interrupted"
+        assert interrupted["current_session_id"] == "source"
+        assert not (manager.store.directory(run["id"]) / "hour-0001.csv").is_file()
+
+        await manager.recover()
+        await manager.recover()
+        finished = manager.store.get(run["id"])
+        assert finished["current_session_id"] is None and finished["segment_count"] == 1, finished.get("cleanup_warning")
+        assert len(manager.store.segments(run["id"])) == 1
+        with (manager.store.directory(run["id"]) / "hour-0001.csv").open(encoding="utf-8-sig") as file:
+            assert [row["ts_ms"] for row in csv.DictReader(file)] == ["1000"]
+        cleanup.assert_awaited_once_with(run["id"], request.serial)
+
     asyncio.run(scenario())
 
 
@@ -413,3 +531,18 @@ def test_expired_memory_is_missing_and_cpu_memory_mode_skips_foreground_probe(tm
         runtime.memory_updated_monotonic = time.monotonic()
         assert (await monitor._capture_once(runtime)).pss_kb == 100
     asyncio.run(scenario())
+
+
+def test_monkey_records_filter_by_project_before_pagination(tmp_path):
+    records = MonkeyRecords(tmp_path / 'monkey')
+    project = 'c' * 32
+    for index in range(105):
+        records.put({'id': f'{index:032x}', 'state': 'completed', 'created_at_ms': index,
+                     'project_id': project if index % 3 == 0 else 'default', 'config': {}})
+    legacy = {'id': 'f' * 32, 'state': 'running', 'created_at_ms': 200, 'config': {}}
+    records.put(legacy)
+    first = records.runs(project_id=project, brief=True)
+    assert len(first) == 35 and all(run['project_id'] == project for run in first)
+    assert records.runs(project_id=project, offset=35) == []
+    assert records.runs(project_id='default', unfinished=True)[0]['id'] == legacy['id']
+    assert records.runs(unfinished=True)[0]['id'] == legacy['id']

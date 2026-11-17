@@ -10,6 +10,12 @@ from zlg.paths import resource_path
 _dll_directories = {}
 
 
+def vendor_sdk_path(folder: str, filename: str) -> Path:
+    directory = (Path(sys.executable).parent / folder if getattr(sys, "frozen", False)
+                 else resource_path(folder))
+    return directory / filename
+
+
 def load_vendor_library(folder: str, filename: str):
     if platform.system() != "Windows":
         raise RuntimeError(
@@ -18,12 +24,10 @@ def load_vendor_library(folder: str, filename: str):
         )
     if ct.sizeof(ct.c_void_p) != 8 or platform.machine().lower() not in {"amd64", "x86_64"}:
         raise RuntimeError("周立功 DLL 需要 Windows x64 和 64 位 x86 Python 3.12。")
-    directory = (Path(sys.executable).parent / folder if getattr(sys, "frozen", False)
-                 else resource_path(folder))
-    library = directory / filename
+    library = vendor_sdk_path(folder, filename)
     if not library.is_file():
-        raise FileNotFoundError(f"找不到周立功 SDK：{library}。请将完整 {folder} 放到程序所在目录。")
-    for path in (directory, directory / "kerneldlls"):
+        raise FileNotFoundError(f"找不到周立功 SDK：{library}。请将厂商提供的完整 SDK 放到 {library.parent}。")
+    for path in (library.parent, library.parent / "kerneldlls"):
         if path.is_dir() and path not in _dll_directories:
             _dll_directories[path] = os.add_dll_directory(str(path))
     try:

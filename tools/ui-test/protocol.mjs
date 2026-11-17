@@ -1,4 +1,5 @@
-import { matchingNodes } from "./hierarchy.mjs";
+import { matchingNodes, selectorFields } from "./hierarchy.mjs";
+import { assignmentsOnEntry } from "./variable-flow.mjs";
 import { setTimeout as sleep } from "node:timers/promises";
 
 export const STEP_TYPES = [
@@ -424,15 +425,14 @@ export function validateJob(job) {
         ["tap", "element_assert", "element_screenshot"].includes(step.type) ||
         (step.type === "image_assert" && step.options?.mode === "element")
       ) ||
-        !Object.values(step.selector).some(
-          value => typeof value === "string" && value.trim()
+        !selectorFields.some(
+          key => typeof step.selector[key] === "string" && step.selector[key].trim()
         ) ||
         Object.entries(step.selector).some(
           ([key, value]) =>
-            !["package", "className", "resourceId", "label", "xpath"].includes(
-              key
-            ) ||
+            (!selectorFields.includes(key) && key !== "treeSource") ||
             typeof value !== "string" ||
+            (key === "treeSource" && !["", "adb", "uiautomator2"].includes(value)) ||
             (key === "xpath" &&
               value !== "" &&
               !/^\/hierarchy(?:\/node\[[1-9][0-9]{0,4}\])+$/.test(value))
@@ -450,13 +450,14 @@ export function validateJob(job) {
   }
   const params = job.parameters || {};
   const captured = new Map();
-  const assigned = new Set();
-  const images = new Set();
-  for (const step of enabled) {
+  const entries = assignmentsOnEntry(test.steps);
+  const enabledIds = new Set(enabled.map(step => step.id));
+  for (const step of test.steps) {
     const scope = scopes.get(step.id);
+    const assigned = entries.get(step.id);
     const variables = {
       ...params,
-      ...Object.fromEntries([...assigned].map(name => [name, ""])),
+      ...Object.fromEntries([...assigned.keys()].map(name => [name, ""])),
     };
     for (const { parent } of scope) {
       const name = parent.type === "for" && parent.options.indexVariable;
@@ -474,18 +475,19 @@ export function validateJob(job) {
       throw new Error("步骤循环变量与现有变量重名");
     for (const operation of step.condition ? [step, step.condition] : [step]) {
       substitute(operation.prompt, variables);
-      if (operation.type === "input") substitute(operation.value, variables);
+      substitute(operation.value ?? "", variables);
       if (operation.type === "variable_assert") {
         if (!Object.hasOwn(variables, operation.options.variable))
           throw new Error("步骤引用了未声明或不可见的变量");
         substitute(operation.options.expectedValue ?? "", variables);
       }
+      if (!enabledIds.has(step.id)) continue;
       if (
         operation.type === "screenshot_assert" &&
         [
           operation.options.firstVariable,
           operation.options.secondVariable,
-        ].some(name => name && !images.has(name))
+        ].some(name => name && assigned.get(name) !== "image")
       )
         throw new Error("步骤引用的图片变量须在前面赋值");
       if (
@@ -505,9 +507,10 @@ export function validateJob(job) {
           "步骤截图对比只能引用前面已启用的截图步骤，且须位于当前分支或外层"
         );
     }
+    if (!enabledIds.has(step.id)) continue;
     if (isCapture(step.type)) captured.set(step.id, scope);
     if (step.type === "assign") {
-      const { variable, valueType } = step.options;
+      const { variable } = step.options;
       if (
         scope.some(
           ({ parent }) =>
@@ -515,8 +518,6 @@ export function validateJob(job) {
         )
       )
         throw new Error("步骤不能给循环索引变量赋值");
-      assigned.add(variable);
-      if (valueType === "image") images.add(variable);
     }
   }
   return job;
@@ -654,7 +655,10 @@ export async function executeStep(
       await device.swipeCoordinates(step.options);
       break;
     case "element_assert": {
-      const nodes = matchingNodes(await device.read(), step.selector);
+      const nodes = matchingNodes(
+        await device.read(step.selector.treeSource || undefined),
+        step.selector
+      );
       const expected = step.options.expected;
       const node = nodes.length === 1 ? nodes[0] : undefined;
       const passed = {

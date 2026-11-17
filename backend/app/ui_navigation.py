@@ -3,7 +3,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .ui_map import MapStore, resolve
+from .ui_map import MapStore, application_nodes, is_navigation_entry, label_tree_nodes, resolve
 
 
 class NavigationStore:
@@ -34,12 +34,16 @@ class NavigationStore:
         maps = MapStore(self.root)
         graph = maps.graph(serial)
         observations = {}
+        normalized_nodes = {}
         # UI labels and source trees bootstrap navigation without a manual recording.
         for page in graph['pages'][:500]:
             try:
                 obs = maps.observation(serial, page['observationId'])
+                nodes = application_nodes(obs)
+                if not nodes:
+                    continue
                 observations[page['id']] = obs
-                seeds['pages'].append({'id': page['id'], 'name': page['name'], 'nodes': obs['nodes']})
+                seeds['pages'].append({'id': page['id'], 'name': page['name'], 'nodes': nodes})
             except (KeyError, ValueError):
                 continue
         for edge in graph['edges'][:1000]:
@@ -52,8 +56,24 @@ class NavigationStore:
             except (KeyError, ValueError):
                 continue
             # Export attribute selectors only when independently unique without XPath.
-            selector = {k: node[k] for k in ('package', 'className', 'resourceId', 'label')}
-            matches = [n for n in observations[edge['from']]['nodes'] if all(not v or n[k] == v for k, v in selector.items())]
-            if len(matches) == 1 and node['clickable'] and not node['checkable']:
+            source = observations[edge['from']]
+            if not is_navigation_entry(source, node):
+                continue
+            if edge['from'] not in normalized_nodes:
+                normalized = [item.copy() for item in source['nodes']]
+                label_tree_nodes(normalized)
+                normalized_nodes[edge['from']] = {
+                    item['index']: normalized[item['index']] for item in application_nodes(source)}
+            normalized = normalized_nodes[edge['from']]
+            current = normalized.get(node['index'])
+            if current is None:
+                continue
+            fields = ('package', 'className', 'resourceId')
+            selector = {key: current[key] for key in fields}
+            matches = [n for n in normalized.values() if all(not v or n[k] == v for k, v in selector.items())]
+            if len(matches) != 1 or not selector['resourceId']:
+                selector['label'] = current['label']
+                matches = [n for n in matches if not current['label'] or n['label'] == current['label']]
+            if len(matches) == 1 and any(selector.values()):
                 seeds['edges'].append({'from': edge['from'], 'to': edge['to'], 'selector': selector})
         return {'knowledge': knowledge, 'seeds': seeds}

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+import logging
 import math
 from pathlib import Path
 import re
 import shlex
 import shutil
+import sqlite3
 import time
 from typing import Annotated, Literal
 import uuid
@@ -18,8 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .adb import AdbError, list_devices, run_adb
 from .models import MetricsConfig, StartSessionRequest
-from .monkey_records import MonkeyRecords, MonkeyReportStore
+from .monkey_records import MonkeyRecords, MonkeyReportStore, connect
 from .report import ReportMetric, ReportTheme, generate_report
+from .record_cleanup import stage_directory, restore_directory, finish_directory
 
 router = APIRouter(prefix="/api/monkey", tags=["Monkey"])
 HOUR_SECONDS = 3600
@@ -57,6 +60,7 @@ class EventRatios(BaseModel):
 class MonkeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     serial: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(default="default", pattern=r"^(?:default|[a-f0-9]{32})$")
     mode: Literal["none", "blacklist", "whitelist"] = "blacklist"
     packages: list[str] = Field(default_factory=list, max_length=1000)
     ratios: EventRatios = Field(default_factory=EventRatios)
@@ -194,13 +198,13 @@ class MonkeyManager:
         self.active: dict[str, Runtime] = {}
         self.lock = asyncio.Lock()
 
-    async def start(self, config: MonkeyRequest) -> dict:
+    async def start(self, config: MonkeyRequest, project_name: str = "默认项目") -> dict:
         if self.ui.device_lock(config.serial).locked():
             raise ValueError("设备正在进行界面操作或画面控制，请先结束操作")
         async with self.lock, self.ui.device_lock(config.serial):
             if self.active or self.ui.has_active_device(config.serial):
                 raise ValueError("设备已有 Monkey、UI 用例或操作任务，请先停止")
-            if self.interactions and any(item.serial == config.serial and item.state in {"queued", "recording"} for item in self.interactions.active.values()):
+            if self.interactions and self.interactions.has_active_device(config.serial):
                 raise ValueError("设备正在录制交互诊断，请等待录制结束")
             if shutil.disk_usage(self.store.root).free < 512 * 1024 * 1024:
                 raise ValueError("存储剩余空间不足 512 MiB，请先清理测试记录")
@@ -220,6 +224,7 @@ class MonkeyManager:
                     if missing:
                         raise ValueError("白名单中存在未安装应用：" + "、".join(sorted(missing)[:10]))
                 run = {"id": run_id, "serial": config.serial, "state": "starting", "config": config.model_dump(),
+                       "project_id": config.project_id, "project_name": project_name,
                        "created_at_ms": int(time.time() * 1000), "started_at_ms": None, "ended_at_ms": None,
                        "current_session_id": None, "pending_session_id": None, "segment_count": 0,
                        "message": "正在准备设备端 Monkey", "cleanup_warning": None}
@@ -315,6 +320,7 @@ class MonkeyManager:
         config = runtime.config
         session_id = await self.monitor.start(StartSessionRequest(
             serial=config.serial, duration_seconds=max(1, min(3600, math.ceil(seconds))),
+            project_id=config.project_id, project_name=self.store.get(runtime.id).get('project_name', '默认项目'),
             interval_ms=config.interval_ms, memory_cycle_skip=config.memory_cycle_skip,
             metrics=MetricsConfig(cpu=True, memory=True, fps=config.fps)), owner=runtime.id)
         run = self.store.get(runtime.id)
@@ -323,14 +329,20 @@ class MonkeyManager:
         runtime.sampling_task = self.monitor.active[session_id].task
         return session_id
 
-    async def archive(self, runtime: Runtime, session_id: str) -> None:
+    async def archive(self, run_id: str, session_id: str) -> None:
         path = self.monitor.store.database_path(session_id)
-        number = await asyncio.to_thread(self.store.archive, runtime.id, session_id, path)
-        run = self.store.get(runtime.id)
-        run.update(segment_count=number, pending_session_id=None)
-        if run["current_session_id"] == session_id:
-            run["current_session_id"] = None
+        number = await asyncio.to_thread(self.store.archive, run_id, session_id, path)
+        run = self.store.get(run_id)
+        run["segment_count"] = max(run.get("segment_count", 0), number)
+        for field in ("pending_session_id", "current_session_id"):
+            if run.get(field) == session_id:
+                run[field] = None
         self.store.put(run)
+
+    async def _archive_remaining(self, run: dict) -> None:
+        for session_id in dict.fromkeys((run.get("pending_session_id"), run.get("current_session_id"))):
+            if session_id:
+                await self.archive(run["id"], session_id)
 
     async def execute(self, runtime: Runtime) -> None:
         runtime.entered = True
@@ -383,7 +395,7 @@ class MonkeyManager:
                     self.store.put(run)
                     # Start the next capture before CSV/SQL work; export runs in a worker thread.
                     current = await self.start_segment(runtime, min(HOUR_SECONDS, deadline - time.monotonic()))
-                    await self.archive(runtime, previous)
+                    await self.archive(runtime.id, previous)
         except asyncio.CancelledError:
             state, message = ("interrupted", "后端关闭，任务已中断") if runtime.interrupted else ("stopped", "任务已停止")
         except Exception as exc:
@@ -392,43 +404,52 @@ class MonkeyManager:
             else:
                 state, message = "failed", str(exc)[:2000]
         finally:
-            runtime.stop.set()
-            cleanup_warning = None
-            run = self.store.get(runtime.id)
-            run.update(state="stopping", message=message or "正在停止 Monkey 并归档记录")
-            self.store.put(run)
+            await self._finish_run(runtime, current, state, message, (wait_process, stop_wait))
+
+    async def _finish_run(self, runtime: Runtime, current: str | None, state: str, message: str,
+                          waiters: tuple[asyncio.Task | None, ...]) -> None:
+        runtime.stop.set()
+        warnings = []
+        try:
+            self.stop_input(runtime)
             try:
-                self.stop_input(runtime)
+                run = self.store.get(runtime.id)
+                run.update(state="stopping", message=message or "正在停止 Monkey 并归档记录")
+                self.store.put(run)
+            except Exception as exc:
+                warnings.append(f"停止状态写入失败：{exc}")
+                logging.getLogger(__name__).exception("Could not record Monkey stop for %s", runtime.id)
+            try:
                 await runtime.cleanup_task
             except Exception as exc:
-                cleanup_warning = f"设备端清理未确认：{exc}；租约守护会在约{LEASE_SECONDS}秒内停止输入"
-            for pending in [runtime.heartbeat, runtime.timer, wait_process, stop_wait]:
-                if pending:
+                warnings.append(f"设备端清理未确认：{exc}；租约守护会在约{LEASE_SECONDS}秒内停止输入")
+            finally:
+                tasks = [task for task in (runtime.heartbeat, runtime.timer, *waiters) if task is not None]
+                for pending in tasks:
                     pending.cancel()
-            await asyncio.gather(*(t for t in [runtime.heartbeat, runtime.timer, wait_process, stop_wait] if t), return_exceptions=True)
+                await asyncio.gather(*tasks, return_exceptions=True)
             try:
                 if current:
                     await self.monitor.stop(current, owner=runtime.id)
                 # Crash-safe pending pointer also covers an interrupted hourly export.
-                saved = self.store.get(runtime.id)
-                for session_id in dict.fromkeys([saved.get("pending_session_id"), saved.get("current_session_id")]):
-                    if session_id:
-                        await self.archive(runtime, session_id)
+                await self._archive_remaining(self.store.get(runtime.id))
                 ended = int(time.time() * 1000)
-                summary = await asyncio.to_thread(self.store.summarize, runtime.id, state, ended)
-                run["segment_count"] = summary["segment_count"]
+                await asyncio.to_thread(self.store.summarize, runtime.id, state, ended)
             except Exception as exc:
                 state, message = "failed", f"归档未完成，原始性能记录仍保留：{exc}"
             finally:
                 run = self.store.get(runtime.id)
-                if cleanup_warning:
-                    run["cleanup_warning"] = cleanup_warning
-                run.update(state=state, ended_at_ms=int(time.time() * 1000), current_session_id=None,
+                if warnings:
+                    run["cleanup_warning"] = "；".join(warnings)
+                run.update(state=state, ended_at_ms=int(time.time() * 1000),
                            message=message or {"completed": "已完成并合并记录", "stopped": "已停止并合并记录", "interrupted": "已中断并保留记录"}.get(state, "执行失败"))
                 self.store.put(run)
+        finally:
+            if self.monitor.reserved_by == runtime.id:
                 self.monitor.reserved_by = None
+            if self.ui.external_busy.get(runtime.config.serial) == runtime.id:
                 self.ui.external_busy.pop(runtime.config.serial, None)
-                self.active.pop(runtime.id, None)
+            self.active.pop(runtime.id, None)
 
     async def cleanup(self, run_id: str, serial: str, process=None) -> None:
         paths = remote_paths(run_id)
@@ -481,22 +502,31 @@ rm -f {shlex.join(list(paths.values()))}"""
         await asyncio.gather(*tasks, return_exceptions=True)
 
     async def recover(self) -> None:
-        # At most one active capture is allowed. No unbounded list of old samples.
-        for run in self.store.runs(unfinished=True):
+        for run in self.store.recovery_runs():
+            active = run["state"] in {"starting", "running", "stopping"}
+            state = "interrupted" if active else run["state"]
+            ended = run.get("ended_at_ms") or int(time.time() * 1000)
+            messages = []
+            previous = run.get("cleanup_warning")
+            if previous and not previous.startswith("部分归档待恢复"):
+                messages.append(previous)
+            if active:
+                try:
+                    await self.cleanup(run["id"], run["serial"])
+                except Exception as exc:
+                    messages.append(f"重启后设备端清理未确认：{exc}；租约将自动到期")
+            summary = None
             try:
-                await self.cleanup(run["id"], run["serial"])
+                await self._archive_remaining(run)
+                summary = await asyncio.to_thread(self.store.summarize, run["id"], state, ended)
             except Exception as exc:
-                run["cleanup_warning"] = f"重启后设备端清理未确认：{exc}；租约将自动到期"
-            try:
-                for session_id in dict.fromkeys([run.get("pending_session_id"), run.get("current_session_id")]):
-                    if session_id and self.monitor.store.database_path(session_id).is_file():
-                        await asyncio.to_thread(self.store.archive, run["id"], session_id, self.monitor.store.database_path(session_id))
-                summary = await asyncio.to_thread(self.store.summarize, run["id"], "interrupted", int(time.time() * 1000))
+                messages.insert(0, f"部分归档待恢复，原始数据保留：{exc}")
+            run = self.store.get(run["id"])
+            run.update(state=state, ended_at_ms=ended, cleanup_warning="；".join(messages) or None)
+            if summary is not None:
                 run["segment_count"] = summary["segment_count"]
-            except Exception as exc:
-                run["cleanup_warning"] = f"部分归档待恢复，原始数据保留：{exc}"
-            run.update(state="interrupted", ended_at_ms=int(time.time() * 1000), current_session_id=None,
-                       message="服务重启，已中断；不会自动重新执行 Monkey")
+            if active:
+                run["message"] = "服务重启，已中断；不会自动重新执行 Monkey"
             self.store.put(run)
 
 
@@ -512,14 +542,18 @@ async def defaults():
 
 
 @router.get("/runs")
-async def runs(request: Request, offset: int = Query(default=0, ge=0)):
-    return manager(request).store.runs(offset=offset, brief=True)
+async def runs(request: Request, offset: int = Query(default=0, ge=0),
+               project_id: str | None = None, unfinished: bool = False):
+    return manager(request).store.runs(offset=offset, brief=True, project_id=project_id, unfinished=unfinished)
 
 
 @router.post("/runs", status_code=202)
 async def start(config: MonkeyRequest, request: Request):
     try:
-        return await manager(request).start(config)
+        async with request.app.state.ui.lock:
+            request.app.state.ui.store.images.require_project(config.project_id)
+            project = next(item for item in request.app.state.ui.store.images.projects() if item['id'] == config.project_id)
+            return await manager(request).start(config, project_name=project['name'])
     except (AdbError, ValueError, OSError) as exc:
         raise HTTPException(409, str(exc)) from exc
 
@@ -543,6 +577,29 @@ async def stop(run_id: str, request: Request):
         return manager(request).stop(run_id)
     except KeyError as exc:
         raise HTTPException(404, "Monkey 任务不存在") from exc
+
+
+@router.post("/runs/{run_id}/delete")
+async def delete_run(run_id: str, request: Request):
+    service = manager(request)
+    async with request.app.state.ui.lock:
+        try:
+            run = service.store.get(run_id)
+        except KeyError as error:
+            raise HTTPException(404, "Monkey 任务不存在") from error
+        if run_id in service.active or run.get("state") not in TERMINAL:
+            raise HTTPException(409, "运行中的 Monkey 任务不能删除")
+        if not RUN_ID.fullmatch(run_id):
+            raise HTTPException(409, "任务目录无效，无法删除")
+        staged = None
+        try:
+            staged = stage_directory(service.store.root / run_id)
+            with connect(service.store.index) as conn:
+                conn.execute("DELETE FROM jobs WHERE id=?", (run_id,))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            restore_directory(staged)
+            raise HTTPException(409, f"删除 Monkey 记录失败：{error}") from error
+        return {"deleted": True, "cleanupErrors": finish_directory(staged)}
 
 
 @router.get("/runs/{run_id}/files/{name}")

@@ -211,6 +211,16 @@ def test_parse_surface_latency_stats() -> None:
     assert stats.jank_count == 0
 
 
+def test_surface_latency_excludes_placeholders_and_duplicate_present_times():
+    clean = "16666666\n0 1000000000 0\n0 1050000000 0\n"
+    output = clean + "0 9223372036854775807 1100000000\n0 -1 1110000000\n0 1000000000 0\n0 0 0\n"
+    metrics = parse_surface_latency_stats(output)
+    assert metrics == parse_surface_latency_stats(clean)
+    assert (metrics.frame_count, metrics.jank_count, metrics.jank_pct) == (2, 1, 50)
+    assert parse_surface_latency(output) == metrics.fps
+    assert parse_surface_latency_stats("16666666\n0 9223372036854775807 0\n0 0 0") is None
+
+
 def test_extract_foreground_package_android13_top_resumed() -> None:
     """Android 12L/13+ 输出为 topResumedActivity=...（等号分隔）。"""
     output = """ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)

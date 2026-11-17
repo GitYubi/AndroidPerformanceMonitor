@@ -43,11 +43,14 @@ android-car-performance-monitor/
 在 Linux 或 macOS 的项目根目录执行：
 
 ```bash
+python3 -m venv backend/.venv
+backend/.venv/bin/pip install -r backend/requirements.txt
+pnpm install
 chmod +x run-local.sh
 ./run-local.sh
 ```
 
-脚本会验证 `adb`、创建 Python 虚拟环境、安装后端依赖、在 `127.0.0.1:8090` 启动后端，并在 `127.0.0.1:3000` 启动前端。然后访问终端显示的本地地址。
+脚本检查 `adb` 和已安装的依赖。在 `127.0.0.1:8090` 的后端通过健康检查后，启动只监听回环地址的 Vite 前端。访问 Vite 打印的本地地址。端口冲突时可用 `BACKEND_PORT=8091 ./run-local.sh` 更换后端端口。
 
 在 Windows 上，请分别启动两个终端；PowerShell 示例：
 
@@ -71,6 +74,7 @@ pnpm dev --host 127.0.0.1
 双击 `Start.cmd`，浏览器会自动打开工具；保留运行窗口，先停止采样，再按 `Ctrl+C` 退出。
 包内含 Windows x64 的 Python、Node.js、ADB、scrcpy server、后端依赖和 UI 自动化依赖。
 正常启动无需联网安装依赖；AI UI 用例仍需模型服务与 API Key，USB 连接可能需要厂商驱动。
+周立功硬件模式使用单独提供的 Windows x64 SDK。按供应商的许可和安装说明取得 SDK 后，将完整 SDK 放在解压目录的 `backend/zlgcan_x64/`，主 DLL 为 `zlgcan.dll`。自检会提示 SDK 文件是否存在。
 
 默认使用 `http://127.0.0.1:8090`，被占用时自动尝试后续端口；前端与 API 共用地址。
 重复双击会打开当前实例。可执行 `Start.cmd --port 8190` 指定端口，
@@ -181,7 +185,7 @@ http://127.0.0.1:8090/fps-probe
 
 - 点击状态栏的**历史会话**按钮，可查看本地 `data/` 目录中全部会话（时间、设备、状态、时长、样本数），选择"查看"后曲线、进程排行、事件与汇总随之加载，并可导出 CSV。
 - 会话目录按 `<设备号>_<日期>[_序号]` 命名（如 `42b86e9c_2026_08_17_2`），方便在文件系统中定位；旧版 UUID 目录同样兼容。
-- **导入**：点击弹窗中的文件选择器，可导入外部 `monitor.db`（例如从其他测试机器拷贝的会话文件）；导入会校验文件合法性，session_id 冲突时自动生成新 ID。
+- **导入**：点击弹窗中的文件选择器，可导入不超过 256 MiB 的 `monitor.db`。数据库通过结构、内容及兼容性检查后才会进入会话列表。遇到已有 session_id 时为导入副本生成新 ID。
 
 ## Monkey 压测与性能联动
 

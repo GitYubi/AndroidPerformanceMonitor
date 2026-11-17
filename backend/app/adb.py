@@ -65,6 +65,7 @@ async def run_adb(
     *arguments: str,
     serial: str | None = None,
     timeout_seconds: float = 6.0,
+    input_data: bytes | None = None,
 ) -> str:
     """运行单个 ADB 命令，并为卡住的设备调用建立硬超时。"""
 
@@ -80,10 +81,12 @@ async def run_adb(
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
+            stdin=asyncio.subprocess.PIPE if input_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
+        communication = process.communicate(input_data) if input_data is not None else process.communicate()
+        stdout, stderr = await asyncio.wait_for(communication, timeout=timeout_seconds)
     except asyncio.CancelledError:
         if "process" in locals() and process.returncode is None:
             try:
@@ -332,73 +335,51 @@ def parse_meminfo(output: str) -> tuple[int | None, int | None, int | None, list
     return pss_total, rss_total, total_ram_kb, processes
 
 
+def _surface_latency_window(output: str) -> tuple[int | None, list[int]]:
+    rows = []
+    for line in output.splitlines():
+        try:
+            values = [int(token) for token in line.split()]
+        except ValueError:
+            continue
+        if values:
+            rows.append(values)
+    if not rows:
+        return None, []
+    period = rows[0][0]
+    timestamps = set()
+    for row in rows[1:]:
+        # The second column is actual present time. Some older outputs leave it
+        # at zero and report completion in the last column.
+        stamp = row[1] if len(row) > 1 and row[1] != 0 else row[-1]
+        if 0 < stamp < 9_000_000_000_000_000_000:
+            timestamps.add(stamp)
+    return (period if period > 0 else None), sorted(timestamps)
+
+
 def parse_surface_latency(output: str) -> float | None:
     """根据 SurfaceFlinger present 时间戳计算最近窗口的显示帧率估计。"""
-
-    rows: list[list[int]] = []
-    for line in output.splitlines():
-        tokens = line.split()
-        if not tokens or not all(token.lstrip("-").isdigit() for token in tokens):
-            continue
-        values = [int(token) for token in tokens]
-        if len(values) >= 1:
-            rows.append(values)
-
-    if len(rows) < 3:
-        return None
-    refresh_period = rows[0][0]
-    timestamps = [(row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) for row in rows[1:] if (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) > 0 and (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) < 9_000_000_000_000_000_000]
-    timestamps = sorted(set(timestamps))
-    if len(timestamps) < 2:
-        return None
-    deltas = [right - left for left, right in zip(timestamps, timestamps[1:]) if 1_000_000 <= right - left <= 1_000_000_000]
-    if not deltas:
-        return None
-    median_delta = statistics.median(deltas[-30:])
-    fps = 1_000_000_000 / median_delta
-    if refresh_period > 0:
-        max_display_fps = 1_000_000_000 / refresh_period * 1.2
-        fps = min(fps, max_display_fps)
-    return round(fps, 2)
+    refresh_period, timestamps = _surface_latency_window(output)
+    return _fps_from_present_ns(timestamps, refresh_period)
 
 
 def parse_surface_latency_stats(output: str) -> FrameStats | None:
-    """``dumpsys SurfaceFlinger --latency <layer>`` 的增强统计版。
-
-    在原有呈现 FPS 基础上额外给出刷新周期、窗口内帧数以及
-    “呈现间隔超过两倍刷新周期”的掉帧计数。
-    """
-
-    rows: list[list[int]] = []
-    for line in output.splitlines():
-        tokens = line.split()
-        if not tokens or not all(token.lstrip("-").isdigit() for token in tokens):
-            continue
-        values = [int(token) for token in tokens]
-        if len(values) >= 1:
-            rows.append(values)
-    if len(rows) < 3:
+    """从同一组有效呈现时间戳估算 FPS、帧数及呈现间隔卡顿。"""
+    period, timestamps = _surface_latency_window(output)
+    refresh_period = period or 16_666_666
+    fps = _fps_from_present_ns(timestamps, refresh_period)
+    if fps is None:
         return None
-    refresh_period = rows[0][0] or 16_666_666
-    timestamps = sorted(
-        {
-            (row[1] if len(row) >= 2 and row[1] > 0 else row[-1])
-            for row in rows[1:]
-            if (row[1] if len(row) >= 2 and row[1] > 0 else row[-1]) > 0
-        }
+    jank_count = sum(
+        1 for left, right in zip(timestamps, timestamps[1:])
+        if 1_000_000 <= right - left <= 1_000_000_000 and right - left > 2 * refresh_period
     )
-    deltas = [right - left for left, right in zip(timestamps, timestamps[1:]) if 1_000_000 <= right - left <= 1_000_000_000]
-    if not deltas:
-        return None
-    fps = 1_000_000_000 / statistics.median(deltas[-30:])
-    fps = min(fps, 1_000_000_000 / refresh_period * 1.2)
-    jank_count = sum(1 for delta in deltas if delta > 2 * refresh_period)
     return FrameStats(
         source="sf_latency",
-        fps=round(fps, 2),
+        fps=fps,
         frame_count=len(timestamps),
         jank_count=jank_count,
-        jank_pct=round(jank_count / len(timestamps) * 100, 2) if jank_count else 0.0,
+        jank_pct=round(jank_count / len(timestamps) * 100, 2),
         refresh_period_ns=refresh_period,
     )
 

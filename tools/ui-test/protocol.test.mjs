@@ -1,11 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   validateJob,
   substitute,
   executeStep,
   stepDeadlineMs,
 } from "./protocol.mjs";
+
+test("a worst-case image search leaves the step timer free to cancel it", () => {
+  const child = spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import assert from "node:assert/strict";
+    import sharp from "sharp";
+    import { searchScreenshot } from "./image-assertion.mjs";
+    const pixels = Buffer.alloc(380 * 380 * 3);
+    pixels.fill(255, 0, 380 * 380 * 3 / 4);
+    const screen = await sharp({ create: { width: 900, height: 900, channels: 3, background: "black" } }).png().toBuffer();
+    const template = await sharp(pixels, { raw: { width: 380, height: 380, channels: 3 } }).png().toBuffer();
+    const signal = AbortSignal.timeout(1000);
+    await assert.rejects(searchScreenshot(screen, template, 0, 80, "grayscale", signal), { name: "TimeoutError" });
+  `], { cwd: new URL(".", import.meta.url), timeout: 4000, encoding: "utf8" });
+  assert.ifError(child.error);
+  assert.equal(child.status, 0, child.stderr);
+});
 const step = {
   id: "check",
   type: "assert",
@@ -143,6 +160,25 @@ test("element assertions distinguish absence, disabled nodes, and ambiguity", as
     await executeStep(null, check, { SSID: "test" }, device),
     "passed"
   );
+});
+
+test("multi-window absence requires a successful read from the saved source", async () => {
+  const check = {
+    ...step,
+    type: "element_assert",
+    selector: { treeSource: "uiautomator2", resourceId: "system:id/battery" },
+    options: { expected: "absent" },
+  };
+  const device = {
+    read: async source => {
+      assert.equal(source, "uiautomator2");
+      throw new Error("多窗口控件树读取失败");
+    },
+  };
+  await assert.rejects(executeStep(null, check, { SSID: "test" }, device), /读取失败/);
+  const request = job();
+  request.testCase.steps = [{ ...check, selector: { treeSource: "uiautomator2" } }];
+  assert.throws(() => validateJob(request), /结构定位条件无效/);
 });
 
 test("image assertions evaluate pixel tolerance and dimension mismatch", async () => {

@@ -18,6 +18,8 @@ import { uiImageUrl, type UiImage, type UiProject } from "@/lib/uiImages";
 type Overview = {
   caseCount: number;
   runCount: number;
+  performanceCount: number;
+  monkeyCount: number;
   states: Record<string, number>;
   recentRuns: { id: string; name: string; state: string; createdAt: number }[];
   imageCount: number;
@@ -224,6 +226,8 @@ export function UiProjectManagement({
                     ["运行记录", overview.runCount],
                     ["图片", overview.imageCount],
                     ["引用的元素", overview.elementCount],
+                    ["性能测试记录", overview.performanceCount],
+                    ["Monkey 测试记录", overview.monkeyCount],
                   ].map(([label, value]) => (
                     <div
                       key={label}
@@ -393,8 +397,10 @@ export function UiProjectManagement({
             <AlertDialogTitle>删除项目“{project?.name}”？</AlertDialogTitle>
             <AlertDialogDescription>
               将删除项目“{project?.name}”的 {overview?.caseCount ?? 0} 个用例、
-              {overview?.imageCount ?? 0} 张图片和 {overview?.runCount ?? 0}{" "}
-              条运行记录及其文件。 删除后无法恢复。其他项目引用的图片会保留。
+              {overview?.imageCount ?? 0} 张图片和 {overview?.runCount ?? 0} 条
+              UI 运行记录、{overview?.performanceCount ?? 0} 条性能记录、
+              {overview?.monkeyCount ?? 0} 条 Monkey
+              记录及其文件。删除后无法恢复。其他项目引用的图片会保留。
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

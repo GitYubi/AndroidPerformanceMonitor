@@ -1,4 +1,6 @@
+import { useWorkspaceProjects } from "@/lib/workspaceProjects";
 import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
+import { DeleteRecordButton } from "@/components/DeleteRecordButton";
 import { BACKEND_URL } from "@/lib/backend";
 /**
  * 设计提示：驾驶舱遥测仪。左侧为会话骨架，右侧为随启用模块数弹性重排的时间轨迹带；不使用虚构性能数据填充空态。
@@ -121,6 +123,8 @@ interface SummaryMetric {
 
 interface MonitorSession {
   session_id: string;
+  project_id?: string;
+  project_name?: string;
   state: "running" | "completed" | "stopped" | "interrupted" | "failed";
   serial: string;
   created_at_ms: number;
@@ -408,7 +412,10 @@ export default function Home() {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => loadJsonStorage(COLLAPSED_STORAGE_KEY, {}));
   const prevSessionState = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
+  const coreRequest = useRef(0);
+  const committedCoreRequest = useRef(0);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const { projects, projectId, selectProject, projectError } = useWorkspaceProjects();
   const [session, setSession] = useState<MonitorSession | null>(null);
   const [points, setPoints] = useState<SessionPoint[]>([]);
   const [timelineStart, setTimelineStart] = useState(0);
@@ -425,12 +432,24 @@ export default function Home() {
   const chartHeight = enabledMetrics.length === 1 ? 400 : enabledMetrics.length === 2 ? 278 : 202;
   const selectedDevice = devices.find((device) => device.serial === selectedSerial);
   const running = session?.state === "running";
+  useEffect(() => {
+    if (session && session.state !== "running" && (session.project_id || "default") !== projectId) {
+      activeSessionIdRef.current = null;
+      setActiveSessionId(null);
+      setSession(null);
+      setPoints([]);
+      setProcesses([]);
+      setEvents([]);
+    }
+  }, [projectId, session?.project_id, session?.state]);
   const maxTimelineStart = Math.max(0, points.length - CHART_WINDOW_POINTS);
   const visiblePoints = useMemo(
     () => running ? points : points.slice(timelineStart, timelineStart + CHART_WINDOW_POINTS),
     [points, running, timelineStart],
   );
   const activateSession = useCallback((nextSession: MonitorSession) => {
+    committedCoreRequest.current = ++coreRequest.current;
+    prevSessionState.current = nextSession.state;
     activeSessionIdRef.current = nextSession.session_id;
     setActiveSessionId(nextSession.session_id);
     setSession(nextSession);
@@ -459,15 +478,19 @@ export default function Home() {
 
   // 快速轮询（1s）：会话状态 + 曲线核心；检测运行结束并弹日志导出 toast
   const refreshCore = useCallback(async (sessionId: string) => {
+    const request = ++coreRequest.current;
+    const isStale = () => activeSessionIdRef.current !== sessionId || request < committedCoreRequest.current;
     try {
       const sessionPayload = await requestApi<MonitorSession>(`/api/sessions/${sessionId}`);
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (isStale()) return;
       const seriesQuery = sessionPayload.state === "running" ? `limit=${CHART_WINDOW_POINTS}` : "full=true";
       const seriesPayload = await requestApi<{ points: SessionPoint[] }>(`/api/sessions/${sessionId}/series?${seriesQuery}`);
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (isStale()) return;
+      const previousState = prevSessionState.current;
+      if (previousState && previousState !== "running" && sessionPayload.state === "running") return;
+      committedCoreRequest.current = request;
       setSession(sessionPayload);
       setPoints(seriesPayload.points);
-      const previousState = prevSessionState.current;
       prevSessionState.current = sessionPayload.state;
       if (previousState === "running" && sessionPayload.state !== "running") {
         try {
@@ -477,7 +500,7 @@ export default function Home() {
         } catch { /* toast 失败不影响状态 */ }
       }
     } catch (error) {
-      if (activeSessionIdRef.current !== sessionId) return;
+      if (isStale()) return;
       setApiError(error instanceof Error ? error.message : "刷新会话失败");
     }
   }, []);
@@ -512,14 +535,14 @@ export default function Home() {
   const loadHistory = useCallback(async () => {
     setHistoryLoading(true);
     try {
-      const payload = await requestApi<{ sessions: MonitorSession[] }>("/api/sessions");
+      const payload = await requestApi<{ sessions: MonitorSession[] }>(`/api/sessions?project_id=${encodeURIComponent(projectId)}`);
       setHistorySessions(payload.sessions);
     } catch (error) {
       toast.error("加载历史会话失败", { description: error instanceof Error ? error.message : "未知错误" });
     } finally {
       setHistoryLoading(false);
     }
-  }, []);
+  }, [projectId]);
 
   const viewHistorySession = (historySession: MonitorSession) => {
     setHistoryOpen(false);
@@ -533,6 +556,7 @@ export default function Home() {
   const importSessionFile = async (file: File) => {
     const form = new FormData();
     form.append("file", file);
+    form.append("project_id", projectId);
     try {
       const response = await fetch(`${API_BASE}/api/sessions/import`, { method: "POST", body: form });
       const body = await response.json().catch(() => ({}));
@@ -599,6 +623,7 @@ export default function Home() {
         method: "POST",
         body: JSON.stringify({
           serial: selectedSerial,
+          project_id: projectId,
           duration_seconds: durationMinutes * 60,
           interval_ms: intervalMs,
           metrics,
@@ -671,6 +696,14 @@ export default function Home() {
             </div>
           </div>
           <div className="space-y-5 p-4">
+            <section>
+              <label className="mb-2 block text-xs text-slate-400" htmlFor="performance-project">所属项目</label>
+              <select id="performance-project" value={running ? (session?.project_id || "default") : projectId} onChange={event => selectProject(event.target.value)} disabled={running} className="h-10 w-full rounded-sm border border-slate-600/80 bg-slate-950/55 px-3 text-xs text-slate-200 disabled:opacity-60">
+                {running && session?.project_id && !projects.some(project => project.id === session.project_id) && <option value={session.project_id}>{session.project_name || session.project_id}</option>}
+                {projects.map(project => <option key={project.id} value={project.id}>{project.name}</option>)}
+              </select>
+              {projectError && <p className="mt-1 text-xs text-red-300">{projectError}</p>}
+            </section>
             <section>
               <SectionHeader
                 title="目标车机"
@@ -748,7 +781,7 @@ export default function Home() {
               {running ? (
                 <Button onClick={() => void stopSession()} disabled={loading} className="h-10 w-full bg-red-400 text-red-950 hover:bg-red-300"><CircleStop size={15} /> {loading ? "正在停止…" : "停止并汇总"}</Button>
               ) : (
-                <Button onClick={() => void startSession()} disabled={loading || !selectedSerial || enabledMetrics.length === 0} className="h-10 w-full bg-cyan-300 text-slate-950 hover:bg-cyan-200"><Play size={15} fill="currentColor" /> {loading ? "正在建立会话…" : "开始连续采样"}</Button>
+                <Button onClick={() => void startSession()} disabled={loading || !!projectError || !selectedSerial || enabledMetrics.length === 0} className="h-10 w-full bg-cyan-300 text-slate-950 hover:bg-cyan-200"><Play size={15} fill="currentColor" /> {loading ? "正在建立会话…" : "开始连续采样"}</Button>
               )}
               <p className="mt-2 text-center font-telemetry text-[10px] text-slate-500">HARD LIMIT · 60 MINUTES</p>
             </div>
@@ -766,7 +799,7 @@ export default function Home() {
                 <div>
                   <p className="font-telemetry text-[10px] uppercase tracking-[0.18em] text-slate-500">Session status</p>
                   <h2 className="mt-0.5 text-lg font-semibold text-slate-100">{running ? "正在连续采样" : session ? `会话已${session.state === "completed" ? "完成" : session.state === "stopped" ? "停止" : session.state}` : "等待建立会话"}</h2>
-                  <p className="mt-1 text-xs text-slate-500">{running ? `目标 ${session?.serial} · ${session?.summary?.sample_count || 0} 个有效采样周期` : "数据仅保存于本机 data/ 会话目录；运行中显示最近 180 点，结束后可浏览全周期。"}</p>
+                  <p className="mt-1 text-xs text-slate-500">{running ? `${session?.project_name || "默认项目"} · 目标 ${session?.serial} · ${session?.summary?.sample_count || 0} 个有效采样周期` : "数据仅保存于本机 data/ 会话目录；运行中显示最近 180 点，结束后可浏览全周期。"}</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2 xl:justify-end">
@@ -839,7 +872,7 @@ export default function Home() {
       <Dialog open={historyOpen} onOpenChange={setHistoryOpen}>
         <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto border-slate-700 bg-slate-900 text-slate-100 sm:max-w-3xl">
           <DialogHeader>
-            <DialogTitle className="text-sm font-semibold">历史会话</DialogTitle>
+            <DialogTitle className="text-sm font-semibold">历史会话 · {projects.find(project => project.id === projectId)?.name}</DialogTitle>
             <DialogDescription className="text-xs text-slate-500">本地 data/ 目录中的会话记录；可导入外部 monitor.db 文件后查看。</DialogDescription>
           </DialogHeader>
           <div className="space-y-3">
@@ -875,6 +908,24 @@ export default function Home() {
                           <Button variant="outline" className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"><FileText size={12} /> 报告</Button>
                         </PerformanceReportDialog>
                         <Button variant="outline" onClick={() => viewHistorySession(item)} className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100">查看</Button>
+                        <DeleteRecordButton
+                          path={`/sessions/${encodeURIComponent(item.session_id)}/delete`}
+                          title={`删除 ${item.dir_name || item.serial} 的性能记录`}
+                          description="将删除该性能会话及其数据文件，关联的其他测试记录将无法显示此会话的性能数据。删除后无法恢复。"
+                          disabled={item.state === "running"}
+                          className="h-7 border-slate-600 bg-slate-950/20 px-2.5 text-[11px] text-slate-300 hover:bg-slate-800 hover:text-cyan-100"
+                          onDeleted={() => {
+                            setHistorySessions(current => current.filter(value => value.session_id !== item.session_id));
+                            if (activeSessionIdRef.current === item.session_id) {
+                              activeSessionIdRef.current = null;
+                              setActiveSessionId(null);
+                              setSession(null);
+                              setPoints([]);
+                              setProcesses([]);
+                              setEvents([]);
+                            }
+                          }}
+                        />
                       </div>
                     </div>
                   ))}

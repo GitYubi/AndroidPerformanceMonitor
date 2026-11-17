@@ -97,7 +97,9 @@ try {
   const { runCase } = await import("./framework.mjs");
   const { exploreTree } = await import("./explore.mjs");
   const { createTreeDevice } = await import("./hierarchy.mjs");
-  const treeDevice = job.serial ? createTreeDevice(job.serial) : null;
+  const treeDevice = job.serial
+    ? createTreeDevice(job.serial, job.pythonExecutable)
+    : null;
   // Sensitive input is omitted from our events. Disable SDK report for these runs,
   // because SDK reports may retain raw inputs. Explicit captures stay in memory
   // for comparisons, but sensitive runs never write screenshot files.
@@ -211,13 +213,15 @@ try {
             captureImage: async () =>
               (capturedImage ??= await treeDevice.screenshot()),
             captureElement: selector =>
-              captureElement(
-                job.pythonExecutable ||
-                  (process.platform === "win32" ? "python" : "python3"),
-                job.serial,
-                selector,
-                step.timeoutMs
-              ),
+              selector.treeSource
+                ? treeDevice.captureElement(selector)
+                : captureElement(
+                    job.pythonExecutable ||
+                      (process.platform === "win32" ? "python" : "python3"),
+                    job.serial,
+                    selector,
+                    step.timeoutMs
+                  ),
             onImage: image => {
               capturedImage = image;
             },

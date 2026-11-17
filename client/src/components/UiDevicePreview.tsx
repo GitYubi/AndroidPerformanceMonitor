@@ -11,9 +11,13 @@ import { toast } from "sonner";
 import ScrcpyScreen, { type ScrcpyHandle } from "@/components/ScrcpyScreen";
 import { BACKEND_URL } from "@/lib/backend";
 import {
+  boundsStyle,
+  candidateLabel,
   elementCenter,
   nodesAtPoint,
+  pointCandidates,
   screenPixel,
+  treeSourceLabel,
   type MapNode,
   type Observation,
 } from "@/lib/uiObservation";
@@ -40,7 +44,7 @@ async function readDevice<T>(
   const response = await fetch(`${BACKEND_URL}/api/ui/map/${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ serial }),
+    body: JSON.stringify({ serial, ...(path === "observe" ? { inspectWindows: true } : {}) }),
     signal,
   });
   const result = await response.json();
@@ -52,27 +56,30 @@ async function readDevice<T>(
 }
 
 function selectorFor(node: MapNode, observation: Observation): Selector {
-  const selector = {
+  const selector: Selector = {
     resourceId: node.resourceId,
     className: node.className,
     package: node.package,
+    ...(observation.treeSource && observation.treeSource !== "screenshot"
+      ? { treeSource: observation.treeSource }
+      : {}),
   };
   const sameIdentity = observation.nodes.filter(
     other =>
-      other.resourceId === node.resourceId &&
-      other.className === node.className &&
-      other.package === node.package
+      (!node.resourceId || other.resourceId === node.resourceId) &&
+      (!node.className || other.className === node.className) &&
+      (!node.package || other.package === node.package)
   );
   if (node.resourceId && sameIdentity.length === 1) return selector;
-  const label = node.text || node.description;
-  const stillAmbiguous =
+  const label = node.text || node.description || node.label;
+  const needsPath = (!node.resourceId && !label) ||
     sameIdentity.filter(
-      other => !label || label === other.text || label === other.description
+      other => !label || [other.text, other.description, other.label].includes(label)
     ).length > 1;
   return {
     ...selector,
     label,
-    ...(stillAmbiguous ? { xpath: node.xpath } : {}),
+    ...(needsPath ? { xpath: node.xpath } : {}),
   };
 }
 
@@ -137,6 +144,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
     const [frame, setFrame] = useState<Frame | null>(null);
     const [observation, setObservation] = useState<Observation | null>(null);
     const [candidates, setCandidates] = useState<MapNode[]>([]);
+    const [hovered, setHovered] = useState<MapNode[]>([]);
     const [node, setNode] = useState<MapNode | null>(null);
     const [clickedPoint, setClickedPoint] = useState<Pixel | null>(null);
     const [loading, setLoading] = useState(false);
@@ -162,6 +170,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
       const controller = new AbortController();
       request.current = controller;
       setLoading(true);
+      setHovered([]);
       setError("");
       pending.current = (async () => {
         try {
@@ -206,7 +215,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
       );
       if (!point) return;
       setClickedPoint(point);
-      if (!observation) return;
+      if (!observation?.nodes.length) return;
       const matches = nodesAtPoint(observation, point.x, point.y);
       setCandidates(matches);
       setNode(matches[0] ?? null);
@@ -272,17 +281,21 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
               draggable={false}
               className="block h-auto max-h-[50dvh] w-auto max-w-full cursor-crosshair"
               onClick={pick}
+              onPointerLeave={() => setHovered([])}
+              onPointerMove={event =>
+                setHovered(observation && !loading ? pointCandidates(observation, event) : [])
+              }
             />
+            {hovered.map(item => item.bounds && (
+              <span key={item.index} aria-hidden="true"
+                className="pointer-events-none absolute border border-dashed border-cyan-400/70"
+                style={boundsStyle(frame, item.bounds)} />
+            ))}
             {bounds && (
               <span
                 aria-hidden="true"
                 className="pointer-events-none absolute border-2 border-cyan-400"
-                style={{
-                  left: `${(bounds[0] * 100) / frame.width}%`,
-                  top: `${(bounds[1] * 100) / frame.height}%`,
-                  width: `${((bounds[2] - bounds[0]) * 100) / frame.width}%`,
-                  height: `${((bounds[3] - bounds[1]) * 100) / frame.height}%`,
-                }}
+                style={boundsStyle(frame, bounds)}
               />
             )}
             {center && <PixelMarker point={center} frame={frame} center />}
@@ -326,7 +339,8 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
         )}
         {!live && observation && (
           <div className="space-y-2 text-xs">
-            {!node && (
+            {observation.treeSource && <p className="text-muted-foreground">{treeSourceLabel[observation.treeSource]}</p>}
+            {!node && observation.nodes.length > 0 && (
               <p className="text-muted-foreground">点击画面中的元素进行选择</p>
             )}
             {node && (
@@ -346,9 +360,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
                   >
                     {candidates.map(item => (
                       <option key={item.index} value={item.index}>
-                        {[item.label, item.resourceId || item.className]
-                          .filter(Boolean)
-                          .join(" · ")}
+                        {candidateLabel(item)}
                       </option>
                     ))}
                   </select>
@@ -359,6 +371,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
                 >
                   <ElementDetail label="XPath" value={node.xpath} />
                   <ElementDetail label="Resource ID" value={node.resourceId} />
+                  <ElementDetail label="包名" value={node.package} />
                   <ElementDetail
                     label="元素边界"
                     value={bounds ? `[${bounds.join(", ")}] px` : undefined}

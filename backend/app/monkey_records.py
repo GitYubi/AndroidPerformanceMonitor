@@ -51,10 +51,7 @@ class MonkeyReportStore(SessionStore):
 
     def get_all_samples(self, session_id: str) -> list[dict]:
         with connect(self.database) as c:
-            count = c.execute("SELECT COUNT(*) FROM sample").fetchone()[0]
-            stride = max(1, (count + 5999) // 6000)
-            rows = c.execute("""WITH numbered AS (SELECT sample.*, ROW_NUMBER() OVER (ORDER BY id) AS rn FROM sample)
-                SELECT * FROM numbered WHERE (rn - 1) % ? = 0 OR rn = ? ORDER BY rn""", (stride, count))
+            rows = c.execute("SELECT * FROM sample ORDER BY id")
             return [dict(row) for row in rows]
 
     def get_process_uss_series(self, session_id: str) -> list[dict]:
@@ -62,18 +59,24 @@ class MonkeyReportStore(SessionStore):
             columns = {row["name"] for row in c.execute("PRAGMA table_info(process_sample)")}
             if "uss_kb" not in columns:
                 return []
-            rows = c.execute("""WITH top_process AS (
-                SELECT process_name FROM process_sample WHERE uss_kb IS NOT NULL
-                GROUP BY process_name ORDER BY AVG(uss_kb) DESC LIMIT 15
-            ), ranked AS (
+            rows = c.execute("""WITH memory AS (
                 SELECT s.ts_ms, p.process_name, p.pid, p.uss_kb,
-                  ROW_NUMBER() OVER (PARTITION BY p.process_name ORDER BY s.ts_ms, s.id) AS rn,
-                  COUNT(*) OVER (PARTITION BY p.process_name) AS total
+                  CASE WHEN INSTR(p.process_name, ':') > 0
+                       THEN SUBSTR(p.process_name, 1, INSTR(p.process_name, ':') - 1)
+                       ELSE p.process_name END AS app
                 FROM process_sample p JOIN sample s ON s.id=p.sample_id
-                WHERE p.uss_kb IS NOT NULL AND p.process_name IN (SELECT process_name FROM top_process)
-            ) SELECT ts_ms, process_name, pid, uss_kb FROM ranked
-              WHERE rn=1 OR rn=total OR rn % MAX(1, (total+599)/600)=0
-              ORDER BY ts_ms, process_name""")
+                WHERE p.uss_kb IS NOT NULL OR p.pss_kb IS NOT NULL
+            ), totals AS (
+                SELECT app, ts_ms, SUM(uss_kb) AS uss FROM memory
+                WHERE uss_kb IS NOT NULL GROUP BY app, ts_ms
+            ), top_apps AS (
+                SELECT app FROM totals GROUP BY app ORDER BY AVG(uss) DESC LIMIT 15
+            )
+            SELECT ts_ms, process_name, pid, uss_kb FROM memory
+            WHERE uss_kb IS NOT NULL AND app IN (SELECT app FROM top_apps)
+            UNION ALL
+            SELECT DISTINCT ts_ms, NULL, NULL, NULL FROM memory
+            ORDER BY ts_ms, process_name""")
             return [dict(row) for row in rows]
 
 
@@ -111,12 +114,30 @@ class MonkeyRecords:
             raise KeyError(run_id)
         return json.loads(row[0])
 
-    def runs(self, limit: int = 50, offset: int = 0, unfinished: bool = False, brief: bool = False) -> list[dict]:
+    def runs(self, limit: int = 50, offset: int = 0, unfinished: bool = False, brief: bool = False, project_id: str | None = None) -> list[dict]:
         with connect(self.index) as c:
-            where = "WHERE state IN ('starting','running','stopping')" if unfinished else ""
+            conditions = []
+            params = []
+            if unfinished:
+                conditions.append("state IN ('starting','running','stopping')")
+            if project_id is not None:
+                conditions.append("COALESCE(json_extract(body,'$.project_id'), 'default') = ?")
+                params.append(project_id)
+            where = "WHERE " + " AND ".join(conditions) if conditions else ""
             body = "json_remove(body,'$.config')" if brief else "body"
             rows = c.execute(f"SELECT {body} FROM jobs {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                             (min(limit, 50), offset)).fetchall()
+                             (*params, min(limit, 50), offset)).fetchall()
+        return [json.loads(row[0]) for row in rows]
+
+    def recovery_runs(self) -> list[dict]:
+        with connect(self.index) as c:
+            rows = c.execute("""
+                SELECT body FROM jobs
+                WHERE state IN ('starting', 'running', 'stopping')
+                   OR json_extract(body, '$.pending_session_id') IS NOT NULL
+                   OR json_extract(body, '$.current_session_id') IS NOT NULL
+                ORDER BY created_at
+            """).fetchall()
         return [json.loads(row[0]) for row in rows]
 
     def directory(self, run_id: str) -> Path:
@@ -134,6 +155,8 @@ class MonkeyRecords:
         writer = store.create_session(run["id"], {
             "session_id": run["id"],
             "serial": run["serial"], "created_at_ms": run["created_at_ms"],
+            "project_id": run.get("project_id", "default"),
+            "project_name": run.get("project_name", "默认项目"),
             "duration_seconds": (run["config"]["duration_hours"] or 0) * 3600,
             "interval_ms": run["config"]["interval_ms"],
             "enabled_metrics": {"cpu": True, "memory": True, "fps": run["config"]["fps"]},

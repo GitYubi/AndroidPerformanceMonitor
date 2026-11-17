@@ -23,6 +23,8 @@ class StartSessionRequest(BaseModel):
     """创建会话的受限请求体，最长持续 60 分钟。"""
 
     serial: str = Field(min_length=1, max_length=128)
+    project_id: str = Field(default="default", pattern=r"^(?:default|[a-f0-9]{32})$")
+    project_name: str = Field(default="默认项目", max_length=100)
     duration_seconds: int = Field(default=900, ge=1, le=3600)
     interval_ms: int = Field(default=2000, ge=500, le=5000)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)

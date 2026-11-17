@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import asynccontextmanager
+import asyncio
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Annotated, AsyncIterator
 
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 
 from .adb import AdbError, enrich_device, list_devices, list_surface_layers
 from .fps_probe import PAGE_HTML, probe_status
@@ -18,6 +19,8 @@ from .models import StartSessionRequest
 from .monitor import MonitorManager
 from .interaction import InteractionError, InteractionTraceManager
 from .report import ReportMetric, ReportTheme, generate_report
+from .record_cleanup import stage_directory, finish_directory
+from .storage import MAX_SESSION_IMPORT_BYTES
 from .ui_testing import UIManager, router as ui_router
 from .ui_map import MapStore, router as map_router
 from .ui_stream import router as stream_router
@@ -30,24 +33,24 @@ DATA_ROOT = Path(__file__).resolve().parents[1] / "data"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    app.state.can = CanService()
-    manager = MonitorManager(DATA_ROOT)
-    manager.store.recover_interrupted_sessions()
-    app.state.manager = manager
-    app.state.interactions = InteractionTraceManager(DATA_ROOT)
-    app.state.ui = UIManager(DATA_ROOT.parent / 'ui-data', manager, app.state.can)
-    app.state.ui_drafts = {}
-    app.state.ui_map = MapStore(DATA_ROOT.parent / 'ui-data')
-    manager.ui_manager = app.state.ui
-    app.state.monkey = MonkeyManager(DATA_ROOT.parent / 'monkey-data', manager, app.state.ui, app.state.interactions)
-    await app.state.monkey.recover()
-    try:
+    async with AsyncExitStack() as shutdown:
+        app.state.can = CanService()
+        shutdown.push_async_callback(asyncio.to_thread, app.state.can.close)
+        manager = MonitorManager(DATA_ROOT)
+        shutdown.push_async_callback(manager.close)
+        manager.store.recover_interrupted_sessions()
+        app.state.manager = manager
+        app.state.interactions = InteractionTraceManager(DATA_ROOT)
+        shutdown.push_async_callback(app.state.interactions.close)
+        app.state.ui = UIManager(DATA_ROOT.parent / 'ui-data', manager, app.state.can)
+        shutdown.push_async_callback(app.state.ui.close)
+        app.state.ui_drafts = {}
+        app.state.ui_map = MapStore(DATA_ROOT.parent / 'ui-data')
+        manager.ui_manager = app.state.ui
+        app.state.monkey = MonkeyManager(DATA_ROOT.parent / 'monkey-data', manager, app.state.ui, app.state.interactions)
+        shutdown.push_async_callback(app.state.monkey.close)
+        await app.state.monkey.recover()
         yield
-    finally:
-        await __import__("asyncio").to_thread(app.state.can.close)
-        await app.state.monkey.close()
-        await manager.close()
-        await app.state.ui.close()
 
 
 app = FastAPI(title="Android 车机性能监测 API", version="0.1.0", lifespan=lifespan)
@@ -113,8 +116,10 @@ async def start_session(payload: StartSessionRequest, request: Request) -> dict[
     manager = manager_from(request)
     try:
         ui = request.app.state.ui
-        async with ui.device_lock(payload.serial):
-            session_id = await manager.start(payload)
+        async with ui.lock, ui.device_lock(payload.serial):
+            ui.store.images.require_project(payload.project_id)
+            project = next(item for item in ui.store.images.projects() if item['id'] == payload.project_id)
+            session_id = await manager.start(payload.model_copy(update={'project_name': project['name']}))
             if ui.has_active_device(payload.serial):
                 manager.active[session_id].preserve_device_logs = True
                 ui.link_performance(payload.serial, session_id)
@@ -139,20 +144,41 @@ async def fps_probe_status(serial: str = Query(min_length=1, max_length=128)) ->
 
 
 @app.get("/api/sessions")
-async def list_sessions(request: Request) -> dict[str, object]:
+async def list_sessions(request: Request, project_id: str | None = None) -> dict[str, object]:
     """列出本地全部历史会话（按修改时间倒序）。"""
-    return {"sessions": manager_from(request).store.list_sessions()}
+    return {"sessions": manager_from(request).store.list_sessions(project_id=project_id)}
 
 
 @app.post("/api/sessions/import", status_code=201)
-async def import_session(request: Request, file: UploadFile = File(...)) -> dict[str, object]:
+async def import_session(request: Request, file: UploadFile = File(...),
+                         project_id: str = Form(default="default")) -> dict[str, object]:
     """导入外部会话数据库文件（monitor.db 二进制）。"""
     store = manager_from(request).store
-    data = await file.read()
-    if not data:
-        raise HTTPException(status_code=422, detail="文件为空")
+    if file.size is not None and file.size > MAX_SESSION_IMPORT_BYTES:
+        raise HTTPException(status_code=413, detail="会话数据库最大为 256 MiB")
     try:
-        session_id = store.import_database(data)
+        with store.import_stage() as directory:
+            stage = Path(directory)
+            total = 0
+            with (stage / "monitor.db").open("wb") as output:
+                while chunk := await file.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > MAX_SESSION_IMPORT_BYTES:
+                        raise HTTPException(status_code=413, detail="会话数据库最大为 256 MiB")
+                    output.write(chunk)
+            if not total:
+                raise ValueError("文件为空")
+            async with request.app.state.ui.lock:
+                images = request.app.state.ui.store.images
+                images.require_project(project_id)
+                project = next(item for item in images.projects() if item['id'] == project_id)
+                operation = asyncio.create_task(asyncio.to_thread(
+                    store.publish_import, stage, project_id, project['name']))
+                try:
+                    session_id = await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    await asyncio.gather(operation, return_exceptions=True)
+                    raise
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return store.get_session(session_id) or {"session_id": session_id, "state": "imported"}
@@ -180,6 +206,31 @@ async def stop_session(session_id: str, request: Request) -> dict[str, object]:
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return manager.store.get_session(session_id) or {"session_id": session_id, "state": "stopped"}
+
+
+@app.post("/api/sessions/{session_id}/delete")
+async def delete_session(session_id: str, request: Request):
+    manager = manager_from(request)
+    async with request.app.state.ui.lock:
+        session = manager.store.get_session(session_id)
+        if session is None:
+            raise HTTPException(404, "会话不存在")
+        if session_id in manager.active or session.get("state") == "running":
+            raise HTTPException(409, "运行中的会话不能删除")
+        monkey = request.app.state.monkey
+        for run_id in monkey.active:
+            run = monkey.store.get(run_id)
+            if session_id in (run.get('current_session_id'), run.get('pending_session_id')):
+                raise HTTPException(409, "该会话正在被 Monkey 归档")
+        path = manager.store.database_path(session_id)
+        directory = path.parent
+        if directory.parent.resolve() != manager.store.data_root.resolve() or directory.is_symlink():
+            raise HTTPException(409, "会话目录无效，无法删除")
+        try:
+            staged = stage_directory(directory)
+        except (OSError, ValueError) as error:
+            raise HTTPException(409, f"删除会话失败：{error}") from error
+        return {"deleted": True, "cleanupErrors": finish_directory(staged)}
 
 
 @app.get("/api/sessions/{session_id}")
@@ -249,13 +300,13 @@ async def session_report(
     return HTMLResponse(content=content, headers=headers)
 
 
-@app.get("/api/sessions/{session_id}/export", response_class=PlainTextResponse)
-async def export_session(session_id: str, request: Request) -> PlainTextResponse:
+@app.get("/api/sessions/{session_id}/export", response_class=StreamingResponse)
+async def export_session(session_id: str, request: Request) -> StreamingResponse:
     store = manager_from(request).store
     if store.get_session(session_id) is None:
         raise HTTPException(status_code=404, detail="会话不存在")
-    return PlainTextResponse(
-        store.to_csv(session_id),
+    return StreamingResponse(
+        store.iter_csv(session_id),
         media_type="text/csv; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{session_id}-samples.csv"'},
     )

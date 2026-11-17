@@ -2,6 +2,8 @@
 import asyncio
 import json
 import os
+import sqlite3
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -83,6 +85,42 @@ def test_real_worker_snapshot_secret_omission_and_device_lock(monkeypatch, tmp_p
         assert not manager.tasks and not manager.processes
     asyncio.run(scenario())
 
+
+def test_project_delete_hides_staged_history_when_purge_fails(tmp_path, monkeypatch):
+    from app.storage import SessionStore
+    import shutil
+
+    manager = ui.UIManager(tmp_path / "ui")
+    performance = SessionStore(tmp_path / "performance")
+    project_id = manager.store.images.create_project("to delete")["id"]
+    writer = performance.create_session("history", {
+        "session_id": "history", "serial": "fixture", "created_at_ms": 1,
+        "duration_seconds": 60, "interval_ms": 1000, "enabled_metrics": {"cpu": True},
+        "project_id": project_id,
+    })
+    writer.finish("stopped")
+    directory = writer.database_path.parent
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        ui=manager, manager=SimpleNamespace(store=performance, active={}),
+    )))
+
+    remove = shutil.rmtree
+
+    def fail_purge(path, *args, **kwargs):
+        if Path(path).parent == performance.data_root:
+            raise PermissionError("fixture purge denied")
+        return remove(path, *args, **kwargs)
+
+    with monkeypatch.context() as failures:
+        failures.setattr(shutil, "rmtree", fail_purge)
+        result = asyncio.run(ui.delete_ui_project(project_id, request))
+    assert result["deleted"]
+    staged, = map(Path, result["cleanupErrors"])
+    assert staged.parent == directory.parent and staged.name.startswith(".delete-")
+    assert staged.is_dir() and not directory.exists()
+    assert performance.get_session("history") is None and performance.list_sessions() == []
+    remove(staged)
+    assert not staged.exists()
 
 def test_cancel_and_abnormal_exit_have_terminal_state(monkeypatch, tmp_path):
     setup_worker(monkeypatch, tmp_path, "setInterval(() => {}, 1000);")
@@ -211,13 +249,57 @@ def test_log_export_preserves_device_files_when_ui_overlaps(monkeypatch, tmp_pat
 
     async def adb(*args, **kwargs):
         commands.append(args)
-        return 'trace.txt\n' if args[0] == 'shell' and args[1] == 'ls' else ''
+        if args[0] == 'shell':
+            assert args[1].startswith('find ')
+            return '/data/anr/trace.txt\0'
+        assert args[0] == 'pull'
+        Path(args[2]).write_text('fixture trace')
+        return ''
 
     monkeypatch.setattr('app.device_logs.run_adb', adb)
     results = asyncio.run(export_and_clean_device_logs('test', DeviceLogConfig(anr='/data/anr'), tmp_path, lambda *args: None, preserve=True))
     assert results['ANR']['exported'] == 1
     assert results['ANR']['cleaned'] is False
     assert not any('rm' in command for command in commands)
+
+
+@pytest.mark.parametrize("phase", ["events", "put"])
+def test_execution_releases_registration_when_storage_fails(tmp_path, monkeypatch, phase):
+    async def scenario():
+        manager = ui.UIManager(tmp_path)
+        request = ui.RunRequest.model_validate({
+            "serial": "",
+            "testCase": {
+                "name": "delay",
+                "steps": [{"id": "delay", "type": "delay", "prompt": "wait", "options": {"durationMs": 1}}],
+            },
+        })
+        run = await manager.start(request)
+        run_id = run["id"]
+        manager.cancelled.add(run_id)
+        task = manager.tasks[run_id]
+
+        def storage_error(*args, **kwargs):
+            raise sqlite3.OperationalError("fixture storage failure")
+
+        with monkeypatch.context() as faults:
+            faults.setattr(manager.store, phase, storage_error)
+            if phase == "put":
+                with pytest.raises(sqlite3.OperationalError, match="fixture storage failure"):
+                    await task
+            else:
+                await task
+                saved = manager.store.get("runs", run_id)
+                assert saved["state"] == "cancelled" and "事件" in saved["message"]
+        assert run_id not in manager.tasks and run_id not in manager.cancelled
+        assert not manager.has_active_device("")
+
+        again = await manager.start(request)
+        manager.cancelled.add(again["id"])
+        await manager.tasks[again["id"]]
+        assert manager.store.get("runs", again["id"])["state"] == "cancelled"
+
+    asyncio.run(scenario())
 
 
 def test_draft_uses_completed_semantic_actions_and_keeps_unresolved_steps():
@@ -254,6 +336,105 @@ def test_step_metrics_only_include_samples_inside_step_window(tmp_path):
     assert result['cpuAverage'] == 30
     assert result['memoryAverageMb'] == 3
     assert result['fpsAverage'] == 45
+
+
+def test_step_metrics_pair_loop_occurrences_and_exclude_cancelled_gap(tmp_path):
+    path = tmp_path / 'perf.db'
+    with sqlite3.connect(path) as conn:
+        conn.execute('CREATE TABLE sample (ts_ms INTEGER, cpu_total_pct REAL, pss_kb REAL, fps REAL)')
+        conn.executemany('INSERT INTO sample VALUES (?,?,?,?)', [
+            (10, 10, 1024, 30), (20, 95, 8192, 1), (30, 15, 2048, 60), (42, 99, 8192, 1),
+        ])
+    run = {'testCase': {'steps': [{'id': 'check'}]}, 'performanceSessionId': 'perf',
+           'state': 'cancelled', 'endedAt': 50}
+
+    def event(stamp, state, iterations):
+        return dict(type='step', stepId='check', time=stamp, state=state, iterations=iterations)
+
+    events = [
+        event(9, 'running', [1, 1]), event(11, 'passed', [1, 1]),
+        event(29, 'running', [2, 1]), event(31, 'failed', [2, 1]),
+        event(40, 'running', [2, 2]), event(41, 'passed', [2, 3]),
+    ]
+    store = SimpleNamespace(database_path=lambda _: path)
+    expected = ui.step_metrics(run, events, store)[0]
+    assert expected == dict(stepId='check', sessionId='perf', start=9, end=31, sampleCount=2,
+                            cpuAverage=12.5, cpuPeak=15, memoryAverageMb=1.5, fpsAverage=45)
+    assert ui.step_metrics(run, events[-2:], store) == []
+    assert ui.step_metrics(dict(run, state='running', endedAt=None), events, store)[0]['sampleCount'] == 3
+
+
+def test_run_baseline_is_pinned_before_runner_reads_it(tmp_path, monkeypatch):
+    import hashlib
+    import io
+
+    from PIL import Image
+
+    def png(color):
+        image = io.BytesIO()
+        Image.new('RGB', (2, 2), color).save(image, format='PNG')
+        return image.getvalue()
+
+    async def exercise():
+        service = ui.UIManager(tmp_path)
+        original, replacement = png('blue'), png('red')
+        before = service.store.images.save('default', 'baseline', 'roi', original)
+        asset_key = f"default/{before['id']}"
+        ready, resume = asyncio.Event(), asyncio.Event()
+        reads = []
+        run_execute = service.execute
+
+        async def worker(run_id, job, *args):
+            path = Path(job['baselineFiles'][asset_key])
+            assert path.parent.parent == Path(job['outputDir']) / '.baselines'
+            reads.append(hashlib.sha256(path.read_bytes()).hexdigest())
+            ready.set()
+            await resume.wait()
+            reads.append(hashlib.sha256(path.read_bytes()).hexdigest())
+            service.tasks.pop(run_id)
+
+        monkeypatch.setattr(service, 'execute', worker)
+        async def devices():
+            return [SimpleNamespace(serial='fixture', state='device')]
+        monkeypatch.setattr(ui, 'list_devices', devices)
+        request = ui.RunRequest.model_validate({
+            'serial': 'fixture', 'testCase': {'name': 'snapshot', 'steps': [{
+                'id': 'check', 'type': 'image_assert', 'prompt': 'compare ROI',
+                'options': {'baselineId': before['id'], 'baselineProjectId': 'default', 'mode': 'roi',
+                            'roi': {'left': 0, 'top': 0, 'right': 2, 'bottom': 2}},
+            }]},
+        })
+        first = await service.start(request)
+        await asyncio.wait_for(ready.wait(), 2)
+        async with service.lock:
+            after = service.store.images.save('default', 'baseline', 'roi', replacement)
+        assert after['id'] == before['id']
+        first_task = service.tasks[first['id']]
+        resume.set()
+        await first_task
+        second = await service.start(request)
+        await service.tasks[second['id']]
+        assert reads == [hashlib.sha256(data).hexdigest()
+                         for data in (original, original, replacement, replacement)]
+
+        monkeypatch.setattr(service, 'execute', run_execute)
+        # The actual device-free runner uses the pinned legacy path, too.
+        baseline_id = 'a' * 64
+        service.store.baselines.mkdir(exist_ok=True)
+        original_path = service.store.baselines / f'{baseline_id}.png'
+        original_path.write_bytes(original)
+        legacy = ui.RunRequest.model_validate({'serial': '', 'testCase': {'name': 'legacy', 'steps': [
+            {'id': name, 'type': 'assign', 'prompt': name,
+             'options': {'variable': name, 'valueType': 'image', 'baselineId': baseline_id}}
+            for name in ('first', 'second')
+        ] + [{'id': 'check', 'type': 'screenshot_assert', 'prompt': 'compare',
+              'options': {'firstVariable': 'first', 'secondVariable': 'second'}}]}})
+        run = await service.start(legacy)
+        original_path.unlink()
+        await asyncio.wait_for(service.tasks[run['id']], 5)
+        assert service.store.get('runs', run['id'])['state'] == 'passed'
+
+    asyncio.run(exercise())
 
 
 def test_exploration_draft_contains_initial_and_restored_state_assertions():
@@ -519,7 +700,8 @@ def test_project_overview_uses_all_cases_and_run_snapshots(tmp_path):
         ui.ui_project_overview('missing', request)
 
 
-def test_delete_project_removes_owned_data_and_preserves_shared_images(tmp_path):
+@pytest.mark.parametrize("fault", [None, "stage", "commit"])
+def test_delete_project_removes_owned_data_and_preserves_shared_images(tmp_path, monkeypatch, fault):
     import io
     from PIL import Image
 
@@ -549,6 +731,35 @@ def test_delete_project_removes_owned_data_and_preserves_shared_images(tmp_path)
         with pytest.raises(ui.HTTPException, match='正在运行'):
             await ui.delete_ui_project(project_id, request)
         manager.tasks.clear()
+        if fault:
+            if fault == "commit":
+                with manager.store.connect() as connection:
+                    connection.execute("""
+                        CREATE TRIGGER fail_project_delete BEFORE DELETE ON ui_projects
+                        BEGIN SELECT RAISE(ABORT, 'fixture database failure'); END
+                    """)
+            original_replace = Path.replace
+
+            def fail_staging(path, target):
+                if path == run_dir and Path(target).name.startswith(".delete-"):
+                    raise PermissionError("fixture directory permission failure")
+                return original_replace(path, target)
+
+            with monkeypatch.context() as failures:
+                if fault == "stage":
+                    failures.setattr(Path, "replace", fail_staging)
+                with pytest.raises(ui.HTTPException) as rejected:
+                    await ui.delete_ui_project(project_id, request)
+                assert rejected.value.status_code == 409
+            assert manager.store.get('cases', 'owned') == owned
+            assert manager.store.get('cases', 'shared') == shared
+            assert (run_dir / 'evidence.png').read_bytes() == png.getvalue()
+            assert manager.store.images.path(image['id'], project_id).read_bytes() == png.getvalue()
+            assert not manager.store.images.path(image['id'], 'default').exists()
+            assert not list(tmp_path.rglob(".delete-*"))
+            if fault == "commit":
+                with manager.store.connect() as connection:
+                    connection.execute("DROP TRIGGER fail_project_delete")
         result = await ui.delete_ui_project(project_id, request)
         assert result == {'deleted': True, 'cleanupErrors': [], 'deletedRunIds': [run_id]}
         assert not run_dir.exists()
@@ -719,4 +930,44 @@ def test_delete_legacy_image_reports_case_references(tmp_path):
         result = await ui.delete_ui_image('default', image['id'], target, request)
         assert result['deleted'] and not manager.store.images.path(image['id']).exists()
         assert manager.store.get('cases', value.id)['id'] == value.id
+    asyncio.run(scenario())
+
+
+def test_project_overview_and_deletion_include_performance_and_monkey(tmp_path):
+    from app.storage import SessionStore
+    from app.monkey_records import MonkeyRecords
+
+    manager = ui.UIManager(tmp_path / 'ui')
+    monitor = SimpleNamespace(store=SessionStore(tmp_path / 'performance'), active={})
+    monkey = SimpleNamespace(store=MonkeyRecords(tmp_path / 'monkey'), active={})
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=manager, manager=monitor, monkey=monkey)))
+    project_id = manager.store.images.create_project('车型项目')['id']
+    metadata = {'session_id': 's1', 'serial': 'dev', 'created_at_ms': 1,
+                'duration_seconds': 60, 'interval_ms': 1000, 'project_id': project_id,
+                'project_name': '车型项目', 'enabled_metrics': {'cpu': True, 'memory': False, 'fps': False}}
+    writer = monitor.store.create_session('s1', metadata)
+    writer.finish('completed')
+    session_dir = monitor.store.database_path('s1').parent
+    run = {'id': 'c' * 32, 'serial': 'dev', 'state': 'completed', 'created_at_ms': 2,
+           'project_id': project_id, 'project_name': '车型项目',
+           'config': {'duration_hours': 1, 'interval_ms': 1000, 'fps': False}}
+    monkey.store.put(run)
+    monkey.store.initialize(run)
+    monkey_dir = monkey.store.directory(run['id'])
+    info = ui.ui_project_overview(project_id, request)
+    assert info['performanceCount'] == 1 and info['monkeyCount'] == 1
+
+    async def scenario():
+        monitor.active['s1'] = SimpleNamespace(request=SimpleNamespace(project_id=project_id))
+        with pytest.raises(ui.HTTPException, match='性能测试正在运行'):
+            await ui.delete_ui_project(project_id, request)
+        monitor.active.clear()
+        monkey.active[run['id']] = SimpleNamespace(config=SimpleNamespace(project_id=project_id))
+        with pytest.raises(ui.HTTPException, match='Monkey 测试正在运行'):
+            await ui.delete_ui_project(project_id, request)
+        monkey.active.clear()
+        result = await ui.delete_ui_project(project_id, request)
+        assert result['deleted'] and result['cleanupErrors'] == []
+        assert not session_dir.exists() and not monkey_dir.exists()
+        assert monkey.store.runs() == []
     asyncio.run(scenario())

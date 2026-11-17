@@ -73,6 +73,8 @@ session (1) ──< event (N)
 
 ## 5. 本地 API 契约
 
+UI 测试路由、用例模型和运行编排位于 `backend/app/ui_testing.py`。用例、运行记录和事件由 `ui_store.py` 沿用原有 `ui.db` 存储，步骤耗时区间与性能样本的关联由 `ui_metrics.py` 计算。前端步骤编辑与 Node 独立执行使用同一套分支赋值规则，后端仍独立校验传入的用例。
+
 后端监听 `127.0.0.1:8090`（默认；可用 `BACKEND_PORT` 环境变量覆盖，`run-local.sh` 会同步设置 `VITE_BACKEND_URL`），由前端使用 `VITE_BACKEND_URL` 配置。首版使用 REST 轮询以降低本地环境中的长连接复杂度；后端同时预留 SSE 流接口，供后续切换为推送模式。
 
 | 方法与路径 | 作用 |

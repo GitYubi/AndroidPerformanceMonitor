@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 from app import ui_map as m
+from app.ui_hierarchy_capture import default_display_xml, default_focus, default_physical_display
 
 
 def tree(label='Page A', checked=False, duplicate=False):
@@ -48,12 +49,226 @@ def test_switch_state_not_page_identity_and_xpath_unique():
     with pytest.raises(ValueError,match='2 个'):m.resolve(dup,bad)
 
 
+def test_multi_window_projection_preserves_legacy_page_and_selector_paths():
+    legacy = tree(duplicate=True)
+    app = '<node package="demo" class="android.widget.LinearLayout" text="Page A" enabled="true" bounds="[0,0][100,100]">'
+    app += '<node package="demo" class="android.widget.Switch" resource-id="demo:id/switch" text="Toggle" enabled="true" bounds="[10,20][90,60]"/>' * 2
+    app += '</node>'
+    bar = '<node package="com.android.systemui" bounds="[0,0][100,10]" text="TIME"/>'
+    other_display = '<node package="external" display-id="2"/>'
+
+    def multi(time):
+        xml = f'<hierarchy>{other_display}{bar.replace("TIME", time)}{app}</hierarchy>'
+        return {**m.parse_tree(default_display_xml(xml, {0}).decode()), 'treeSource': m.MULTI_WINDOW}
+
+    observed = multi('09:40')
+    assert m.identity(observed) == m.identity(multi('09:41')) == m.identity(legacy)
+    assert m.page_signature(observed) == m.page_signature(legacy)
+    assert m.observation_package(observed) == 'demo'
+    assert [n['package'] for n in observed['nodes']] == ['com.android.systemui', 'demo', 'demo', 'demo']
+    old_loc = m.locator(legacy, legacy['nodes'][2])
+    new_loc = m.locator(observed, observed['nodes'][3])
+    assert old_loc['xpath'] == '/hierarchy/node[1]/node[2]'
+    assert new_loc['xpath'] == '/hierarchy/node[2]/node[2]'
+    assert m.resolve(legacy, old_loc)['index'] == 2
+    assert m.resolve(observed, new_loc)['index'] == 3
+    with pytest.raises(ValueError, match='来源'):
+        m.resolve(observed, old_loc)
+    with pytest.raises(ValueError, match='没有返回'):
+        default_display_xml(f'<hierarchy>{other_display}</hierarchy>', {0, 2})
+    with pytest.raises(ValueError, match='无法确认'):
+        default_display_xml(f'<hierarchy>{bar}{other_display}</hierarchy>', {0, 2})
+
+
+def test_vehicle_default_display_and_foreground_window_mapping():
+    display_dump = """
+  Display: mDisplayId=2 (organized)
+  mFocusedApp=ActivityRecord{abc u0 demo/.Passenger t1}
+  Display: mDisplayId=0 (organized)
+  mCurrentFocus=Window{abc u0 vendor.systemui/Overlay}
+  mFocusedApp=ActivityRecord{dec u0 demo/.MainActivity t2}
+"""
+    window_dump = """
+  Window #3 Window{abc u0 demo/demo.MainActivity}:
+    mDisplayId=2 taskId=3
+    mAttrs={(0,0) ty=BASE_APPLICATION}
+    Frames: parent=[0,0][100,100] frame=[0,0][90,90]
+  Window #4 Window{def u0 demo/demo.MainActivity}:
+    mDisplayId=0 taskId=4
+    mAttrs={(0,0) ty=BASE_APPLICATION}
+    Frames: parent=[0,0][100,100] frame=[0,0][100,100]
+"""
+    xml = """<hierarchy>
+      <node package="demo" display-id="2" bounds="[0,0][90,90]"/>
+      <node package="demo" display-id="0" bounds="[0,0][100,100]"/>
+      <node package="demo" display-id="0" bounds="[0,70][100,100]"/>
+      <node package="vendor.systemui" display-id="0" bounds="[0,0][100,10]"/>
+      </hierarchy>"""
+    filtered = default_display_xml(xml, {0, 2}, default_focus(display_dump), lambda: window_dump)
+    observation = {**m.parse_tree(filtered.decode()), 'treeSource': m.MULTI_WINDOW}
+    assert len(observation['nodes']) == 3
+    assert m.observation_package(observation) == 'demo'
+    assert [node['bounds'] for node in m.application_nodes(observation)] == [[0, 0, 100, 100]]
+
+    def denied():
+        raise PermissionError
+
+    filtered = default_display_xml(xml, {0, 2}, default_focus(display_dump), denied)
+    observation = {**m.parse_tree(filtered.decode()), 'treeSource': m.MULTI_WINDOW}
+    assert len(observation['nodes']) == 3
+    assert m.observation_package(observation) is None
+
+    assert default_physical_display("""
+  Display 2:
+    mPrimaryDisplayDevice=HDMI(local:222)
+  Display 0:
+    mPrimaryDisplayDevice=主屏(local:4630947208271169569)
+""") == '4630947208271169569'
+    assert default_physical_display("""
+  Display 0:
+    mPrimaryDisplayDevice=Device
+    mBaseDisplayInfo=DisplayInfo{"Device", displayId 0, uniqueId "local:123"}
+""") == '123'
+
+
+def test_frame_retries_multidisplay_warning_with_explicit_physical_mapping(monkeypatch):
+    device = m.Device('vehicle')
+    calls = []
+
+    async def command(*args):
+        calls.append(args)
+        return b'[Warning] Multiple displays were found\n'
+
+    async def read_default(*args):
+        calls.append(args)
+        return b'\x89PNG\r\n\x1a\n' + bytes(8) + bytes.fromhex('00000a00000005a0')
+
+    monkeypatch.setattr(device, 'command', command)
+    monkeypatch.setattr(device, 'run', read_default)
+    frame = asyncio.run(device.frame())
+    assert (frame['width'], frame['height']) == (2560, 1440)
+    assert calls[0] == ('exec-out', 'screencap', '-p')
+    assert calls[1][-2:] == ('vehicle', '--capture-default')
+
+
+@pytest.mark.parametrize('adb_available', [False, True])
+def test_inspect_restarts_capture_with_one_source_or_returns_screenshot(adb_available):
+    calls = []
+
+    class Device(m.Device):
+        async def multi_window_tree(self):
+            calls.append('multi')
+            if calls.count('multi') > 1:
+                raise ValueError('UIAutomator2 unavailable after screenshot')
+            return tree()
+
+        async def active_window_tree(self):
+            calls.append('adb')
+            return tree() if adb_available else m.parse_tree('<hierarchy/>')
+
+        async def frame(self):
+            calls.append('frame')
+            return {'width': 100, 'height': 100, 'image': ''}
+
+    result = asyncio.run(Device('emulator').inspect())
+    assert calls[:3] == ['multi', 'frame', 'multi']
+    if adb_available:
+        assert calls[3:] == ['adb', 'frame', 'adb']
+        assert result['nodes'] and result['treeSource'] == m.ACTIVE_WINDOW
+    else:
+        assert calls[-1] == 'frame' and result['width'] == 100
+        assert result['nodes'] == [] and result['treeSource'] == m.SCREENSHOT_ONLY
+
+
+def test_inspect_rejects_orientation_changed_after_screenshot(monkeypatch):
+    device = m.Device('emulator')
+    rotation = iter(['0', '1', '1', '1'])
+
+    async def multi():
+        return {**tree(), 'rotation': next(rotation)}
+
+    async def frame():
+        return {'width': 100, 'height': 100, 'image': ''}
+
+    monkeypatch.setattr(device, 'multi_window_tree', multi)
+    monkeypatch.setattr(device, 'frame', frame)
+    assert asyncio.run(device.inspect())['rotation'] == '1'
+
+
+def test_navigation_seeds_keep_system_windows_out_of_page_fingerprint(tmp_path):
+    from app.ui_navigation import NavigationStore
+
+    xml = ('<hierarchy><node package="com.android.systemui"/>'
+           '<node package="demo"><node package="demo" text="Open" '
+           'resource-id="demo:id/open" clickable="true" enabled="true" bounds="[0,0][50,50]"/>'
+           '</node></hierarchy>')
+    source = {**tree(), **m.parse_tree(xml), 'treeSource': m.MULTI_WINDOW}
+    destination = {**tree('Destination'), 'treeSource': m.MULTI_WINDOW}
+    db = m.MapStore(tmp_path)
+    db.remember(source)
+    db.remember(destination)
+    graph = db.graph('dev')
+    a, b = db.ensure_page(graph, source), db.ensure_page(graph, destination)
+    graph['edges'].append({'id': m.uid(), 'from': a['id'], 'to': b['id'],
+                           'status': 'verified', 'locator': m.locator(source, source['nodes'][2])})
+    db.put('dev', graph)
+    seeds = NavigationStore(tmp_path).load('dev')['seeds']
+    nodes = next(p['nodes'] for p in seeds['pages'] if p['id'] == a['id'])
+    assert [n['package'] for n in nodes] == ['demo', 'demo']
+    assert [n['parent'] for n in nodes] == [None, 0]
+    assert seeds['edges'][0]['selector']['resourceId'] == 'demo:id/open'
+
+
 def test_graph_does_not_use_unverified_or_reverse_edges():
     g={'edges':[{'from':'a','to':'b','status':'observed'}]}
     with pytest.raises(ValueError):m.route(g,'a','b')
     g['edges'][0]['status']='verified'
     assert len(m.route(g,'a','b'))==1
     with pytest.raises(ValueError):m.route(g,'b','a')
+
+
+@pytest.mark.parametrize('restore_order', [('parent', 'child'), ('child', 'parent')])
+def test_subpages_remain_visible_and_links_restore_in_either_order(tmp_path, monkeypatch, restore_order):
+    async def scenario():
+        db, req, _ = setup(tmp_path, monkeypatch, [])
+        graph = db.graph('dev')
+        graph['pages'] = [
+            {'id': 'parent', 'name': 'Parent', 'appId': 'demo'},
+            {'id': 'child', 'name': 'Child', 'appId': 'demo', 'parentPageId': 'parent', 'parentEdgeId': 'pc',
+             'navigationStatus': 'recorded', 'entry': {'sourcePageId': 'parent', 'elementId': 'entry'}},
+            {'id': 'leaf', 'name': 'Leaf', 'appId': 'demo', 'parentPageId': 'child', 'parentEdgeId': 'cl',
+             'navigationStatus': 'recorded'},
+        ]
+        graph['elements'] = [{'id': 'entry', 'pageId': 'parent'}]
+        graph['edges'] = [
+            {'id': 'pc', 'from': 'parent', 'to': 'child', 'status': 'verified'},
+            {'id': 'cl', 'from': 'child', 'to': 'leaf', 'status': 'verified'},
+        ]
+        db.put('dev', graph)
+
+        async def change(id_, action):
+            result = await m.edit(m.EditRequest(serial='dev', id=id_, action=action), req)
+            pages = {page['id']: page for page in result['pages']}
+            edges = {edge['id']: edge for edge in result['edges']}
+            for page in pages.values():
+                assert not page.get('parentPageId') or page['parentPageId'] in pages
+                assert not page.get('parentEdgeId') or page['parentEdgeId'] in edges
+            return result, pages
+
+        result, pages = await change('parent', 'delete')
+        assert pages['child']['navigationStatus'] == 'missing'
+        assert pages['child'].get('entry') is None
+        with pytest.raises(ValueError):
+            m.route(result, 'parent', 'leaf')
+        _, pages = await change('child', 'delete')
+        assert pages['leaf']['navigationStatus'] == 'missing'
+        for page_id in restore_order:
+            result, pages = await change(page_id, 'restore')
+        assert pages['child']['entry']['elementId'] == 'entry'
+        assert [edge['id'] for edge in m.route(result, 'parent', 'leaf')] == ['pc', 'cl']
+        assert len(result['elements']) == 1
+
+    asyncio.run(scenario())
 
 
 def test_saved_element_persists_and_rename_keeps_locator(tmp_path,monkeypatch):
@@ -128,6 +343,27 @@ def test_record_verify_replay_and_stop_on_wrong_destination(tmp_path, monkeypatc
             await m.execute(m.ExecuteRequest(serial='dev',targetId=target,requestId='wrong-page'),req)
         assert '路径失效' in exc.value.detail and len(fake.taps)==4
         assert db.graph('dev')['edges'][0]['status']=='stale'
+    asyncio.run(scenario())
+
+
+def test_replay_does_not_tap_entry_that_changed_to_switch(tmp_path, monkeypatch):
+    async def scenario():
+        source = entrance("A")
+        target = entrance("B")
+        changed = entrance("A")
+        changed["nodes"][1]["checkable"] = True
+        observations = [source, target, changed]
+        db, req, fake = setup(tmp_path, monkeypatch, observations)
+        db.remember(source)
+        recorded = await m.tap(m.TapRequest(
+            serial="dev", observationId=source["id"], nodeIndex=1, recordNavigation=True,
+        ), req)
+        edge, = recorded["graph"]["edges"]
+        with pytest.raises(HTTPException, match="导航入口当前不可安全点击"):
+            await m.execute(m.ExecuteRequest(serial="dev", targetId=edge["to"], requestId="unsafe"), req)
+        assert len(fake.taps) == 1
+        assert db.graph("dev")["edges"][0]["status"] == "stale"
+
     asyncio.run(scenario())
 
 

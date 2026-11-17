@@ -45,6 +45,8 @@ type Frame = {
   data: number[];
   is_rx: boolean;
 };
+type CanDevice = { vendor: string; model: string | null; device_id: string; channels: { number: number }[] };
+type Discovery = { devices: CanDevice[]; errors: Record<string, string> };
 type Directory = {
   path: string;
   parent: string;
@@ -72,6 +74,8 @@ export default function CanBus() {
     signal: "",
   });
   const [backend, setBackend] = useState("hardware");
+  const [discovery, setDiscovery] = useState<Discovery>({ devices: [], errors: {} });
+  const [deviceId, setDeviceId] = useState("");
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [directory, setDirectory] = useState<Directory | null>(null);
   const [folderInput, setFolderInput] = useState("");
@@ -111,6 +115,14 @@ export default function CanBus() {
       );
     return data;
   }, []);
+  const scanDevices = useCallback(async () => {
+    try {
+      const result: Discovery = await request("/devices");
+      setDiscovery(result);
+      const hirain = result.devices.filter(d => d.vendor === "hirain");
+      setDeviceId(current => hirain.some(d => d.device_id === current) ? current : hirain.length === 1 ? hirain[0].device_id : "");
+    } catch (e) { setError(String(e)); }
+  }, [request]);
   const refresh = useCallback(
     async () => setStatus(await request("/status")),
     [request]
@@ -122,6 +134,7 @@ export default function CanBus() {
         if (live) setError(String(e));
       });
     void update();
+    void scanDevices();
     const t = setInterval(() => void update(), 1500);
     void request("/dbc")
       .then(d => {
@@ -136,7 +149,7 @@ export default function CanBus() {
       live = false;
       clearInterval(t);
     };
-  }, [refresh, request]);
+  }, [refresh, request, scanDevices]);
   useEffect(() => {
     if (!catalog?.key) return;
     void request("/wake/profile")
@@ -529,11 +542,19 @@ export default function CanBus() {
               className={field}
               value={backend}
               disabled={status.open}
-              onChange={e => setBackend(e.target.value)}
+              onChange={e => { setBackend(e.target.value); setChannel(0); }}
             >
               <option value="mac-usb">Mac USB</option>
-              <option value="hardware">硬件自动选择</option>
+              <option value="hardware">周立功</option>
+              <option value="hirain">经纬恒润</option>
             </select>
+            {backend === "hirain" && <select aria-label="恒润设备" className={field} value={deviceId}
+              disabled={status.open} onChange={e => setDeviceId(e.target.value)}>
+              <option value="">{discovery.devices.filter(d => d.vendor === "hirain").length ? "请选择设备" : "未发现恒润设备"}</option>
+              {discovery.devices.filter(d => d.vendor === "hirain").map(d =>
+                <option key={d.device_id} value={d.device_id}>{d.model || "型号未知"} · {d.device_id} · 通道 {d.channels.map(c => c.number).join(", ")}</option>)}
+            </select>}
+            <button className={button} disabled={status.open || busy} onClick={() => void scanDevices()}>刷新设备</button>
             <select
               aria-label="连接通道"
               className={field}
@@ -543,16 +564,18 @@ export default function CanBus() {
             >
               <option value={0}>通道 0</option>
               <option value={1}>通道 1</option>
+              {backend === "hirain" && <option value={2}>通道 2</option>}
+              {backend === "hirain" && <option value={3}>通道 3</option>}
             </select>
             <button
               className={button}
-              disabled={(busy && !status.open) || !catalog?.key}
+              disabled={(busy && !status.open) || !catalog?.key || (!status.open && backend === "hirain" && !deviceId)}
               onClick={() =>
                 void action(
                   status.open ? "/close" : "/open",
                   status.open
                     ? {}
-                    : { backend, dbc: catalog?.path, channels: [channel] }
+                    : { backend, dbc: catalog?.path, channels: [channel], device_id: backend === "hirain" ? deviceId : null }
                 )
               }
             >
@@ -560,6 +583,7 @@ export default function CanBus() {
             </button>
           </div>
         </section>
+        {backend === "hirain" && !status.open && discovery.errors.hirain && <p className="text-xs text-muted-foreground">{discovery.errors.hirain}</p>}
         {(error || status.error) && (
           <p
             role="alert"

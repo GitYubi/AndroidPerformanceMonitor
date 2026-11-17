@@ -23,9 +23,18 @@ class CanBackend(Protocol):
     def close(self) -> None: ...
 
 
-def validate_channel(channel: int) -> None:
-    if type(channel) is not int or channel not in (0, 1):
-        raise ValueError("通道必须为 0 或 1。")
+def validate_channel(channel: int, max_channels: int = 4) -> None:
+    if type(channel) is not int or not 0 <= channel < max_channels:
+        raise ValueError(f"通道必须在 0 到 {max_channels - 1} 之间。")
+
+
+def attempt_cleanup(errors, label, action):
+    try:
+        action()
+    except Exception as exc:
+        errors.append(f"{label}：{exc}")
+        return False
+    return True
 
 
 class LoopbackBackend:

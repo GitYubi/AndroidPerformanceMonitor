@@ -1,11 +1,6 @@
-import inspect
-import traceback
-
-from zlg.logutil import Logs
+from functools import wraps
 
 class FunctionRely():
-    log = Logs()
-
     @classmethod
     def try_func_comments(cls, content:str):
         def try_func(func):
@@ -14,12 +9,12 @@ class FunctionRely():
             param： func: 要装饰的函数
             return：wrapper
             """
+            @wraps(func)
             def wrapper(*args, **kwargs):
                 try:
                     return func(*args, **kwargs)
-                except:
-                    cls.log.error(f"\"{func.__name__}\"方法异常，异常信息如下：{content}"
-                        f"\n{traceback.format_exc()}")
+                except Exception as exc:
+                    raise RuntimeError(f"ZLG SDK {func.__name__}：{content} {exc}") from exc
             return wrapper
         return try_func
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -59,7 +61,7 @@ class RuntimeSession:
     foreground_package: str | None = None
     foreground_checked_cycle: int = -1
     # 帧率数据源失败冷却：frametimeline/framestats 持续失败时暂停尝试。
-    frame_source_cooldowns: dict[str, int] = field(default_factory=dict)
+    frame_source_cooldowns: dict[tuple[str, str | None], int] = field(default_factory=dict)
     # 异步内存采样：worker 完成后更新结果，不阻塞主采样循环
     memory_task: asyncio.Task[tuple[int | None, int | None, int | None, list[ProcessSample]]] | None = None
     memory_result: tuple[int | None, int | None, int | None, list[ProcessSample]] | None = None
@@ -115,6 +117,8 @@ class MonitorManager:
         metadata = {
             "session_id": session_id,
             "serial": request.serial,
+            "project_id": request.project_id,
+            "project_name": request.project_name,
             "created_at_ms": created_at_ms,
             "duration_seconds": request.duration_seconds,
             "interval_ms": request.interval_ms,
@@ -191,20 +195,32 @@ class MonitorManager:
             final_state = "failed"
             runtime.writer.add_event("error", "runtime_failure", str(exc))
         finally:
-            pending = list(runtime.inflight)
-            for memory_task in [runtime.memory_task, runtime.system_memory_task]:
-                if memory_task is not None and memory_task not in pending:
-                    pending.append(memory_task)
-            for task in pending:
-                task.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
-            if runtime.request.log_export_enabled():
+            try:
+                pending = set(runtime.inflight)
+                pending.update(task for task in (runtime.memory_task, runtime.system_memory_task) if task is not None)
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                if runtime.request.log_export_enabled():
+                    try:
+                        await self._export_device_logs(runtime)
+                    except asyncio.CancelledError:
+                        final_state = "stopped"
+                        try:
+                            runtime.writer.add_event("warning", "log_export_cancelled", "会话停止时设备日志导出未完成。")
+                        except Exception:
+                            logging.getLogger(__name__).exception("Could not record log export cancellation for %s", runtime.session_id)
+                        raise
+                    except Exception as exc:
+                        runtime.writer.add_event("warning", "log_export_failed", f"设备日志导出异常：{exc}")
+            finally:
                 try:
-                    await self._export_device_logs(runtime)
-                except Exception as exc:
-                    runtime.writer.add_event("warning", "log_export_failed", f"设备日志导出异常：{exc}")
-            runtime.writer.finish(final_state)
-            self.active.pop(runtime.session_id, None)
+                    runtime.writer.finish(final_state)
+                except Exception:
+                    logging.getLogger(__name__).exception("Could not finalize monitor session %s", runtime.session_id)
+                    raise
+                finally:
+                    self.active.pop(runtime.session_id, None)
 
     def _spawn(self, runtime: RuntimeSession, coroutine) -> asyncio.Task:
         task = asyncio.create_task(coroutine)
@@ -521,7 +537,8 @@ class MonitorManager:
             "dumpsys",
             "SurfaceFlinger",
             "--latency",
-            runtime.selected_surface_layer,
+            # ADB joins the arguments again for the device's shell.
+            shlex.quote(runtime.selected_surface_layer),
             serial=runtime.request.serial,
             timeout_seconds=7,
         )

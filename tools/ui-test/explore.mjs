@@ -24,6 +24,17 @@ export async function exploreTree(agent, device, step, emit) {
       tree.nodes[index],
       ...descendants(tree, tree.nodes[index]),
     ]);
+  async function observe() {
+    try {
+      return { tree: await device.read(), retried: false };
+    } catch {
+      try {
+        return { tree: await device.read(), retried: true };
+      } catch {
+        return { tree: null, retried: true };
+      }
+    }
+  }
 
   async function visit(initial, depth) {
     if (visited.has(initial.fingerprint) || halted) return;
@@ -201,18 +212,34 @@ export async function exploreTree(agent, device, step, emit) {
         continue;
       }
       actions++;
-      await device.tap(selector);
-      const child = await device.read();
+      let tapUncertain = false;
+      try {
+        await device.tap(selector);
+      } catch {
+        tapUncertain = true;
+      }
+      const { tree: child, retried } = await observe();
+      if (!child || ((retried || tapUncertain) && !withinScope(child))) {
+        halted = true;
+        emit({
+          type: "graph-edge", state: "needs_review", from: before.fingerprint,
+          to: child?.fingerprint, label: node.label, selector, tree: child,
+          message: "点击后无法确认设备位置，停止遍历，请检查当前画面",
+        });
+        break;
+      }
       const changed = child.fingerprint !== before.fingerprint;
       emit({
         type: "graph-edge",
-        state: changed ? "entered" : "unchanged",
+        state: tapUncertain ? "needs_review" : changed ? "entered" : "unchanged",
         from: before.fingerprint,
         to: child.fingerprint,
         label: node.label,
         selector,
         depth: depth + 1,
+        message: tapUncertain ? "点击返回异常，已重新确认设备画面" : undefined,
       });
+      incomplete ||= tapUncertain;
       if (!changed) continue;
       try {
         if (!withinScope(child)) {
@@ -225,18 +252,18 @@ export async function exploreTree(agent, device, step, emit) {
             packages: child.packages,
             tree: child,
           });
-        } else await visit(child, depth + 1);
+        } else if (!tapUncertain) await visit(child, depth + 1);
       } finally {
         if (!halted) {
           actions++;
-          await device.back();
-          const returned = await device.read();
-          const restored = returned.fingerprint === before.fingerprint;
+          await device.back().catch(() => {}); // Confirm the outcome before taking another action.
+          const { tree: returned } = await observe();
+          const restored = returned?.fingerprint === before.fingerprint;
           emit({
             type: "graph-return",
             state: restored ? "restored" : "needs_review",
             from: child.fingerprint,
-            to: returned.fingerprint,
+            to: returned?.fingerprint,
             tree: restored ? undefined : returned,
             message: restored
               ? "已返回并校验父页面"

@@ -1,3 +1,5 @@
+import { redactDebugField } from "./debug-redaction.mjs";
+
 /**
  * Manus Debug Collector (agent-friendly)
  *
@@ -469,8 +471,8 @@
     // Safely parse headers (avoid breaking if headers format is invalid)
     var requestHeaders = {};
     try {
-      if (init.headers) {
-        requestHeaders = Object.fromEntries(new Headers(init.headers).entries());
+      if (init.headers || input?.headers) {
+        requestHeaders = Object.fromEntries(new Headers(init.headers || input.headers).entries());
       }
     } catch (e) {
       requestHeaders = { _parseError: true };
@@ -558,7 +560,7 @@
             if (text.length <= CONFIG.maxBodyLength) {
               entry.response.body = sanitizeValue(tryParseJson(text));
             } else {
-              entry.response.body = text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
+              entry.response.body = "[Large response - not captured]";
             }
           })
           .catch(function () {
@@ -643,7 +645,7 @@
           try {
             var text = xhr.responseText || "";
             if (text.length > CONFIG.maxBodyLength) {
-              responseBody = text.slice(0, CONFIG.maxBodyLength) + "...[truncated]";
+              responseBody = "[Large response - not captured]";
             } else {
               responseBody = sanitizeValue(tryParseJson(text));
             }
@@ -740,7 +742,7 @@
     return originalFetch(CONFIG.reportEndpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(payload, redactDebugField),
     }).catch(function () {
       // Put data back on failure (but respect limits)
       store.consoleLogs = consoleLogs.concat(store.consoleLogs);
@@ -780,7 +782,7 @@
     };
 
     if (navigator.sendBeacon) {
-      var payloadStr = JSON.stringify(payload);
+      var payloadStr = JSON.stringify(payload, redactDebugField);
       // sendBeacon has ~64KB limit, truncate if too large
       var MAX_BEACON_SIZE = 60000; // Leave some margin
       if (payloadStr.length > MAX_BEACON_SIZE) {
@@ -793,7 +795,7 @@
           uiEvents: uiEvents.slice(-100),
           _truncated: true,
         };
-        payloadStr = JSON.stringify(truncatedPayload);
+        payloadStr = JSON.stringify(truncatedPayload, redactDebugField);
       }
       navigator.sendBeacon(CONFIG.reportEndpoint, payloadStr);
     }

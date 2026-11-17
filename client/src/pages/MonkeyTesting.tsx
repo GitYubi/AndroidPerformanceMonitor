@@ -1,4 +1,6 @@
+import { useWorkspaceProjects } from "@/lib/workspaceProjects";
 import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
+import { DeleteRecordButton } from "@/components/DeleteRecordButton";
 import { useEffect, useRef, useState } from "react";
 import { Download, Play, RefreshCw, Square, Shuffle } from "lucide-react";
 import { toast } from "sonner";
@@ -31,6 +33,8 @@ type Segment = {
 type Run = {
   id: string;
   serial: string;
+  project_id?: string;
+  project_name?: string;
   state: string;
   config?: Config;
   created_at_ms: number;
@@ -178,7 +182,10 @@ const button =
 const panel = "rounded-lg border border-slate-800 bg-slate-900/50 p-5";
 
 export default function MonkeyTesting() {
+  const { projects, projectId, selectProject, projectError } =
+    useWorkspaceProjects();
   const [config, setConfig] = useState<Config>(restored);
+  const [activeRuns, setActiveRuns] = useState<Run[]>([]);
   const [packageText, setPackageText] = useState(() =>
     restored().packages.join("\n")
   );
@@ -200,7 +207,7 @@ export default function MonkeyTesting() {
   const summaryLoaded = useRef("");
   const hydrated = useRef("");
   const hadDraft = useRef(!!localStorage.getItem("acpm.monkey.v1"));
-  const active = runs.find(busy);
+  const active = activeRuns.find(busy);
   const locked = pending || !!active || busy(selected);
   const total = Object.values(config.ratios).reduce(
     (sum, value) => sum + value,
@@ -211,6 +218,7 @@ export default function MonkeyTesting() {
     .map(line => line.trim())
     .filter(line => line && !line.startsWith("#"));
   const valid =
+    !projectError &&
     config.serial &&
     total === 100 &&
     (config.mode === "none" || packages.length > 0) &&
@@ -281,12 +289,16 @@ export default function MonkeyTesting() {
     const poll = async () => {
       try {
         if (document.hidden) return;
-        const latest = await api<Run[]>(
-          `/monkey/runs?offset=${historyOffset}`,
-          abort.signal
-        );
+        const [latest, activeJobs] = await Promise.all([
+          api<Run[]>(
+            `/monkey/runs?offset=${historyOffset}&project_id=${encodeURIComponent(projectId)}`,
+            abort.signal
+          ),
+          api<Run[]>("/monkey/runs?unfinished=true", abort.signal),
+        ]);
         if (disposed) return;
         setRuns(latest);
+        setActiveRuns(activeJobs);
         if (!selectedId && latest.length) {
           setSelectedId((latest.find(busy) || latest[0]).id);
           return;
@@ -335,13 +347,14 @@ export default function MonkeyTesting() {
       abort.abort();
       clearTimeout(timer);
     };
-  }, [selectedId, segmentOffset, historyOffset]);
+  }, [selectedId, segmentOffset, historyOffset, projectId]);
 
   const start = async () => {
     setPending(true);
     try {
       const run = await api<Run>("/monkey/runs", undefined, {
         ...config,
+        project_id: projectId,
         packages: config.mode === "none" ? [] : packages,
       });
       setHistoryOffset(0);
@@ -405,6 +418,48 @@ export default function MonkeyTesting() {
         <div className="grid items-start gap-5 xl:grid-cols-[350px_minmax(0,1fr)]">
           <section className={panel} aria-label="Monkey 执行配置">
             <h2 className="mb-4 font-semibold">执行配置</h2>
+            <div className="mb-5">
+              <label
+                htmlFor="monkey-project"
+                className="mb-2 block text-xs text-slate-400"
+              >
+                所属项目
+              </label>
+              <select
+                id="monkey-project"
+                className={control}
+                value={projectId}
+                onChange={event => {
+                  selectProject(event.target.value);
+                  setHistoryOffset(0);
+                  setSelectedId(null);
+                  setSelected(null);
+                  setResult(null);
+                }}
+              >
+                {projects.map(project => (
+                  <option key={project.id} value={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </select>
+              {projectError && (
+                <p className="mt-1 text-xs text-rose-300">{projectError}</p>
+              )}
+              {active && (active.project_id || "default") !== projectId && (
+                <button
+                  type="button"
+                  className="mt-2 text-left text-xs text-cyan-300 underline"
+                  onClick={() => {
+                    selectProject(active.project_id || "default");
+                    setHistoryOffset(0);
+                    selectRun(active.id);
+                  }}
+                >
+                  {active.project_name || "默认项目"}有任务运行中，查看任务
+                </button>
+              )}
+            </div>
             <fieldset disabled={locked} className="space-y-5">
               <div>
                 <label
@@ -823,12 +878,17 @@ export default function MonkeyTesting() {
                       </a>
                     )}
                   </div>
-                  {!busy(selected) && selected.segment_count > 0 && <p className="mt-2 text-xs text-slate-500">勾选指标并生成预览后，可点击“保存为图片（PNG）”。</p>}
+                  {!busy(selected) && selected.segment_count > 0 && (
+                    <p className="mt-2 text-xs text-slate-500">
+                      勾选指标并生成预览后，可点击“保存为图片（PNG）”。
+                    </p>
+                  )}
                 </>
               ) : (
                 <div className="py-12 text-center text-sm leading-7 text-slate-500">
                   选择设备并配置事件比例后启动。
-                  <br />满 1 小时自动导出一次 CSV，结束时保存末段并生成全程性能 CSV。
+                  <br />满 1 小时自动导出一次 CSV，结束时保存末段并生成全程性能
+                  CSV。
                 </div>
               )}
             </section>
@@ -1073,7 +1133,10 @@ export default function MonkeyTesting() {
             </section>
             <section className={panel} aria-label="Monkey 历史任务">
               <div className="flex items-center justify-between">
-                <h2 className="font-semibold">历史任务</h2>
+                <h2 className="font-semibold">
+                  历史任务 ·{" "}
+                  {projects.find(project => project.id === projectId)?.name}
+                </h2>
                 <div className="flex gap-2">
                   <button
                     className={button}
@@ -1095,25 +1158,52 @@ export default function MonkeyTesting() {
               </div>
               <div className="mt-3 max-h-72 space-y-2 overflow-auto">
                 {runs.map(run => (
-                  <button
+                  <div
                     key={run.id}
-                    onClick={() => selectRun(run.id)}
-                    className={`flex w-full items-center justify-between gap-4 rounded border p-3 text-left text-xs ${selectedId === run.id ? "border-cyan-800 bg-cyan-950/30" : "border-slate-800 hover:border-slate-600"}`}
+                    className={`flex items-center gap-2 rounded border p-2 ${selectedId === run.id ? "border-cyan-800 bg-cyan-950/30" : "border-slate-800 hover:border-slate-600"}`}
                   >
-                    <span className="min-w-0">
-                      <span className="block truncate font-mono">
-                        {run.serial}
-                      </span>
-                      <span className="mt-1 block text-slate-500">
-                        {date(run.created_at_ms)} · {run.segment_count} 段
-                      </span>
-                    </span>
-                    <span
-                      className={busy(run) ? "text-cyan-300" : "text-slate-400"}
+                    <button
+                      type="button"
+                      onClick={() => selectRun(run.id)}
+                      className="flex min-w-0 flex-1 items-center justify-between gap-4 p-1 text-left text-xs"
                     >
-                      {states[run.state] || run.state}
-                    </span>
-                  </button>
+                      <span className="min-w-0">
+                        <span className="block truncate font-mono">
+                          {run.serial}
+                        </span>
+                        <span className="mt-1 block text-slate-500">
+                          {date(run.created_at_ms)} · {run.segment_count} 段
+                        </span>
+                      </span>
+                      <span
+                        className={
+                          busy(run) ? "text-cyan-300" : "text-slate-400"
+                        }
+                      >
+                        {states[run.state] || run.state}
+                      </span>
+                    </button>
+                    <DeleteRecordButton
+                      path={`/monkey/runs/${encodeURIComponent(run.id)}/delete`}
+                      title={`删除 ${run.serial} 的 Monkey 记录`}
+                      description="将删除该 Monkey 任务、合并报告、分段记录及其文件，删除后无法恢复。"
+                      disabled={busy(run)}
+                      className="border-slate-700 bg-transparent text-slate-300 hover:bg-slate-800"
+                      onDeleted={() => {
+                        setRuns(current =>
+                          current.filter(item => item.id !== run.id)
+                        );
+                        if (selectedId === run.id) {
+                          setSelectedId(null);
+                          setSelected(null);
+                          setResult(null);
+                          summaryLoaded.current = "";
+                        }
+                        if (runs.length === 1 && historyOffset > 0)
+                          setHistoryOffset(Math.max(0, historyOffset - 50));
+                      }}
+                    />
+                  </div>
                 ))}
                 {!runs.length && (
                   <p className="py-4 text-sm text-slate-500">暂无记录。</p>

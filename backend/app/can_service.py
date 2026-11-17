@@ -1,9 +1,11 @@
 """Process-local CAN service owned by the application lifecycle."""
 from __future__ import annotations
+from contextlib import contextmanager
 import os
 import json
 import hashlib
 import configparser
+import time
 from math import isfinite
 from pathlib import Path
 from threading import RLock, Event, Thread
@@ -21,7 +23,11 @@ from zlg.wake import resolve_signal_value, encode_wake_message
 class CanService:
     def __init__(self):
         self.lock = RLock()
+        self._lifecycle_lock = RLock()
         self.device = None
+        self._pending_close = None
+        self._ui_owners = {}
+        self._manual_inflight = {}
         self.frames = deque(maxlen=10000)
         self.seq = 0
         self.receive_session = ''
@@ -32,19 +38,24 @@ class CanService:
         self.dbc_key = None
         self.catalog = []
 
-    def open(self, backend, dbc, channels):
-        with self.lock:
+    def open(self, backend, dbc, channels, device_id=None):
+        with self._lifecycle_lock, self.lock:
             if self.device: raise ValueError('设备已打开')
-            if backend not in ('simulation', 'mac-usb', 'hardware'): raise ValueError('无效后端')
+            if self._pending_close is not None:
+                self._close_device(self._pending_close)
+            if backend not in ('simulation', 'mac-usb', 'hardware', 'hirain'): raise ValueError('无效后端')
             path = Path(dbc).expanduser().resolve() if dbc else self.dbc_path or ROOT / 'config' / 'Example.dbc'
             if not path.is_file(): raise ValueError('DBC 文件不存在')
             self.load_dbc(str(path))
             os.environ['ZCAN_BACKEND'] = backend
-            device = zlgCan(0, str(path))
+            device = zlgCan(0, str(path), device_id=device_id)
             try:
                 for channel in channels: device.chn_open(channel)
-            except BaseException:
-                device.close()
+            except BaseException as error:
+                try:
+                    self._close_device(device)
+                except Exception as cleanup:
+                    raise RuntimeError(f'{error}；{cleanup}') from error
                 raise
             self.device = device
             self.frames.clear(); self.seq = 0; self.error = None
@@ -101,36 +112,73 @@ class CanService:
             return profile
 
     def start_wake(self, channel):
-        d = self.require()
-        if hashlib.sha256(self.dbc_path.read_bytes()).hexdigest() != self.dbc_key:
-            raise ValueError('DBC 文件已改变，请关闭设备并重新加载')
-        d.start_wake(channel, self.wake_profile(), background=True)
+        with self.lock:
+            d = self.require()
+            if hashlib.sha256(self.dbc_path.read_bytes()).hexdigest() != self.dbc_key:
+                raise ValueError('DBC 文件已改变，请关闭设备并重新加载')
+            profile = self.wake_profile()
+            for name in profile:
+                self._check_message_owner(d, (channel, name))
+            d.start_wake(channel, profile, background=True)
 
     def _receive(self):
+        next_health_check = time.monotonic() + 1.0
         while not self.stop.wait(.05):
+            device = self.device
+            if not device:
+                continue
             try:
-                device = self.device
-                if device:
-                    frames = device.get_receive_data()
-                    with self.lock:
+                if time.monotonic() >= next_health_check:
+                    next_health_check = time.monotonic() + 1.0
+                    if not device.is_online():
+                        raise ConnectionError('CAN 设备已断开。')
+                frames = device.get_receive_data()
+                with self.lock:
+                    if self.device is device:
                         for frame in frames:
                             self.seq += 1
                             self.frames.append({'sequence': self.seq, **frame})
             except Exception as exc:
-                self.error = str(exc)
-                self.stop.wait(.25)
+                with self.lock:
+                    if self.device is device:
+                        self.stop.set()
+                        self.error = str(exc)
+                        try:
+                            self._close_device(device)
+                        except Exception as close_exc:
+                            self.error = f'{exc}；{close_exc}'
+                return
+
+    def _close_device(self, device):
+        self._ui_owners.clear()
+        self._manual_inflight.clear()
+        try:
+            device.close()
+        except Exception as exc:
+            self._pending_close = device
+            self.error = f'CAN 资源释放待确认；可重试关闭：{exc}'
+            raise RuntimeError(self.error) from exc
+        else:
+            self._pending_close = None
+        finally:
+            self.device = None
 
     def close(self):
-        self.stop.set()
-        worker = self.worker
-        if worker: worker.join()
-        with self.lock:
-            if self.device:
-                self.device.close(); self.device = None
-            self.worker = None
+        with self._lifecycle_lock:
+            with self.lock:
+                self.stop.set()
+                worker = self.worker
+            if worker:
+                worker.join()
+            with self.lock:
+                self.worker = None
+                device = self.device or self._pending_close
+                if device is not None:
+                    self._close_device(device)
+                    self.error = None
 
     def require(self):
-        if self.device is None: raise ValueError('请先打开设备')
+        if self.device is None or self.stop.is_set(): raise ValueError('请先打开设备')
         return self.device
 
     def signal_series(self, message, signal, channel, after, session):
@@ -186,6 +234,22 @@ class CanService:
         except KeyError as exc:
             raise ValueError(f'当前 DBC 中没有报文 {name}') from exc
 
+    def _check_message_owner(self, device, key, owner=None, *, ui=False):
+        current = self._ui_owners.get(key)
+        if current is not None and current is not owner:
+            raise ValueError(f'通道 {key[0]} 的 {key[1]} 正由其他 UI 用例发送')
+        task = device.thread_messages.get(key)
+        if ui and current is None and (key in self._manual_inflight or (task and task['func'].is_alive())):
+            raise ValueError(f'通道 {key[0]} 的 {key[1]} 正由手动操作发送')
+
+    @contextmanager
+    def _message_access(self, key, owner=None):
+        with self.lock:
+            device = self.require()
+            with device._state_lock:
+                self._check_message_owner(device, key, owner, ui=owner is not None)
+                yield device
+
     def prepare_ui_run(self, steps):
         with self.lock:
             if not self.dbc_key:
@@ -196,6 +260,7 @@ class CanService:
             with device._state_lock:
                 for _, options in steps:
                     message = self._ui_message(device, options)
+                    self._check_message_owner(device, (options['channel'], message.name), ui=True)
                     for name, value in options.get('signals', {}).items():
                         try:
                             signal = message.get_signal_by_name(name)
@@ -213,17 +278,23 @@ class CanService:
                 message = self._ui_message(device, options)
                 key = (options['channel'], message.name)
                 if kind == 'can_stop':
-                    self.break_msg_by_name(*key)
+                    self._check_message_owner(device, key, owned, ui=True)
+                    if self._ui_owners.get(key) is not owned:
+                        return f'通道 {key[0]} 的 {message.name} 无本次循环任务'
+                    self.break_msg_by_name(*key, _owner=owned)
+                    self._ui_owners.pop(key, None)
                     owned.pop(key, None)
                     return f'已停止通道 {key[0]} 的 {message.name}'
                 looping = kind == 'can_send_loop'
                 period = options['cycleMs'] if looping else None
                 period = period or message.cycle_time or 100
                 self.send_msg_by_name(*key, options['signals'], can_fd=message.is_fd,
-                                      cycle_time=period, send_count=-1 if looping else 1)
+                                      cycle_time=period, send_count=-1 if looping else 1, _owner=owned)
                 if looping:
+                    self._ui_owners[key] = owned
                     owned[key] = device.thread_messages[key]
                     return f'已启动循环发送 · 通道 {key[0]} · {message.name} · {period} ms'
+                self._ui_owners.pop(key, None)
                 owned.pop(key, None)
                 return f'已发送 1 帧 · 通道 {key[0]} · {message.name}'
 
@@ -234,18 +305,23 @@ class CanService:
             if device is None or session != self.receive_session:
                 return errors
             with device._state_lock:
-                for key, task in owned.items():
+                for key, task in list(owned.items()):
+                    if self._ui_owners.get(key) is not owned:
+                        continue
                     if device.thread_messages.get(key) is task:
                         try:
-                            self.break_msg_by_name(*key)
+                            self.break_msg_by_name(*key, _owner=owned)
                         except (RuntimeError, OSError, ValueError) as exc:
                             errors.append(f'通道 {key[0]} 的 {key[1]}：{exc}')
+                            continue
+                    self._ui_owners.pop(key, None)
+                    owned.pop(key, None)
         return errors
 
-    def send_msg_by_name(self, channel, name, signals, can_fd=True, fd_brs=False, cycle_time=100, send_count=-1):
-        d = self.require(); message = d.db.get_message_by_name(name)
-        values = {key: resolve_signal_value(message.get_signal_by_name(key), value, name) for key, value in signals.items()}
-        with d._state_lock:
+    def send_msg_by_name(self, channel, name, signals, can_fd=True, fd_brs=False, cycle_time=100, send_count=-1, *, _owner=None):
+        with self._message_access((channel, name), _owner) as d:
+            message = d.db.get_message_by_name(name)
+            values = {key: resolve_signal_value(message.get_signal_by_name(key), value, name) for key, value in signals.items()}
             existing = d.thread_messages.get((channel, name))
             merged = {signal.name: 0 for signal in message.signals}
             if existing:
@@ -259,23 +335,46 @@ class CanService:
         return 1
     def send_msg_by_id(self, channel, id, signals, **kwargs):
         return self.send_msg_by_name(channel, self.require().db.get_message_by_id(id).name, signals, **kwargs)
-    def break_msg_by_name(self, channel, name):
-        self.require().single_send(channel, name, state=False); return 1
+    def break_msg_by_name(self, channel, name, *, _owner=None):
+        with self._message_access((channel, name), _owner) as device:
+            device.single_send(channel, name, state=False)
+        return 1
     def break_msg_by_id(self, channel, id):
         return self.break_msg_by_name(channel, self.require().db.get_message_by_id(id).name)
+
+    def trigger_message(self, channel, name, signals, *, can_fd, fd_brs, cycle_time, stop_after):
+        key = (channel, name)
+        with self._message_access(key) as device:
+            if key in self._manual_inflight:
+                raise ValueError(f'通道 {channel} 的 {name} 正在触发发送')
+            message = device.db.get_message_by_name(name)
+            values = {signal: resolve_signal_value(message.get_signal_by_name(signal), value, name)
+                      for signal, value in signals.items()}
+            self._manual_inflight[key] = device
+        try:
+            return device.send_timed_trigger(channel, name, values, can_fd=can_fd, fd_brs=fd_brs,
+                                             cycle_time=cycle_time, stop_after=stop_after)
+        finally:
+            with self.lock:
+                if self._manual_inflight.get(key) is device:
+                    self._manual_inflight.pop(key)
+
+    def pulse_message(self, channel, name, signals, count, *, can_fd):
+        with self._message_access((channel, name)) as device:
+            device.start_pulse(channel, name, signals, count, can_fd=can_fd)
+
     def send_once_msg_by_name(self, channel, name, single_name, single_value, isBreak=True, can_fd=True, fd_brs=False, cycle_time=100):
-        d=self.require(); signal=d.db.get_message_by_name(name).get_signal_by_name(single_name)
-        value=resolve_signal_value(signal,single_value,name)
-        return int(d.send_timed_trigger(channel,name,{single_name:value},can_fd=can_fd,fd_brs=fd_brs,cycle_time=cycle_time,stop_after=isBreak))
+        return int(self.trigger_message(channel, name, {single_name: single_value}, can_fd=can_fd,
+                                        fd_brs=fd_brs, cycle_time=cycle_time, stop_after=isBreak))
     def send_once_msg_by_name_two_singal(self, channel, name, single_name, single_value, single_name1, single_value1, isBreak=True, can_fd=True, fd_brs=False, cycle_time=100):
-        d=self.require(); msg=d.db.get_message_by_name(name)
-        values={k:resolve_signal_value(msg.get_signal_by_name(k),v,name) for k,v in [(single_name,single_value),(single_name1,single_value1)]}
-        return int(d.send_timed_trigger(channel,name,values,can_fd=can_fd,fd_brs=fd_brs,cycle_time=cycle_time,stop_after=isBreak))
+        return int(self.trigger_message(channel, name, {single_name: single_value, single_name1: single_value1},
+                                        can_fd=can_fd, fd_brs=fd_brs, cycle_time=cycle_time, stop_after=isBreak))
 
 router=APIRouter(prefix='/api/can')
 class Open(BaseModel):
     backend: str = 'simulation'
     dbc: str = ''
+    device_id: str | None = None
     channels: list[int] = Field(default_factory=lambda:[0])
 class Send(BaseModel):
     channel: int = 0
@@ -296,11 +395,15 @@ def service(request: Request): return request.app.state.can
 def call(fn, *args, **kwargs):
     try: return fn(*args, **kwargs)
     except (ValueError, RuntimeError, OSError, KeyError, DbcError, configparser.Error, UnicodeError) as e: raise HTTPException(400, str(e)) from e
+@router.get('/devices')
+def devices():
+    from can_adapters.device_manager import CanDeviceManager
+    return CanDeviceManager().discover()
 @router.get('/status')
 def status(request: Request): return service(request).status()
 @router.post('/open')
 def open_device(p: Open, request: Request):
-    call(service(request).open,p.backend,p.dbc,p.channels); return service(request).status()
+    call(service(request).open,p.backend,p.dbc,p.channels,p.device_id); return service(request).status()
 @router.post('/close')
 def close_device(request: Request):
     call(service(request).close); return service(request).status()
@@ -310,15 +413,11 @@ def send(p: Send, request: Request):
 @router.post('/trigger')
 def trigger(p: Trigger, request: Request):
     if not p.signals: raise HTTPException(400, "请至少指定一个信号")
-    d=call(service(request).require)
-    msg=call(d.db.get_message_by_name,p.name)
-    values=call(lambda:{k:resolve_signal_value(msg.get_signal_by_name(k),v,p.name) for k,v in p.signals.items()})
-    result=call(d.send_timed_trigger,p.channel,p.name,values,can_fd=p.can_fd,fd_brs=p.fd_brs,cycle_time=p.cycle_time,stop_after=p.stop_after)
+    result=call(service(request).trigger_message,p.channel,p.name,p.signals,can_fd=p.can_fd,fd_brs=p.fd_brs,cycle_time=p.cycle_time,stop_after=p.stop_after)
     return {'completed': result}
 @router.post('/pulse')
 def pulse(p: Pulse, request: Request):
-    d=call(service(request).require)
-    call(d.start_pulse,p.channel,p.name,p.signals,p.count,can_fd=p.can_fd)
+    call(service(request).pulse_message,p.channel,p.name,p.signals,p.count,can_fd=p.can_fd)
     return service(request).status()
 @router.post('/stop')
 def stop_send(p: Send, request: Request):

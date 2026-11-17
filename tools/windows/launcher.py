@@ -131,7 +131,13 @@ def check_runtime(root: Path) -> None:
 
     if os.name != "nt":
         return  # Native runtime checks are performed on Windows only.
+    from zlg.native import vendor_sdk_path
     import uiautomator2  # noqa: F401
+    zlg_sdk = vendor_sdk_path("zlgcan_x64", "zlgcan.dll")
+    if zlg_sdk.is_file():
+        logging.info("周立功可选 SDK 文件存在：%s", zlg_sdk)
+    else:
+        logging.warning("周立功硬件模式需另行安装 SDK：%s", zlg_sdk)
     for tool, args in [("platform-tools/adb.exe", ["version"]), ("node/node.exe", ["--version"])]:
         executable = root / "runtime" / tool
         result = subprocess.run([str(executable), *args], capture_output=True, text=True,

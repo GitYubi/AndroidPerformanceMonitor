@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import html
+from itertools import groupby
 import statistics
 import time
 from typing import Any, Literal, get_args
@@ -97,20 +98,25 @@ def _escape(value: Any) -> str:
     return html.escape(str(value))
 
 
-def _downsample(values: list[float | None], max_points: int = _CHART_MAX_POINTS) -> list[float | None]:
-    """等间隔抽稀，保留 None（缺测）位置。"""
-    if len(values) <= max_points:
-        return values
-    step = len(values) / max_points
-    result: list[float | None] = []
-    for index in range(max_points):
-        source = int(index * step)
-        result.append(values[source] if source < len(values) else None)
-    return result
+def _chart_indices(series, length: int, max_points: int = _CHART_MAX_POINTS) -> set[int]:
+    if length <= max_points:
+        return set(range(length))
+    selected = {0, length - 1}
+    buckets = max(1, (max_points - 2) // (2 * len(series)))
+    for bucket in range(buckets):
+        start = 1 + bucket * (length - 2) // buckets
+        end = 1 + (bucket + 1) * (length - 2) // buckets
+        for _, values, _ in series:
+            points = [(value, index) for index, value in enumerate(values[start:end], start) if value is not None]
+            if points:
+                selected.update((min(points)[1], max(points)[1]))
+    return selected
 
 
-def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]], unit: str, description: str = "") -> str:
-    """生成单张 SVG 折线图；series = [(名称, 值序列, 颜色), ...]。"""
+def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]], unit: str,
+                    description: str = "", *, times_ms: list[int] | None = None) -> str:
+    """Render every series against the same source indices and optional clock."""
+
     all_values = [value for _, values, _ in series for value in values if value is not None]
     if not all_values:
         note = f'<p class="meaning">{_escape(description)}</p>' if description else ""
@@ -122,25 +128,37 @@ def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]
         y_min, y_max = y_min - pad, y_max + pad
     span = y_max - y_min
 
-    def x(value_index: int, length: int) -> float:
-        return 44 + value_index * (900 - 48) / max(1, length - 1)
+    length = max(len(values) for _, values, _ in series)
+    indices = _chart_indices(series, length)
+    axis = times_ms if times_ms is not None else range(length)
+    origin = axis[0]
+    duration = max(1, axis[-1] - origin)
+
+    def x(value_index: int) -> float:
+        return 44 + (axis[value_index] - origin) * (900 - 48) / duration
 
     def y(value: float) -> float:
         return 12 + (_CHART_HEIGHT - 24) * (1 - (value - y_min) / span)
 
-    length = max(len(values) for _, values, _ in series)
-    polylines = ""
+    plots = []
     for name, values, color in series:
-        points = []
-        for index, value in enumerate(values):
-            if value is not None:
-                points.append(f"{x(index, length):.1f},{y(value):.1f}")
-        if points:
-            polylines += (
-                f'<polyline fill="none" stroke="{color}" stroke-width="1.5" '
-                f'points="{" ".join(points)}"/>'
-                f'<text x="44" y="{y(values[0] or y_min) - 6}" font-size="10" fill="{color}">{_escape(name)}</text>'
-            )
+        first_point = True
+        for present, group in groupby(enumerate(values), key=lambda point: point[1] is not None):
+            if not present:
+                continue
+            coordinates = [(x(index), y(value)) for index, value in group if index in indices]
+            if not coordinates:
+                continue
+            if len(coordinates) == 1:
+                px, py = coordinates[0]
+                plots.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="2" fill="{color}"/>')
+            else:
+                points = " ".join(f"{px:.1f},{py:.1f}" for px, py in coordinates)
+                plots.append(f'<polyline fill="none" stroke="{color}" stroke-width="1.5" points="{points}"/>')
+            if first_point:
+                px, py = coordinates[0]
+                plots.append(f'<text x="{px:.1f}" y="{py - 6:.1f}" font-size="10" fill="{color}">{_escape(name)}</text>')
+                first_point = False
     grid = ""
     for tick in range(5):
         ratio = tick / 4
@@ -151,13 +169,21 @@ def _svg_line_chart(title: str, series: list[tuple[str, list[float | None], str]
             f'<text x="4" y="{grid_y + 3:.1f}" font-size="9" fill="var(--report-muted)">{value:.1f}</text>'
         )
     note = f'<p class="meaning">{_escape(description)}</p>' if description else ""
+    time_ticks = ""
+    if times_ms is not None:
+        for tick in range(5):
+            elapsed = (axis[-1] - origin) * tick / 4000
+            px = 44 + (900 - 48) * tick / 4
+            anchor = "end" if tick == 4 else "start"
+            time_ticks += (f'<text x="{px:.1f}" y="199" text-anchor="{anchor}" font-size="9" '
+                           f'fill="var(--report-muted)">{elapsed:.1f} s</text>')
     return (
         f'<div class="chart"><h3>{_escape(title)} <span class="unit">{_escape(unit)}</span></h3>'
         f'<svg viewBox="0 0 {_CHART_WIDTH} {_CHART_HEIGHT}" preserveAspectRatio="xMidYMid meet" '
         f'width="100%" height="auto" xmlns="http://www.w3.org/2000/svg">'
-        f'{grid}{polylines}'
+        f'{grid}{"".join(plots)}'
         f'<line x1="44" y1="{_CHART_HEIGHT - 12}" x2="900" y2="{_CHART_HEIGHT - 12}" stroke="var(--report-axis)" stroke-width="1"/>'
-        f'</svg>{note}</div>'
+        f'{time_ticks}</svg>{note}</div>'
     )
 
 
@@ -176,14 +202,22 @@ def _summary_metric(summary: dict[str, Any], key: str) -> dict[str, Any]:
 def _build_app_uss_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """将同一应用的冒号子进程按快照求和，并计算简单线性趋势。"""
     grouped: dict[str, dict[int, int]] = {}
+    process_ids: dict[tuple[str, int], set[int]] = {}
+    snapshot_times = set()
     for row in rows:
+        ts_ms = int(row["ts_ms"])
+        snapshot_times.add(ts_ms)
+        if row["uss_kb"] is None:
+            continue
         process_name = str(row["process_name"])
         app_name = process_name.split(":", 1)[0]
-        ts_ms = int(row["ts_ms"])
         snapshots = grouped.setdefault(app_name, {})
         snapshots[ts_ms] = snapshots.get(ts_ms, 0) + int(row["uss_kb"])
+        if isinstance(row.get("pid"), int):
+            process_ids.setdefault((app_name, ts_ms), set()).add(row["pid"])
 
     trends: list[dict[str, Any]] = []
+    timeline = sorted(snapshot_times)
     for app_name, snapshots in grouped.items():
         points = sorted(snapshots.items())
         if len(points) < 2:
@@ -208,9 +242,23 @@ def _build_app_uss_trends(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             assessment = "下降"
         else:
             assessment = "基本稳定 / 波动"
+        chart_times, chart_values = [], []
+        previous = set()
+        for stamp in timeline:
+            if not start_ts <= stamp <= points[-1][0]:
+                continue
+            current = process_ids.get((app_name, stamp), set())
+            if previous and current and previous.isdisjoint(current):
+                chart_times.append(stamp)
+                chart_values.append(None)
+            value = snapshots.get(stamp)
+            chart_times.append(stamp)
+            chart_values.append(value / 1024 if value is not None else None)
+            previous = current
         trends.append({
             "app_name": app_name,
-            "values": values_mib,
+            "values": chart_values,
+            "times_ms": chart_times,
             "samples": len(values_mib),
             "duration_minutes": duration_minutes,
             "average": statistics.fmean(values_mib),
@@ -245,6 +293,7 @@ def generate_report(
     )
 
     # ---------- 折线图数据（按时间正序） ----------
+    sample_times = [sample["ts_ms"] for sample in samples]
     def series_of(key: str, convert=None) -> list[float | None]:
         values: list[float | None] = []
         for sample in samples:
@@ -341,10 +390,10 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
 <header>
 <h1>Android 车机性能测试报告</h1>
 <div class="meta">
-设备：{_escape(session.get("serial", ""))} ｜ 会话状态：{_escape(state)} ｜
+项目：{_escape(session.get("project_name") or "默认项目")} ｜ 设备：{_escape(session.get("serial", ""))} ｜ 会话状态：{_escape(state)} ｜
 开始：{time.strftime("%Y-%m-%d %H:%M:%S", time.localtime((started or 0) / 1000))} ｜
 周期：{duration_min:.1f} 分钟 ｜ 间隔：{(session.get("interval_ms") or 0) / 1000:.1f}s ｜
-样本：{summary.get("sample_count", len(samples))} 点
+样本：{_escape(summary.get("sample_count", len(samples)))} 点
 </div></header>"""
     )
 
@@ -387,18 +436,18 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
             parts.append('<p class="meaning">长时间曲线可能抽稀。完整采样见合并 CSV 和 SQLite。</p>')
         if samples:
             if "cpu" in included:
-                parts.append(_svg_line_chart("CPU 整体占用", [("CPU", _downsample(cpu_series), "var(--series-cpu)")], "%", "整机 CPU 利用率（多核归一），来自 /proc/stat 差值；设备不支持时回退 top。"))
+                parts.append(_svg_line_chart("CPU 整体占用", [("CPU", cpu_series, "var(--series-cpu)")], "%", "整机 CPU 利用率（多核归一），来自 /proc/stat 差值；设备不支持时回退 top。", times_ms=sample_times))
             if "memory" in included:
-                parts.append(_svg_line_chart("系统内存占用率（基于 MemAvailable）", [("系统内存率", _downsample(system_memory_series), "var(--series-memory)")], "%", "(MemTotal - MemAvailable) / MemTotal × 100%；缺失时不绘制有效曲线。"))
+                parts.append(_svg_line_chart("系统内存占用率（基于 MemAvailable）", [("系统内存率", system_memory_series, "var(--series-memory)")], "%", "(MemTotal - MemAvailable) / MemTotal × 100%；缺失时不绘制有效曲线。", times_ms=sample_times))
             if "process_memory" in included:
-                parts.append(_svg_line_chart("内存占用（PSS）", [("PSS", _downsample(pss_series), "var(--series-pss)")], "MiB", "按已采到进程加总的 PSS，共享内存按比例分摊，用于分析进程内存开销。"))
-                parts.append(_svg_line_chart("进程 PSS / RAM 比例", [("PSS / RAM", _downsample(pss_percent_series), "var(--series-pss)")], "%", "PSS 占 Total RAM 的比例，不等同于系统内存占用率。"))
+                parts.append(_svg_line_chart("内存占用（PSS）", [("PSS", pss_series, "var(--series-pss)")], "MiB", "按已采到进程加总的 PSS，共享内存按比例分摊，用于分析进程内存开销。", times_ms=sample_times))
+                parts.append(_svg_line_chart("进程 PSS / RAM 比例", [("PSS / RAM", pss_percent_series, "var(--series-pss)")], "%", "PSS 占 Total RAM 的比例，不等同于系统内存占用率。", times_ms=sample_times))
             if "fps" in included:
-                parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", _downsample(present_fps_series), "var(--series-fps)")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。"))
-                parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", _downsample(render_fps_series), "var(--series-render)")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。"))
+                parts.append(_svg_line_chart("呈现帧率（P）", [("呈现 FPS", present_fps_series, "var(--series-fps)")], "fps", "屏幕呈现节奏（帧送上屏速率）。低于刷新率（60Hz）且持续时说明显示链路吃紧。", times_ms=sample_times))
+                parts.append(_svg_line_chart("应用渲染帧率（R）", [("渲染 FPS", render_fps_series, "var(--series-render)")], "fps", "应用主动渲染帧率（gfxinfo 计数器增量）。静态界面回落 0 属正常；操作时持续偏低才是渲染性能问题。", times_ms=sample_times))
             if "frames" in included:
-                parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", _downsample(jank_series), "var(--series-jank)")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。"))
-                parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", _downsample(avg_frame_series), "var(--series-frame-avg)"), ("p95", _downsample(p95_frame_series), "var(--series-frame-p95)"), ("p99", _downsample(p99_frame_series), "var(--series-frame-p99)")], "ms", "每秒窗口内帧耗时均值与分位数。60Hz 下帧耗时超过 16.7ms 意味着错过 vsync、可能出现掉帧；p95/p99 衡量尾延迟。"))
+                parts.append(_svg_line_chart("逐帧 Jank", [("Jank %", jank_series, "var(--series-jank)")], "%", "每秒窗口内帧耗时超过两倍帧间隔（约 33ms @60Hz）的占比。尖峰对应卡顿时刻。", times_ms=sample_times))
+                parts.append(_svg_line_chart("帧耗时（avg / p95 / p99）", [("avg", avg_frame_series, "var(--series-frame-avg)"), ("p95", p95_frame_series, "var(--series-frame-p95)"), ("p99", p99_frame_series, "var(--series-frame-p99)")], "ms", "每秒窗口内帧耗时均值与分位数。60Hz 下帧耗时超过 16.7ms 意味着错过 vsync、可能出现掉帧；p95/p99 衡量尾延迟。", times_ms=sample_times))
         else:
             parts.append('<p class="empty">该会话没有采样数据。</p>')
 
@@ -409,9 +458,9 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
             return None if value is None else value / scale
 
         body = "".join(
-            f"<tr><td>{_escape(row['process_name'])}</td><td>{row.get('pid') or '—'}</td>"
+            f"<tr><td>{_escape(row['process_name'])}</td><td>{_escape(row.get('pid') or '—')}</td>"
             f"<td>{_fmt(scaled(row.get('average')), 1)} {unit}</td><td>{_fmt(scaled(row.get('peak')), 1)} {unit}</td>"
-            f"<td>{row.get('samples', 0)}</td></tr>"
+            f"<td>{_escape(row.get('samples', 0))}</td></tr>"
             for row in rows
         )
         return (
@@ -442,9 +491,10 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
             parts.append(f'<details class="uss-chart" id="uss-{index}"><summary>{_escape(item["app_name"])} · USS 折线图</summary>')
             parts.append(_svg_line_chart(
                 f"{item['app_name']} · USS",
-                [("USS", _downsample(item["values"]), "var(--series-fps)")],
+                [("USS", item["values"], "var(--series-fps)")],
                 "MiB",
                 f"{item['samples']} 个真实内存快照；线性趋势 {item['slope']:+.2f} MiB/min，首尾变化 {item['delta']:+.1f} MiB。",
+                times_ms=item["times_ms"],
             ))
             parts.append('</details>')
 

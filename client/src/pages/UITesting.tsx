@@ -1,7 +1,9 @@
 import { PerformanceReportDialog } from "@/components/PerformanceReportDialog";
+import { DeleteRecordButton } from "@/components/DeleteRecordButton";
 import { BACKEND_URL } from "@/lib/backend";
 import type { CanCatalog } from "@/lib/canCatalog";
 import { getUiSection } from "@/lib/uiNavigation";
+import { currentProjectId, rememberProject } from "@/lib/workspaceProjects";
 import { UiStepFields } from "@/components/UiStepFields";
 import { UiCaseLibrary } from "@/components/UiCaseLibrary";
 import { UiProjectManagement } from "@/components/UiProjectManagement";
@@ -17,6 +19,7 @@ import {
   type UiDevicePreviewHandle,
 } from "@/components/UiDevicePreview";
 import {
+  assignmentsOnEntry,
   changeStepType,
   childInsertion,
   expandElseBlocks,
@@ -28,6 +31,7 @@ import {
   stepLayout,
   stepGroups,
   stepTypes,
+  hasSelectorFields,
   type Selector,
   type Step,
   type StepDrop,
@@ -211,7 +215,10 @@ export default function UITesting() {
   const devicePreview = useRef<UiDevicePreviewHandle>(null);
   const [draft, setDraft] = useState<Case>(() => blank());
   const [projects, setProjects] = useState<UiProject[]>([defaultProject]);
-  const [projectId, setProjectId] = useState(defaultProject.id);
+  const [projectId, setProjectId] = useState(currentProjectId);
+  useEffect(() => {
+    rememberProject(projectId);
+  }, [projectId]);
   const [catalog, setCatalog] = useState<{
     id: string;
     items: UiImage[];
@@ -301,7 +308,14 @@ export default function UITesting() {
     let disposed = false;
     api<UiProject[]>("/ui/projects")
       .then(items => {
-        if (!disposed) setProjects(items);
+        if (!disposed) {
+          setProjects(items);
+          setProjectId(current =>
+            items.some(item => item.id === current)
+              ? current
+              : defaultProject.id
+          );
+        }
       })
       .catch(e => {
         if (!disposed) toast.error(e.message);
@@ -646,6 +660,7 @@ export default function UITesting() {
   }
   const activeRuns = runs.filter(active);
   const rows = stepLayout(draft.steps);
+  const assignmentEntries = assignmentsOnEntry(draft.steps);
   const stepsFull = stepLimitReached(draft.steps);
   const draggingElse = draft.steps.some(
     step => step.id === dragged && step.type === "else"
@@ -681,6 +696,14 @@ export default function UITesting() {
       const prefix = `第 ${index + 1} 步`;
       const operation = step.condition ?? step;
       const options = operation.options;
+      const visible = visibleVariables(row, index);
+      for (const value of [step.prompt, step.value, operation.prompt, operation.value, options?.expectedValue]) {
+        if (
+          value && Array.from(value.matchAll(/\$\{([a-zA-Z0-9_]+)\}/g))
+            .some(([, name]) => !visible.includes(name))
+        )
+          throw new Error(`${prefix}引用了未声明或不可见的变量`);
+      }
       if (step.type === "for") {
         const { count, indexVariable } = options ?? {};
         if (
@@ -693,14 +716,14 @@ export default function UITesting() {
         if (
           indexVariable &&
           (!/^[a-zA-Z0-9_]{1,64}$/.test(indexVariable) ||
-            visibleVariables(row, index).includes(indexVariable))
+            visible.includes(indexVariable))
         )
           throw new Error(`${prefix}的索引变量名称无效或与现有变量重名`);
       }
       if (
         operation.type === "variable_assert" &&
         (!options?.variable ||
-          !visibleVariables(row, index).includes(options.variable))
+          !visible.includes(options.variable))
       )
         throw new Error(`${prefix}请选择一个可用变量`);
       if (operation.type === "assign") {
@@ -742,8 +765,9 @@ export default function UITesting() {
       if (
         (operation.type === "element_screenshot" ||
           operation.type === "element_assert" ||
+          (operation.type === "tap" && operation.selector) ||
           (operation.type === "image_assert" && options?.mode === "element")) &&
-        !Object.values(operation.selector ?? {}).some(value => value?.trim())
+        !hasSelectorFields(operation.selector)
       )
         throw new Error(`${prefix}请从投屏选取元素或填写定位条件`);
       if (options?.mode === "roi") {
@@ -812,20 +836,10 @@ export default function UITesting() {
     });
   }
   function assignedVariables(index: number, valueType?: "image") {
-    return Array.from(
-      new Set(
-        rows
-          .slice(0, index)
-          .flatMap(({ step, active }) =>
-            active &&
-            step.type === "assign" &&
-            step.options?.variable &&
-            (!valueType || step.options.valueType === valueType)
-              ? [step.options.variable]
-              : []
-          )
-      )
-    );
+    const entries = assignmentEntries.get(rows[index].step.id) ?? [];
+    return Array.from(entries)
+      .filter(([, type]) => !valueType || type === valueType)
+      .map(([name]) => name);
   }
   function visibleVariables(row: (typeof rows)[number], index: number) {
     return Array.from(
@@ -873,7 +887,7 @@ export default function UITesting() {
       ? pickTargets[0].id
       : "";
   function applyElement(selector: Selector) {
-    if (!pickTarget || !Object.values(selector).some(Boolean)) return;
+    if (!pickTarget || !hasSelectorFields(selector)) return;
     patchStep(pickTarget, step =>
       step.condition
         ? { condition: { ...step.condition, selector } }
@@ -1309,15 +1323,12 @@ export default function UITesting() {
                                 ? "structured_tap"
                                 : step.type
                             }
-                            onChange={event =>
-                              patchStep(
-                                step.id,
-                                changeStepType(
-                                  step,
-                                  event.target.value as StepType
-                                )
-                              )
-                            }
+                            onChange={event => {
+                              const type = event.target.value;
+                              patchStep(step.id, type === "structured_tap"
+                                ? { ...changeStepType(step, "tap"), prompt: "结构点击", selector: {} }
+                                : changeStepType(step, type as StepType));
+                            }}
                           >
                             {stepGroups.map(group => (
                               <optgroup key={group.label} label={group.label}>
@@ -1326,9 +1337,7 @@ export default function UITesting() {
                                     {stepTypes[type]}
                                   </option>
                                 ))}
-                                {group.label === "页面操作" &&
-                                  step.type === "tap" &&
-                                  step.selector && (
+                                {group.label === "页面操作" && (
                                     <option value="structured_tap">
                                       结构点击
                                     </option>
@@ -1895,44 +1904,97 @@ export default function UITesting() {
       )}
       {section === "reports" && (
         <section>
-          <h2 className="font-medium mb-5">运行历史 · {runs.length}</h2>
+          <h2 className="mb-5 font-medium">运行历史 · {runs.length}</h2>
           {!runs.length && (
             <p className="py-12 text-muted-foreground">
               尚无运行记录，实际执行后生成报告。
             </p>
           )}
-          <ul className="divide-y divide-border">
-            {runs.map(item => (
-              <li
-                key={item.id}
-                className="flex flex-wrap items-center justify-between gap-4 py-4"
+          {Array.from(
+            new Set(
+              runs.map(item => item.testCase.projectId || defaultProject.id)
+            )
+          ).map(id => {
+            const items = runs.filter(
+              item => (item.testCase.projectId || defaultProject.id) === id
+            );
+            const project = projects.find(item => item.id === id);
+            return (
+              <details
+                key={id}
+                className="mb-4 rounded-md border border-border"
               >
-                <div>
-                  <p>
-                    {item.testCase.name}{" "}
-                    <span className="ml-2 text-sm text-cyan-400">
-                      {states[item.state] || item.state}
-                    </span>
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    {item.serial || "本机执行"} ·{" "}
-                    {new Date(item.createdAt).toLocaleString()} ·{" "}
-                    {item.endedAt
-                      ? `${Math.round((item.endedAt - item.createdAt) / 1000)} 秒`
-                      : "运行中"}
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  onClick={() => void perform(() => showRecords(item.id))}
-                >
-                  查看步骤与报告
-                </Button>
-              </li>
-            ))}
-          </ul>
+                <summary className="cursor-pointer rounded-t-md bg-muted/50 px-4 py-3 text-sm font-medium">
+                  {project?.name ?? `未知项目 (${id})`} · {items.length} 条记录
+                </summary>
+                <ul className="divide-y divide-border px-4">
+                  {items.map(item => (
+                    <li
+                      key={item.id}
+                      className="flex flex-wrap items-center justify-between gap-4 py-4"
+                    >
+                      <div className="min-w-0">
+                        <p>
+                          {item.testCase.name}{" "}
+                          <span className="ml-2 text-sm text-cyan-400">
+                            {states[item.state] || item.state}
+                          </span>
+                        </p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          {item.serial || "本机执行"} ·{" "}
+                          {new Date(item.createdAt).toLocaleString()} ·{" "}
+                          {item.endedAt
+                            ? `${Math.round((item.endedAt - item.createdAt) / 1000)} 秒`
+                            : "运行中"}
+                        </p>
+                      </div>
+                      <div className="flex gap-2">
+                        <Button
+                          variant="outline"
+                          onClick={() =>
+                            void perform(() => showRecords(item.id))
+                          }
+                        >
+                          查看步骤与报告
+                        </Button>
+                        <DeleteRecordButton
+                          path={`/ui/runs/${encodeURIComponent(item.id)}/delete`}
+                          title={`删除 ${item.testCase.name} 的运行记录`}
+                          disabled={
+                            ![
+                              "passed",
+                              "failed",
+                              "error",
+                              "cancelled",
+                              "interrupted",
+                              "needs_review",
+                            ].includes(item.state)
+                          }
+                          description="将删除这条运行记录、执行步骤和关联截图及报告文件，删除后无法恢复。"
+                          onDeleted={() => {
+                            setRuns(current =>
+                              current.filter(run => run.id !== item.id)
+                            );
+                            setRunId(current =>
+                              current === item.id ? "" : current
+                            );
+                            if (run?.id === item.id) {
+                              setRun(null);
+                              setEvents([]);
+                              setMetrics([]);
+                            }
+                          }}
+                        />
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            );
+          })}
         </section>
       )}
+
       <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
         <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>

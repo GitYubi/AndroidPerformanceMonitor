@@ -65,6 +65,21 @@ function setup(knowledge = {}, seeds = {}) {
 }
 const goal = { source: pageKey(a), target: pageKey(b), prompt: "进入显示页面" };
 const edge = { from: pageKey(a), to: pageKey(b), selector };
+test("rechecks a learned entry immediately before sending input", async () => {
+  const s = setup({ goals: [goal], edges: [edge] });
+  s.device.tap = async (_, validate) => {
+    const changed = structuredClone(a);
+    changed.nodes[0].checkable = true;
+    validate(changed);
+    assert.fail("tap must stop before input");
+  };
+  await assert.rejects(
+    s.memory.run(goal.prompt, () => assert.fail("must not fall back after preparing to tap"), async () => true),
+    /导航入口当前不可安全点击/
+  );
+  assert.equal(s.events[0].knowledge.edges[0].stale, true);
+});
+
 test("only unambiguous navigation instructions qualify; toggle and compound commands remain AI tasks", () => {
   assert.equal(navigationTarget("进入显示页面"), "显示");
   assert.equal(navigationTarget("打开显示页面"), "显示");

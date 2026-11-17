@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import shlex
 
 from .adb import (
     AdbError,
@@ -26,9 +27,8 @@ from .adb import (
 )
 from .frame_sources import capture_frame_metrics, SOURCE_LABELS
 
-# 巡检状态：按前台包名跟踪 gfxinfo 计数基线，用于 R 线增量判定。
-# 全局单设备场景（工具本就是单主机/单车机），包名变化时自动重置。
-_probe_state: dict[str, object] = {}
+# 每个设备独立保存当前前台包和 gfxinfo 计数基线。
+_probe_state: dict[str, tuple[str, int | None]] = {}
 _probe_lock = asyncio.Lock()
 
 
@@ -55,7 +55,7 @@ async def _probe_present(serial: str, package: str, sdk_version: int | None) -> 
         layer = choose_surface_layer(layers, package)
         if layer is None:
             return False, "逐帧源不可用且未找到可测 layer", False, "逐帧源不可用"
-        output = await run_adb("shell", "dumpsys", "SurfaceFlinger", "--latency", layer, serial=serial, timeout_seconds=7)
+        output = await run_adb("shell", "dumpsys", "SurfaceFlinger", "--latency", shlex.quote(layer), serial=serial, timeout_seconds=7)
         latency_stats = parse_surface_latency_stats(output)
     except AdbError:
         latency_stats = None
@@ -74,13 +74,15 @@ async def probe_status(serial: str) -> dict[str, object]:
         try:
             package = await get_foreground_package(serial)
         except AdbError as exc:
+            _probe_state.pop(serial, None)
             return {"package": None, "r": False, "p": False, "jank": False, "note": f"ADB 不可用：{exc}"}
         if package is None:
+            _probe_state.pop(serial, None)
             return {"package": None, "r": False, "p": False, "jank": False, "note": "无法识别前台应用（请先打开一个界面）"}
 
-        if _probe_state.get("package") != package:
-            _probe_state.clear()
-            _probe_state["package"] = package
+        last_package, previous = _probe_state.get(serial, ("", None))
+        if last_package != package:
+            previous = None
 
         # ---------- R：gfxinfo 计数器增量 ----------
         r_ok = False
@@ -93,15 +95,15 @@ async def probe_status(serial: str) -> dict[str, object]:
             counters = None
             r_detail = f"gfxinfo 命令失败：{exc}"
         if counters is not None:
-            previous = _probe_state.get("counter")
-            if isinstance(previous, int) and counters[0] > previous:
+            if previous is not None and counters[0] > previous:
                 r_ok = True
                 r_detail = f"计数增量 {counters[0] - previous}"
             else:
                 r_detail = f"计数未增长（当前 {counters[0]}）——该界面渲染可能不经过 gfxinfo，请操作后确认"
-            _probe_state["counter"] = counters[0]
         else:
-            r_detail = "gfxinfo 无计数段（应用从未产生 HWUI 帧）"
+            if r_detail == "等待操作触发渲染…":
+                r_detail = "gfxinfo 无计数段（应用从未产生 HWUI 帧）"
+        _probe_state[serial] = (package, counters[0] if counters is not None else None)
 
         # ---------- P / Jank：逐帧源 → SF latency 兜底 ----------
         try:

@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack, closing
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,12 +25,14 @@ from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictBool, Stri
 
 from .adb import list_devices
 from .can_service import CanService
-from .ui_images import DEFAULT_PROJECT, IMAGE_ID, MAX_PNG, PROJECT_ID, UIImages, png_size
+from .ui_images import DEFAULT_PROJECT, IMAGE_ID, MAX_PNG, PROJECT_ID, png_size
 from .ui_navigation import NavigationStore
+from .ui_metrics import step_metrics
+from .ui_store import TERMINAL, UIStore
+from .record_cleanup import stage_directory, restore_directory, finish_directory
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / 'tools' / 'ui-test' / 'runner.mjs'
-TERMINAL = {'passed', 'failed', 'error', 'cancelled', 'interrupted', 'needs_review'}
 NAME = r'^[a-zA-Z0-9_-]{1,64}$'
 VARIABLE = r'^[a-zA-Z0-9_]{1,64}$'
 REFERENCE = re.compile(r'\$\{([a-zA-Z0-9_]+)\}')
@@ -53,6 +57,7 @@ class Selector(BaseModel):
     resourceId: str = Field(default='', max_length=500)
     label: str = Field(default='', max_length=2000)
     xpath: str = Field(default='', max_length=1600, pattern=r'^(?:/hierarchy(?:/node\[[1-9][0-9]{0,4}\])+)?$')
+    treeSource: Literal['', 'adb', 'uiautomator2'] = ''
 
 
 class TapCoordinates(BaseModel):
@@ -253,7 +258,7 @@ class Step(BaseModel):
     def validate_step(self):
         element_image = isinstance(self.options, ImageCheck) and self.options.mode == 'element'
         if self.selector and (not (self.type in {'tap', 'element_assert', 'element_screenshot'} or element_image)
-                              or not any(v.strip() for v in self.selector.model_dump().values())):
+                              or not any(v.strip() for v in self.selector.model_dump(exclude={'treeSource'}).values())):
             raise ValueError('结构定位条件不能为空且须适用于该步骤')
         if (self.type in {'element_assert', 'element_screenshot'} or element_image) and self.selector is None:
             raise ValueError('请至少填写一个元素定位条件')
@@ -317,11 +322,6 @@ class TestCase(BaseModel):
             raise ValueError('敏感参数不可保存默认值，请在执行时输入')
         seen = {}
         paths = {}
-        visible_names = {}
-        captured = {}
-        assigned = set()
-        image_variables = set()
-        enabled_ids = set()
         groups = {}
         for index, step in enumerate(self.steps, start=1):
             parent = seen.get(step.parentId)
@@ -331,43 +331,6 @@ class TestCase(BaseModel):
             if step.type == 'else' and (not parent or parent.type != 'if' or step.branch != 'else'):
                 raise ValueError(f'第 {index} 步的 Else 必须归属于 If')
             scope = (*paths[parent.id], (parent.id, step.branch)) if parent else ()
-            scoped = visible_names[parent.id] if parent else names
-            available = scoped | assigned
-            effective = step.enabled and (not parent or parent.id in enabled_ids)
-            for operation in (step, step.condition) if step.condition else (step,):
-                references = set(REFERENCE.findall(operation.prompt + ' ' + operation.value))
-                if isinstance(operation.options, VariableCheck):
-                    references.add(operation.options.variable)
-                    references.update(REFERENCE.findall(operation.options.expectedValue))
-                if references - available:
-                    raise ValueError(f'第 {index} 步引用了未声明或不可见的变量')
-                if effective:
-                    options = operation.options
-                    sources = ()
-                    if isinstance(options, ScreenshotCheck):
-                        sources = (options.firstStepId, options.secondStepId)
-                        if {options.firstVariable, options.secondVariable} - image_variables - {None}:
-                            raise ValueError(f'第 {index} 步引用的图片变量须在前面赋值')
-                    elif isinstance(options, VariableAssignment):
-                        sources = (options.sourceStepId,)
-                    for source in filter(None, sources):
-                        source_scope = captured.get(source)
-                        if source_scope is None or source_scope != scope[:len(source_scope)]:
-                            raise ValueError(f'第 {index} 步只能引用前面已启用的截图步骤，且须位于当前分支或外层')
-            if effective:
-                enabled_ids.add(step.id)
-                if step.type in CAPTURE_TYPES:
-                    captured[step.id] = scope
-                if isinstance(step.options, VariableAssignment):
-                    if step.options.variable in scoped - names:
-                        raise ValueError(f'第 {index} 步不能给循环索引变量赋值')
-                    assigned.add(step.options.variable)
-                    if step.options.valueType == 'image':
-                        image_variables.add(step.options.variable)
-            loop_variable = step.options.indexVariable if isinstance(step.options, LoopOptions) else None
-            if loop_variable and loop_variable in available:
-                raise ValueError(f'第 {index} 步的循环变量与现有变量重名')
-            visible_names[step.id] = scoped | {loop_variable} if loop_variable else scoped
             seen[step.id] = step
             paths[step.id] = scope
             groups.setdefault((step.parentId, step.branch), []).append(step.id)
@@ -384,6 +347,66 @@ class TestCase(BaseModel):
 
         if list(ordered()) != [step.id for step in self.steps]:
             raise ValueError('分支和循环的子步骤须连续排列，且 If 分支位于 Else 之前')
+
+        entries = {}
+        enabled_ids = {step.id for step in self.enabled_steps()}
+
+        def walk(parent=None, branch=None, incoming=None):
+            assigned = dict(incoming or {})
+            for step_id in groups.get((parent, branch), []):
+                step = seen[step_id]
+                entries[step_id] = assigned.copy()
+                if step.type == 'if':
+                    yes = walk(step_id, incoming=assigned)
+                    no = walk(step_id, 'else', assigned)
+                    assigned = {name: kind if no[name] == kind else 'mixed'
+                                for name, kind in yes.items() if name in no}
+                elif step.type in {'else', 'for'}:
+                    assigned = walk(step_id, incoming=assigned)
+                elif step_id in enabled_ids and isinstance(step.options, VariableAssignment):
+                    assigned[step.options.variable] = step.options.valueType
+            return assigned
+
+        walk()
+        visible_names = {}
+        captured = {}
+        for index, step in enumerate(self.steps, start=1):
+            scope = paths[step.id]
+            scoped = visible_names[step.parentId] if step.parentId else names
+            assigned = entries[step.id]
+            available = scoped | assigned.keys()
+            effective = step.id in enabled_ids
+            for operation in (step, step.condition) if step.condition else (step,):
+                references = set(REFERENCE.findall(operation.prompt + ' ' + operation.value))
+                if isinstance(operation.options, VariableCheck):
+                    references.add(operation.options.variable)
+                    references.update(REFERENCE.findall(operation.options.expectedValue))
+                if references - available:
+                    raise ValueError(f'第 {index} 步引用了未声明或不可见的变量')
+                if effective:
+                    options = operation.options
+                    sources = ()
+                    if isinstance(options, ScreenshotCheck):
+                        sources = (options.firstStepId, options.secondStepId)
+                        if any(name and assigned.get(name) != 'image'
+                               for name in (options.firstVariable, options.secondVariable)):
+                            raise ValueError(f'第 {index} 步引用的图片变量须在前面赋值')
+                    elif isinstance(options, VariableAssignment):
+                        sources = (options.sourceStepId,)
+                    for source in filter(None, sources):
+                        source_scope = captured.get(source)
+                        if source_scope is None or source_scope != scope[:len(source_scope)]:
+                            raise ValueError(f'第 {index} 步只能引用前面已启用的截图步骤，且须位于当前分支或外层')
+            if effective:
+                if step.type in CAPTURE_TYPES:
+                    captured[step.id] = scope
+                if isinstance(step.options, VariableAssignment):
+                    if step.options.variable in scoped - names:
+                        raise ValueError(f'第 {index} 步不能给循环索引变量赋值')
+            loop_variable = step.options.indexVariable if isinstance(step.options, LoopOptions) else None
+            if loop_variable and loop_variable in available:
+                raise ValueError(f'第 {index} 步的循环变量与现有变量重名')
+            visible_names[step.id] = scoped | {loop_variable} if loop_variable else scoped
         return self
 
     def enabled_steps(self):
@@ -417,71 +440,6 @@ class Settings(BaseModel):
         if url.scheme not in {'http', 'https'} or not url.hostname or url.username or url.password or url.query or url.fragment:
             raise ValueError('模型接口必须是无凭据、无查询参数的 HTTP(S) 地址')
         return self
-
-
-class UIStore:
-    def __init__(self, root: Path):
-        self.root = root
-        root.mkdir(parents=True, exist_ok=True)
-        self.db = root / 'ui.db'
-        self.baselines = root / 'baselines'
-        self.images = UIImages(root, self.db)
-        with self.connect() as conn:
-            conn.execute('CREATE TABLE IF NOT EXISTS cases (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
-            conn.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
-            conn.execute('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, body TEXT NOT NULL)')
-            conn.execute('CREATE INDEX IF NOT EXISTS events_run ON events(run_id, seq)')
-
-    def connect(self):
-        return sqlite3.connect(self.db, timeout=10)
-
-    def validate_baselines(self, test_case: TestCase):
-        self.images.require_project(test_case.projectId)
-        files = {}
-        for step in test_case.steps:
-            operation = step.condition or step
-            if isinstance(operation.options, (ImageCheck, VariableAssignment)) and operation.options.baselineId:
-                image_id = operation.options.baselineId
-                project_id = getattr(operation.options, 'baselineProjectId', None)
-                path = self.images.path(image_id, project_id)
-                if not path.is_file():
-                    raise ValueError('用例引用的 PNG 图片不存在，请重新选择')
-                if project_id:
-                    files[f'{project_id}/{image_id}'] = str(path.resolve())
-        return files
-
-    def all(self, table: str):
-        with self.connect() as conn:
-            return [json.loads(row[0]) for row in conn.execute(f'SELECT body FROM {table} ORDER BY rowid DESC LIMIT 500')]
-
-    def get(self, table: str, key: str):
-        with self.connect() as conn:
-            row = conn.execute(f'SELECT body FROM {table} WHERE id=?', (key,)).fetchone()
-        if row is None:
-            raise KeyError(key)
-        return json.loads(row[0])
-
-    def put(self, table: str, body: dict):
-        with self.connect() as conn:
-            conn.execute(f'INSERT INTO {table} VALUES (?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body', (body['id'], json.dumps(body, ensure_ascii=False)))
-
-    def event(self, run_id: str, body: dict):
-        with self.connect() as conn:
-            conn.execute('INSERT INTO events(run_id,body) VALUES (?,?)', (run_id, json.dumps(body, ensure_ascii=False)))
-
-    def events(self, run_id: str, after: int = 0, limit: int = -1):
-        with self.connect() as conn:
-            return [{'seq': row[0], **json.loads(row[1])} for row in conn.execute(
-                'SELECT seq,body FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?', (run_id, after, limit))]
-
-    def recover(self):
-        with self.connect() as conn:
-            rows = conn.execute('SELECT body FROM runs').fetchall()
-        for row in rows:
-            run = json.loads(row[0])
-            if run['state'] not in TERMINAL:
-                run.update(state='interrupted', endedAt=int(time.time() * 1000))
-                self.put('runs', run)
 
 
 def draft_from_run(run: dict, events: list[dict]) -> dict:
@@ -644,7 +602,18 @@ class UIManager:
             run_id = uuid.uuid4().hex
             settings = self.settings()
             output = (Path(settings['reportRoot']) if settings['reportRoot'] else self.store.root / 'runs') / run_id
-            output.mkdir(parents=True, exist_ok=True)
+            output.mkdir(parents=True)
+            baseline_dir = output / '.baselines'
+            try:
+                # Image-library mutations use the same lock as run creation.
+                for key, original in baseline_files.items():
+                    snapshot = baseline_dir / f'{key}.png'
+                    snapshot.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(original, snapshot)
+                    baseline_files[key] = str(snapshot.resolve())
+            except OSError:
+                shutil.rmtree(output, ignore_errors=True)
+                raise
             performance_id = None
             if self.monitor and serial:
                 for runtime in self.monitor.active.values():
@@ -662,7 +631,7 @@ class UIManager:
             }
             self.store.put('runs', run)
             job = {'serial': serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
-            job['baselineDir'] = str(self.store.baselines.resolve())
+            job['baselineDir'] = str(baseline_dir.resolve())
             job['baselineFiles'] = baseline_files
             job['pythonExecutable'] = sys.executable
             if serial and not run['sensitive']:
@@ -703,6 +672,14 @@ class UIManager:
                     pass
 
     async def execute(self, run_id, job, env, timeout, can_steps, can_session):
+        try:
+            await self._execute_run(run_id, job, env, timeout, can_steps, can_session)
+        finally:
+            self.processes.pop(run_id, None)
+            self.tasks.pop(run_id, None)
+            self.cancelled.discard(run_id)
+
+    async def _execute_run(self, run_id, job, env, timeout, can_steps, can_session):
         run = self.store.get('runs', run_id)
         process = None
         owned = {}
@@ -786,7 +763,15 @@ class UIManager:
             if run['state'] not in TERMINAL:
                 run['state'] = 'interrupted'
             controls = {}
-            for event in self.store.events(run_id):
+            try:
+                events = self.store.events(run_id)
+            except (OSError, sqlite3.Error, ValueError):
+                logging.getLogger(__name__).exception("Could not read final UI events for %s", run_id)
+                if run['state'] != 'cancelled':
+                    run['state'] = 'error'
+                run['message'] = '无法读取执行事件，请检查运行记录与设备状态'
+                events = []
+            for event in events:
                 if event.get('type') == 'exploration' and event.get('control'):
                     controls[event['control']] = event
             pending = [name for name, event in controls.items() if event.get('state') in {'running', 'passed', 'failed', 'needs_review'}]
@@ -802,9 +787,6 @@ class UIManager:
             run['performanceSessionId'] = self.store.get('runs', run_id).get('performanceSessionId')
             self.store.put('runs', run)
             self.store.event(run_id, {'type': 'task_end', 'state': run['state'], 'time': run['endedAt'], 'message': run.get('message')})
-            self.processes.pop(run_id, None)
-            self.tasks.pop(run_id, None)
-            self.cancelled.discard(run_id)
 
     async def cancel(self, run_id):
         self.store.get('runs', run_id)
@@ -906,7 +888,22 @@ async def delete_ui_project(project_id: str, request: Request):
             store.images.require_project(project_id)
         except ValueError as error:
             raise HTTPException(404, str(error)) from error
-        with store.connect() as conn:
+        monitor = getattr(request.app.state, 'manager', None)
+        monkey = getattr(request.app.state, 'monkey', None)
+        if monitor and any(runtime.request.project_id == project_id for runtime in monitor.active.values()):
+            raise HTTPException(409, '项目的性能测试正在运行，请等待运行结束后再删除')
+        if monkey and any(runtime.config.project_id == project_id for runtime in monkey.active.values()):
+            raise HTTPException(409, '项目的 Monkey 测试正在运行，请等待运行结束后再删除')
+        performance = monitor.store.list_sessions(limit=None, project_id=project_id) if monitor else []
+        monkey_runs = []
+        if monkey:
+            with sqlite3.connect(monkey.store.index) as monkey_db:
+                monkey_runs = [json.loads(row[0]) for row in monkey_db.execute(
+                    "SELECT body FROM jobs WHERE COALESCE(json_extract(body,'$.project_id'),'default')=?", (project_id,))]
+        staged_paths = []
+        with ExitStack() as rollback, closing(store.connect()) as conn:
+            if monkey:
+                conn.execute('ATTACH DATABASE ? AS monkey_jobs', (str(monkey.store.index),))
             cases = [json.loads(row[0]) for row in conn.execute('SELECT body FROM cases')]
             runs = [json.loads(row[0]) for row in conn.execute('SELECT body FROM runs')]
             for run in runs:
@@ -919,6 +916,18 @@ async def delete_ui_project(project_id: str, request: Request):
                         raise HTTPException(409, '项目相关用例正在运行，请等待运行结束后再删除')
 
             removed_runs = [run for run in runs if (run.get('testCase') or {}).get('projectId', DEFAULT_PROJECT) == project_id]
+            directories = [store.images.root / project_id]
+            if monitor:
+                directories.extend(monitor.store.data_root / session['dir_name'] for session in performance)
+            if monkey:
+                directories.extend(monkey.store.root / run['id'] for run in monkey_runs
+                                   if re.fullmatch(r'[a-f0-9]{32}', run['id']))
+            for run in removed_runs:
+                run_id = run.get('id', '')
+                path = Path(run.get('outputDir') or '')
+                if re.fullmatch(r'[a-f0-9]{32}', run_id) and path.name == run_id:
+                    directories.append(path)
+
             kept = [('cases', case, case) for case in cases if case.get('projectId', DEFAULT_PROJECT) != project_id]
             kept += [('runs', run, run.get('testCase') or {}) for run in runs if run not in removed_runs]
             shared_ids = set()
@@ -941,11 +950,17 @@ async def delete_ui_project(project_id: str, request: Request):
                         try:
                             shutil.copyfile(source, temp)
                             temp.replace(target)
+                            rollback.callback(target.unlink, missing_ok=True)
                         finally:
                             temp.unlink(missing_ok=True)
                     conn.execute('''INSERT OR IGNORE INTO ui_images (project_id,id,name,width,height,source,region)
                         SELECT ?,id,name,width,height,source,region FROM ui_images WHERE project_id=? AND id=?''',
                         (DEFAULT_PROJECT, project_id, image_id))
+                for path in dict.fromkeys(directories):
+                    staged = stage_directory(path)
+                    if staged:
+                        staged_paths.append(staged)
+                        rollback.callback(restore_directory, staged)
                 for table, body, case in kept:
                     changed = False
                     for step in case.get('steps', []):
@@ -964,23 +979,13 @@ async def delete_ui_project(project_id: str, request: Request):
                     conn.execute('DELETE FROM runs WHERE id=?', (run['id'],))
                 conn.execute('DELETE FROM ui_images WHERE project_id=?', (project_id,))
                 conn.execute('DELETE FROM ui_projects WHERE id=?', (project_id,))
-            except (OSError, ValueError) as error:
+                if monkey:
+                    conn.executemany('DELETE FROM monkey_jobs.jobs WHERE id=?', [(run['id'],) for run in monkey_runs])
+                conn.commit()
+            except (OSError, ValueError, sqlite3.Error) as error:
                 raise HTTPException(409, str(error)) from error
-        errors = []
-        directories = [store.images.root / project_id]
-        for run in removed_runs:
-            run_id = run.get('id', '')
-            path = Path(run.get('outputDir') or '')
-            if re.fullmatch(r'[a-f0-9]{32}', run_id) and path.name == run_id:
-                directories.append(path)
-        for path in directories:
-            try:
-                if path.is_symlink():
-                    path.unlink()
-                elif path.is_dir():
-                    shutil.rmtree(path)
-            except OSError:
-                errors.append(str(path))
+            rollback.pop_all()
+        errors = [error for staged in staged_paths for error in finish_directory(staged)]
         return {'deleted': True, 'cleanupErrors': errors,
                 'deletedRunIds': [run['id'] for run in removed_runs]}
 
@@ -1019,9 +1024,18 @@ def ui_project_overview(project_id: str, request: Request):
                 recent.append({'id': run.get('id'), 'name': test_case.get('name', ''),
                                'state': state, 'createdAt': run.get('createdAt')})
     images = store.images.list_images(project_id)
+    monitor = getattr(request.app.state, 'manager', None)
+    monkey = getattr(request.app.state, 'monkey', None)
+    performance_count = len(monitor.store.list_sessions(limit=None, project_id=project_id)) if monitor else 0
+    monkey_count = 0
+    if monkey:
+        with sqlite3.connect(monkey.store.index) as conn:
+            monkey_count = conn.execute(
+                "SELECT COUNT(*) FROM jobs WHERE COALESCE(json_extract(body,'$.project_id'),'default')=?", (project_id,)).fetchone()[0]
     return {'caseCount': case_count, 'runCount': sum(states.values()), 'states': states,
             'recentRuns': recent, 'imageCount': len(images), 'images': images[:6],
-            'elementCount': len(elements), 'elements': list(elements.values())[:6]}
+            'elementCount': len(elements), 'elements': list(elements.values())[:6],
+            'performanceCount': performance_count, 'monkeyCount': monkey_count}
 
 
 @router.get('/projects/{project_id}/images')
@@ -1273,7 +1287,33 @@ async def cases_export(value: ExportRequest, request: Request):
 @router.get('/runs')
 async def runs_list(request: Request):
     runs = manager(request).store.all('runs')
-    return [{**run, 'testCase': {k: run['testCase'][k] for k in ('id', 'name', 'version')}} for run in runs]
+    return [{**run, 'testCase': {**{k: run['testCase'][k] for k in ('id', 'name', 'version')},
+                                'projectId': run['testCase'].get('projectId') or DEFAULT_PROJECT}} for run in runs]
+
+
+@router.post('/runs/{run_id}/delete')
+async def delete_ui_run(run_id: str, request: Request):
+    service = manager(request)
+    async with service.lock:
+        try:
+            run = service.store.get('runs', run_id)
+        except KeyError as error:
+            raise HTTPException(404, '运行记录不存在') from error
+        if run_id in service.tasks or run.get('state') not in TERMINAL:
+            raise HTTPException(409, '运行中的记录不能删除')
+        path = Path(run.get('outputDir') or '')
+        if not re.fullmatch(r'[a-f0-9]{32}', run_id) or path.name != run_id:
+            raise HTTPException(409, '记录目录无效，无法删除')
+        staged = None
+        try:
+            staged = stage_directory(path)
+            with service.store.connect() as conn:
+                conn.execute('DELETE FROM events WHERE run_id=?', (run_id,))
+                conn.execute('DELETE FROM runs WHERE id=?', (run_id,))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            restore_directory(staged)
+            raise HTTPException(409, f'删除运行记录失败：{error}') from error
+        return {'deleted': True, 'cleanupErrors': finish_directory(staged)}
 
 
 @router.post('/runs', status_code=201)
@@ -1309,29 +1349,6 @@ async def execution_draft(run_id: str, request: Request):
     if run['state'] not in TERMINAL:
         raise HTTPException(409, '执行结束后才能生成草稿')
     return draft_from_run(run, manager(request).store.events(run_id))
-
-
-def step_metrics(run: dict, events: list[dict], performance_store) -> list[dict]:
-    session_ids = list(dict.fromkeys([run.get('performanceSessionId')] + [e.get('sessionId') for e in events if e.get('type') == 'performance']))
-    output = []
-    for step in run['testCase']['steps']:
-        progress = [e for e in events if e.get('type') == 'step' and e.get('stepId') == step['id']]
-        starts = [e['time'] for e in progress if e.get('state') == 'running']
-        if not starts:
-            continue
-        start = min(starts)
-        ends = [e['time'] for e in progress if e.get('state') in TERMINAL]
-        end = max(ends) if ends else run.get('endedAt') or int(time.time() * 1000)
-        for session_id in filter(None, session_ids):
-            path = performance_store.database_path(session_id)
-            if not path.exists():
-                continue
-            with sqlite3.connect(path) as conn:
-                conn.row_factory = sqlite3.Row
-                row = conn.execute('SELECT COUNT(*) AS sampleCount, AVG(cpu_total_pct) AS cpuAverage, MAX(cpu_total_pct) AS cpuPeak, AVG(pss_kb)/1024.0 AS memoryAverageMb, AVG(fps) AS fpsAverage FROM sample WHERE ts_ms>=? AND ts_ms<=?', (start, end)).fetchone()
-            if row['sampleCount']:
-                output.append({'stepId': step['id'], 'sessionId': session_id, 'start': start, 'end': end, **dict(row)})
-    return output
 
 
 @router.get('/runs/{run_id}/metrics')

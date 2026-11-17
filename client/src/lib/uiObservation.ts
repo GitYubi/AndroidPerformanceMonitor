@@ -27,7 +27,32 @@ export type Observation = {
   identity?: string;
   geometry: string;
   rotation: string;
+  treeSource?: "uiautomator2" | "adb" | "screenshot";
 };
+
+export const treeSourceLabel = {
+  uiautomator2: "UIAutomator2 多窗口",
+  adb: "ADB 活动窗口",
+  screenshot: "仅截图 · 控件不可用",
+};
+
+export function candidateLabel(node: MapNode) {
+  return [node.label, node.package, node.resourceId, node.className]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export function boundsStyle(
+  frame: Pick<Observation, "width" | "height">,
+  [left, top, right, bottom]: number[]
+) {
+  return {
+    left: `${(left * 100) / frame.width}%`,
+    top: `${(top * 100) / frame.height}%`,
+    width: `${((right - left) * 100) / frame.width}%`,
+    height: `${((bottom - top) * 100) / frame.height}%`,
+  };
+}
 
 export function screenPixel(
   frame: Pick<Observation, "width" | "height">,
@@ -61,11 +86,29 @@ export function nodesAtPoint(observation: Observation, x: number, y: number) {
   return observation.nodes
     .flatMap(node => {
       const bounds = node.bounds;
-      if (!bounds) return [];
+      if (bounds?.length !== 4 || !bounds.every(Number.isFinite)) return [];
       const [left, top, right, bottom] = bounds;
+      if (right <= left || bottom <= top) return [];
       if (x < left || x >= right || y < top || y >= bottom) return [];
       return [{ node, area: (right - left) * (bottom - top) }];
     })
-    .sort((a, b) => a.area - b.area)
+    .sort(
+      (a, b) =>
+        a.area - b.area ||
+        b.node.xpath.split("/").length - a.node.xpath.split("/").length
+    )
     .map(({ node }) => node);
+}
+
+export function pointCandidates(
+  observation: Observation,
+  event: { currentTarget: HTMLImageElement; clientX: number; clientY: number }
+) {
+  const point = screenPixel(
+    observation,
+    event.currentTarget.getBoundingClientRect(),
+    event.clientX,
+    event.clientY
+  );
+  return point ? nodesAtPoint(observation, point.x, point.y) : [];
 }

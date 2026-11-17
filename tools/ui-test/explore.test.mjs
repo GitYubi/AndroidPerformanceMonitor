@@ -22,6 +22,45 @@ test('failed return stops further navigation',async()=>{
   const d=navigation();d.back=async()=>{};
   assert.equal(await exploreTree(null,d,{exploration:scope},()=>{}),'needs_review');assert.equal(d.taps,1);
 });
+test('transient observation failure after a tap still returns to the parent', async () => {
+  const d = navigation(), events = [];
+  const read = d.read;
+  let missed = false;
+  d.read = async () => {
+    if (d.taps && !missed) {
+      missed = true;
+      throw Error('hierarchy temporarily unavailable');
+    }
+    return read();
+  };
+  assert.equal(await exploreTree(null, d, { exploration: scope }, event => events.push(event)), 'passed');
+  assert.equal(d.taps, 1);
+  assert.equal(d.backs, 1);
+  assert.ok(events.some(event => event.type === 'graph-return' && event.state === 'restored'));
+});
+test('unknown device location after a tap halts traversal without issuing Back', async () => {
+  const d = navigation(), events = [];
+  const read = d.read;
+  d.read = async () => {
+    if (d.taps) throw Error('hierarchy unavailable');
+    return read();
+  };
+  assert.equal(await exploreTree(null, d, { exploration: scope }, event => events.push(event)), 'needs_review');
+  assert.equal(d.taps, 1);
+  assert.equal(d.backs, 0);
+  assert.ok(events.some(event => event.type === 'graph-edge' && event.state === 'needs_review'));
+});
+test('a Back error is verified by reading the device instead of repeating Back', async () => {
+  const d = navigation(), events = [];
+  const back = d.back;
+  d.back = async () => {
+    await back();
+    throw Error('unknown exit status');
+  };
+  assert.equal(await exploreTree(null, d, { exploration: scope }, event => events.push(event)), 'passed');
+  assert.equal(d.backs, 1);
+  assert.ok(events.some(event => event.type === 'graph-return' && event.state === 'restored'));
+});
 test('checkable controls are excluded from scan menu discovery',async()=>{
   const d=navigation();d.read=async()=>parseHierarchy(xml(menu.replace('</node>','<node checkable="true"/></node>')));
   assert.equal(await exploreTree(null,d,{exploration:scope},()=>{}),'passed');assert.equal(d.taps,0);

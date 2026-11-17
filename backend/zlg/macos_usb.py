@@ -7,7 +7,7 @@ from struct import Struct, pack
 import time
 
 from can import Message
-from zlg.backend import validate_channel
+from zlg.backend import attempt_cleanup, validate_channel
 from zlg.logutil import Logs
 from zlg.paths import resource_path
 from zlg.ucfd_identity import COMMAND, crc16, encode_packet, exchange_command, query_identity, query_version
@@ -209,7 +209,7 @@ class MacUsbCanBackend:
         return tuple(sorted(self._channels))
 
     def open_channel(self, channel):
-        validate_channel(channel)
+        validate_channel(channel, 2)
         if not self._opened:
             raise RuntimeError("Mac USB 设备已关闭。")
         if channel in self._channels:
@@ -232,7 +232,7 @@ class MacUsbCanBackend:
         self._log.info(f"Mac USB 通道 {channel} 已启动（500 kbit/s / 2 Mbit/s）。")
 
     def close_channel(self, channel):
-        validate_channel(channel)
+        validate_channel(channel, 2)
         if channel in self._channels:
             if channel in self._periodic_channels:
                 try:
@@ -345,35 +345,29 @@ class MacUsbCanBackend:
         return self._opened
 
     def _release(self):
-        handle, self._handle = self._handle, None
+        handle = self._handle
+        errors = []
         if handle is not None:
-            try:
-                if self._claimed:
-                    self._usb.release_interface(handle, 0)
-            finally:
+            if self._claimed and attempt_cleanup(errors, "释放 USB 接口",
+                                                lambda: self._usb.release_interface(handle, 0)):
                 self._claimed = False
-                self._usb.close_device(handle)
+            if attempt_cleanup(errors, "关闭 USB 句柄", lambda: self._usb.close_device(handle)):
+                self._handle = None
+                self._claimed = False
+        if errors:
+            raise RuntimeError("；".join(errors))
 
     def close(self):
-        try:
-            if self._opened:
-                errors = []
-                try:
-                    for channel in self.channels:
-                        try:
-                            self.close_channel(channel)
-                        except (OSError, RuntimeError) as exc:
-                            errors.append(exc)
-                finally:
-                    self._command(0x02)
-                if errors:
-                    raise errors[0]
-        finally:
-            self._opened = False
-            self._channels.clear()
-            self._periodic_channels.clear()
-            self._pending.clear()
-            try:
-                self._release()
-            finally:
-                self._log.close()
+        errors = []
+        if self._opened:
+            for channel in self.channels:
+                attempt_cleanup(errors, f"停止通道 {channel}", lambda: self.close_channel(channel))
+            attempt_cleanup(errors, "停止设备", lambda: self._command(0x02))
+        self._opened = False
+        self._channels.clear()
+        self._periodic_channels.clear()
+        self._pending.clear()
+        attempt_cleanup(errors, "释放 USB 设备", self._release)
+        attempt_cleanup(errors, "关闭 USB 日志", self._log.close)
+        if errors:
+            raise RuntimeError("；".join(errors))
