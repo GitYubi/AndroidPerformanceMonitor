@@ -44,6 +44,7 @@ REQUIRED_PROJECT_FILES = (
     "backend/vendor/scrcpy/README.md",
     "backend/vendor/scrcpy/scrcpy-server-v3.3.4",
     "tools/monkey/android_system_blacklist.txt",
+    "tools/monkey/multiscreen-runner.jar",
     "tools/ui-test/package.json",
     "tools/ui-test/package-lock.json",
 )

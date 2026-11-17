@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from html import escape
 import logging
 import math
 from pathlib import Path
@@ -21,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from .adb import AdbError, list_devices, run_adb
 from .models import MetricsConfig, StartSessionRequest
 from .monkey_records import MonkeyRecords, MonkeyReportStore, connect
+from . import monkey_multiscreen as screens
 from .report import ReportMetric, ReportTheme, generate_report
 from .record_cleanup import stage_directory, restore_directory, finish_directory
 
@@ -72,6 +74,7 @@ class MonkeyRequest(BaseModel):
     fps: bool = False
     ignore_crashes: bool = True
     ignore_timeouts: bool = True
+    multi_screen: screens.MultiScreen | None = None
 
     @field_validator("serial")
     @classmethod
@@ -92,6 +95,10 @@ class MonkeyRequest(BaseModel):
 
     @model_validator(mode="after")
     def list_mode(self):
+        if self.multi_screen is not None:
+            if self.mode != "none" or self.packages:
+                raise ValueError("多屏模式请按屏配置名单")
+            return self
         if self.mode == "none" and self.packages:
             raise ValueError("无名单模式不能携带包名单")
         if self.mode != "none" and not self.packages:
@@ -103,7 +110,8 @@ def remote_paths(run_id: str) -> dict[str, str]:
     if not RUN_ID.fullmatch(run_id):
         raise ValueError("无效的 Monkey 任务 ID")
     base = "/data/local/tmp/acpm-monkey-" + run_id
-    return {"script": base + ".sh", "packages": base + ".packages", "pid": base + ".pid", "lease": base + ".lease"}
+    return {"script": base + ".sh", "packages": base + ".packages", "pid": base + ".pid",
+            "lease": base + ".lease", "runner": base + ".jar", "gate": base + ".start", "halt": base + ".halt"}
 
 
 def monkey_arguments(config: MonkeyRequest, paths: dict[str, str]) -> list[str]:
@@ -121,13 +129,17 @@ def monkey_arguments(config: MonkeyRequest, paths: dict[str, str]) -> list[str]:
 
 
 def runner_script(config: MonkeyRequest, paths: dict[str, str]) -> str:
-    command = shlex.join(["app_process", "/system/bin", "com.android.commands.monkey.Monkey", *monkey_arguments(config, paths)])
+    if config.multi_screen:
+        command = screens.command(paths["runner"], "run", paths["packages"], paths["gate"], paths["halt"])
+    else:
+        command = "CLASSPATH=/system/framework/monkey.jar " + shlex.join([
+            "app_process", "/system/bin", "com.android.commands.monkey.Monkey", *monkey_arguments(config, paths)])
     duration = config.duration_hours * HOUR_SECONDS if config.duration_hours else 0
     return f"""#!/system/bin/sh
 set -u
 touch {paths['lease']}
 started=$(date +%s)
-CLASSPATH=/system/framework/monkey.jar {command} &
+{command} &
 child=$!
 stamp=$(awk '{{print $22}}' /proc/$child/stat 2>/dev/null)
 printf '%s %s\\n' "$child" "$stamp" > {paths['pid']}
@@ -139,6 +151,9 @@ echo __ACPM_MONKEY_PID__=$child
     now=$(date +%s)
     if [ $((now-modified)) -ge {LEASE_SECONDS} ] || {{ [ {duration} -gt 0 ] && [ $((now-started)) -ge {duration} ]; }}; then
       echo __ACPM_DEVICE_GUARD_STOP__
+      if [ -f {paths['runner']} ]; then touch {paths['halt']}; sleep 1; fi
+      current=$(awk '{{print $22}}' /proc/$child/stat 2>/dev/null)
+      [ -n "$stamp" ] && [ "$current" = "$stamp" ] || break
       kill "$child" 2>/dev/null
       sleep 2
       current=$(awk '{{print $22}}' /proc/$child/stat 2>/dev/null)
@@ -187,6 +202,9 @@ class Runtime:
     expired: bool = False
     timer: asyncio.Task | None = None
     cleanup_task: asyncio.Task | None = None
+    evidence: screens.ScreenEvidence | None = None
+    screen_plan: str = ""
+    anomaly_watcher: asyncio.Task | None = None
 
 
 class MonkeyManager:
@@ -223,6 +241,8 @@ class MonkeyManager:
                     missing = set(config.packages) - names
                     if missing:
                         raise ValueError("白名单中存在未安装应用：" + "、".join(sorted(missing)[:10]))
+                if config.multi_screen:
+                    screen_plan, inventory = await screens.prepare(config.serial, config.multi_screen, config.seed, config.throttle_ms)
                 run = {"id": run_id, "serial": config.serial, "state": "starting", "config": config.model_dump(),
                        "project_id": config.project_id, "project_name": project_name,
                        "created_at_ms": int(time.time() * 1000), "started_at_ms": None, "ended_at_ms": None,
@@ -231,6 +251,10 @@ class MonkeyManager:
                 self.store.put(run)
                 self.store.initialize(run)
                 runtime = Runtime(run_id, config)
+                if config.multi_screen:
+                    runtime.screen_plan = screen_plan
+                    runtime.evidence = screens.ScreenEvidence(
+                        self.store.directory(run_id), inventory, config.multi_screen, config.seed)
                 self.active[run_id] = runtime
                 self.ui.external_busy[config.serial] = run_id
                 runtime.task = asyncio.create_task(self.execute(runtime), name="monkey-" + run_id)
@@ -248,11 +272,17 @@ class MonkeyManager:
         script = root / "runner.sh"
         script.write_text(runner_script(runtime.config, paths), encoding="utf-8", newline="\n")
         packages = root / "packages.txt"
-        packages.write_text("\n".join(runtime.config.packages) + "\n", encoding="utf-8", newline="\n")
-        await run_adb("shell", "test -r /system/framework/monkey.jar && command -v app_process && command -v awk && stat -c %Y /data/local/tmp", serial=runtime.config.serial)
+        packages.write_text(runtime.screen_plan or "\n".join(runtime.config.packages) + "\n", encoding="utf-8", newline="\n")
+        prerequisite = "command -v app_process && command -v awk && stat -c %Y /data/local/tmp"
+        if not runtime.evidence:
+            prerequisite = "test -r /system/framework/monkey.jar && " + prerequisite
+        await run_adb("shell", prerequisite, serial=runtime.config.serial)
         await run_adb("push", str(script), paths["script"], serial=runtime.config.serial, timeout_seconds=15)
-        if runtime.config.mode != "none":
+        if runtime.config.mode != "none" or runtime.evidence:
             await run_adb("push", str(packages), paths["packages"], serial=runtime.config.serial, timeout_seconds=15)
+        if runtime.evidence:
+            await run_adb("push", str(screens.RUNNER), paths["runner"], serial=runtime.config.serial, timeout_seconds=15)
+            device_epoch = int((await run_adb("shell", "date", "+%s%3N", serial=runtime.config.serial)).strip()) / 1000
         adb = shutil.which("adb")
         if not adb:
             raise AdbError("未找到 adb")
@@ -260,13 +290,37 @@ class MonkeyManager:
                                                                stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
                                                                stderr=asyncio.subprocess.STDOUT, limit=32768)
         runtime.reader = asyncio.create_task(self.read_output(runtime))
+        if runtime.evidence:
+            runtime.anomaly_watcher = asyncio.create_task(self.watch_screen_faults(runtime, device_epoch))
         await asyncio.wait_for(runtime.ready.wait(), 20)
         if not runtime.received_pid or runtime.process.returncode is not None:
             raise ValueError("Monkey 启动失败：" + runtime.tail.decode(errors="replace")[-1000:])
+        if runtime.evidence and runtime.failure:
+            raise ValueError(runtime.failure)
+
+    async def watch_screen_faults(self, runtime, device_epoch):
+        def on_fault(kind, package):
+            ignore = runtime.config.ignore_crashes if kind == "crash" else runtime.config.ignore_timeouts
+            if ignore:
+                return False
+            runtime.failure = f"{package} 发生 {'Crash' if kind == 'crash' else 'ANR'}"
+            runtime.stop.set()
+            self.stop_input(runtime)
+            return True
+
+        try:
+            await screens.watch_anomalies(runtime.config.serial, runtime.evidence, on_fault, device_epoch)
+        except (AdbError, OSError) as exc:
+            if not runtime.stop.is_set():
+                runtime.failure = str(exc)
+                runtime.stop.set()
+                self.stop_input(runtime)
 
     async def read_output(self, runtime: Runtime) -> None:
         path = self.store.directory(runtime.id) / "monkey.log"
         try:
+            pending_line = b""
+            device_ready = not runtime.evidence
             with path.open("ab") as log:
                 size = path.stat().st_size
                 while chunk := await runtime.process.stdout.read(8192):
@@ -281,6 +335,20 @@ class MonkeyManager:
                     runtime.tail = (runtime.tail + chunk)[-8192:]
                     if re.search(rb"__ACPM_MONKEY_PID__=[1-9][0-9]*\s", runtime.tail):
                         runtime.received_pid = True
+                    if runtime.evidence:
+                        *lines, pending_line = (pending_line + chunk).split(b"\n")
+                        if len(pending_line)>32768:
+                            raise ValueError("设备端事件行超限")
+                        for raw in lines:
+                            line = raw.decode(errors="replace").rstrip("\r")
+                            if line == screens.PREFIX+"READY":
+                                device_ready = True
+                            elif line.startswith(screens.PREFIX+"ERROR\t"):
+                                runtime.failure = line.split("\t",2)[2]
+                                runtime.ready.set()
+                            else:
+                                runtime.evidence.add(line)
+                    if runtime.received_pid and device_ready:
                         runtime.ready.set()
         except Exception as exc:
             runtime.failure = f"Monkey 输出记录失败：{exc}"
@@ -370,6 +438,8 @@ class MonkeyManager:
             wait_process = asyncio.create_task(runtime.process.wait())
             stop_wait = asyncio.create_task(runtime.stop.wait())
             current = await self.start_segment(runtime, min(HOUR_SECONDS, deadline - time.monotonic()))
+            if runtime.evidence and not runtime.stop.is_set():
+                await run_adb("shell", "touch", remote_paths(runtime.id)["gate"], serial=runtime.config.serial)
             while True:
                 task = runtime.sampling_task
                 remaining = deadline - time.monotonic()
@@ -424,7 +494,7 @@ class MonkeyManager:
             except Exception as exc:
                 warnings.append(f"设备端清理未确认：{exc}；租约守护会在约{LEASE_SECONDS}秒内停止输入")
             finally:
-                tasks = [task for task in (runtime.heartbeat, runtime.timer, *waiters) if task is not None]
+                tasks = [task for task in (runtime.heartbeat, runtime.timer, runtime.anomaly_watcher, *waiters) if task is not None]
                 for pending in tasks:
                     pending.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
@@ -458,7 +528,9 @@ read pid stamp < {paths['pid']}
 case "$pid" in ''|*[!0-9]*) exit 1;; esac
 current=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null)
 if [ -n "$stamp" ] && [ "$current" = "$stamp" ]; then
-  kill "$pid" 2>/dev/null || true
+  if [ -f {paths['runner']} ]; then touch {paths['halt']}; sleep 1; fi
+  current=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null)
+  [ "$current" != "$stamp" ] || kill "$pid" 2>/dev/null || true
   sleep 1
   current=$(awk '{{print $22}}' /proc/$pid/stat 2>/dev/null)
   [ "$current" != "$stamp" ] || kill -9 "$pid" 2>/dev/null || true
@@ -541,6 +613,34 @@ async def defaults():
     return {"ratios": EventRatios().model_dump(), "blacklist": packages}
 
 
+async def display_request(request, serial, operation):
+    ui = request.app.state.ui
+    try:
+        serial = StartSessionRequest.serial_is_safe(serial)
+        lock = ui.device_lock(serial)
+        if lock.locked():
+            raise ValueError("设备正在操作，请稍后重试")
+        async with lock:
+            if ui.has_active_device(serial):
+                raise ValueError("设备正在运行任务")
+            if not any(d.serial == serial and d.state == "device" for d in await list_devices()):
+                raise ValueError("设备未连接或未授权")
+            return await operation(serial)
+    except (AdbError, ValueError, OSError, TimeoutError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.get("/displays")
+async def display_list(request: Request, serial: str = Query(min_length=1, max_length=128)):
+    return await display_request(request, serial, screens.discover)
+
+
+@router.get("/displays/{display_id}/frame")
+async def display_frame(display_id: int, request: Request, serial: str = Query(min_length=1, max_length=128),
+                        fingerprint: str | None = Query(default=None, pattern=r"^[0-9a-f]{64}$")):
+    return await display_request(request, serial, lambda device: screens.capture(device, display_id, fingerprint))
+
+
 @router.get("/runs")
 async def runs(request: Request, offset: int = Query(default=0, ge=0),
                project_id: str | None = None, unfinished: bool = False):
@@ -566,7 +666,8 @@ async def detail(run_id: str, request: Request, offset: int = Query(default=0, g
         segments = store.segments(run_id, offset)
         for segment in segments:
             segment["csv_ready"] = (store.directory(run_id) / f"hour-{segment['number']:04d}.csv").is_file()
-        return {**run, "segments": segments, "log_tail": store.tail(run_id)}
+        return {**run, "segments": segments, "log_tail": store.tail(run_id),
+                "display_summary": screens.read_summary(store.directory(run_id))}
     except (KeyError, FileNotFoundError) as exc:
         raise HTTPException(404, "Monkey 任务不存在") from exc
 
@@ -613,7 +714,7 @@ async def download(run_id: str, name: str, request: Request):
             path = store.database(run_id) if name == "combined.db" else store.directory(run_id) / name
             if name == "combined.csv" and not path.is_file() and store.database(run_id).is_file():
                 path = await asyncio.to_thread(store.export_combined_csv, run_id)
-        elif name == "summary.json":
+        elif name in {"summary.json", "display-summary.json"}:
             path = store.directory(run_id) / name
         elif re.fullmatch(r"hour-[0-9]{4,6}\.csv", name):
             path = store.directory(run_id) / name
@@ -634,7 +735,11 @@ async def summary(run_id: str, request: Request):
         path = store.directory(run_id) / "summary.json"
         if not path.exists():
             raise HTTPException(409, "汇总在任务结束归档后生成")
-        return json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8"))
+        evidence = screens.read_summary(store.directory(run_id))
+        if evidence:
+            value["display_summary"] = evidence
+        return value
     except KeyError as exc:
         raise HTTPException(404, "Monkey 任务不存在") from exc
 
@@ -658,7 +763,38 @@ async def report(
         content = await asyncio.to_thread(
             generate_report, run_id, MonkeyReportStore(database), metrics=metrics, theme=theme
         )
+        evidence = screens.read_summary(store.directory(run_id))
+        if evidence:
+            content = content.replace("</header>", "</header>"+display_report(evidence), 1)
         headers = {"Content-Disposition": f'attachment; filename="monkey-{run_id[:8]}-report.html"'} if download else None
         return HTMLResponse(content, headers=headers)
     except KeyError as exc:
         raise HTTPException(404, "Monkey 任务不存在") from exc
+
+
+def display_report(evidence):
+    def cells(values):
+        return "<tr>" + "".join(f"<td>{escape(str(value))}</td>" for value in values) + "</tr>"
+
+    rows = []
+    for screen in evidence["screens"]:
+        if not screen["selected"]:
+            rows.append(cells((screen["display_id"], screen["reason"] or "未选择", "—", "—", "—", "—")))
+        for action, counts in screen["actions"].items():
+            rows.append(cells((screen["display_id"], screens.LABELS[action],
+                               *(counts.get(name,0) for name in ("planned", "success", "skipped", "failed")))))
+    failures = []
+    for item in evidence["failures"]:
+        d = item.get("display_id")
+        cause = item.get("detail") or item.get("kind", "")
+        failures.append(cells(("未归属" if d is None else d, item.get("package",""), cause)))
+    reasons = [cells((screen["display_id"], reason, count)) for screen in evidence["screens"]
+               for reason, count in screen["reasons"].items()]
+    coverage = "每块所选屏幕均有成功注入" if evidence["selected_coverage"] else "部分所选屏幕尚无成功注入"
+    return (f'<h2>多屏 Monkey</h2><p class="meta">随机种子 {escape(str(evidence["seed"]))} · {coverage}</p>'
+            '<table><thead><tr><th>屏幕</th><th>动作</th><th>计划</th><th>成功</th><th>跳过</th><th>失败</th>'
+            '</tr></thead><tbody>'+"".join(rows)+'</tbody></table>'
+            + ('<h3>跳过与失败原因</h3><table><thead><tr><th>屏幕</th><th>原因</th><th>次数</th></tr></thead><tbody>'
+               +"".join(reasons)+'</tbody></table>' if reasons else "")
+            + ('<h3>异常</h3><table><thead><tr><th>屏幕</th><th>应用</th><th>原因</th></tr></thead><tbody>'
+               +"".join(failures)+'</tbody></table>' if failures else ""))

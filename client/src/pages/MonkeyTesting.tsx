@@ -5,6 +5,14 @@ import { useEffect, useRef, useState } from "react";
 import { Download, Play, RefreshCw, Square, Shuffle } from "lucide-react";
 import { toast } from "sonner";
 import { BACKEND_URL } from "@/lib/backend";
+import {
+  MonkeyDisplays,
+  MonkeyScreenCoverage,
+  newMultiScreen,
+  validMultiScreen,
+  type DisplaySummary,
+  type MultiScreen,
+} from "@/components/MonkeyDisplays";
 
 type Ratios = Record<string, number>;
 type Config = {
@@ -20,6 +28,7 @@ type Config = {
   fps: boolean;
   ignore_crashes: boolean;
   ignore_timeouts: boolean;
+  multi_screen?: MultiScreen | null;
 };
 type Segment = {
   number: number;
@@ -46,6 +55,7 @@ type Run = {
   cleanup_warning: string | null;
   segments?: Segment[];
   log_tail?: string;
+  display_summary?: DisplaySummary | null;
 };
 type Metric = {
   average: number | null;
@@ -220,8 +230,9 @@ export default function MonkeyTesting() {
   const valid =
     !projectError &&
     config.serial &&
-    total === 100 &&
-    (config.mode === "none" || packages.length > 0) &&
+    (config.multi_screen
+      ? validMultiScreen(config.multi_screen)
+      : total === 100 && (config.mode === "none" || packages.length > 0)) &&
     (config.duration_hours === null || config.duration_hours >= 1);
   const file = (name: string) =>
     `${BACKEND_URL}/api/monkey/runs/${selectedId}/files/${name}`;
@@ -355,7 +366,8 @@ export default function MonkeyTesting() {
       const run = await api<Run>("/monkey/runs", undefined, {
         ...config,
         project_id: projectId,
-        packages: config.mode === "none" ? [] : packages,
+        mode: config.multi_screen ? "none" : config.mode,
+        packages: config.multi_screen || config.mode === "none" ? [] : packages,
       });
       setHistoryOffset(0);
       selectRun(run.id);
@@ -473,7 +485,15 @@ export default function MonkeyTesting() {
                     id="monkey-device"
                     className={control}
                     value={config.serial}
-                    onChange={event => update("serial", event.target.value)}
+                    onChange={event =>
+                      setConfig(previous => ({
+                        ...previous,
+                        serial: event.target.value,
+                        multi_screen: previous.multi_screen
+                          ? newMultiScreen()
+                          : null,
+                      }))
+                    }
                   >
                     <option value="">请选择已授权设备</option>
                     {devices.map(device => (
@@ -509,60 +529,86 @@ export default function MonkeyTesting() {
                   </button>
                 </div>
               </div>
-              <div>
-                <label
-                  htmlFor="monkey-mode"
-                  className="mb-2 block text-xs text-slate-400"
-                >
-                  包名单模式
-                </label>
+              <label className="block text-xs text-slate-400">
+                执行方式
                 <select
-                  id="monkey-mode"
-                  className={control}
-                  value={config.mode}
+                  className={`${control} mt-2`}
+                  value={config.multi_screen ? "multi" : "native"}
                   onChange={event =>
-                    update("mode", event.target.value as Config["mode"])
+                    update(
+                      "multi_screen",
+                      event.target.value === "multi" ? newMultiScreen() : null
+                    )
                   }
                 >
-                  <option value="blacklist">黑名单 · 排除指定应用</option>
-                  <option value="whitelist">白名单 · 仅进入指定应用</option>
-                  <option value="none">无名单 · 不限制应用</option>
+                  <option value="native">原生 Monkey</option>
+                  <option value="multi">多屏随机</option>
                 </select>
-                {config.mode !== "none" && (
-                  <div className="mt-3">
-                    <label
-                      htmlFor="monkey-packages"
-                      className="mb-2 block text-xs text-slate-400"
-                    >
-                      每行一个完整包名，可粘贴 TXT 内容
-                    </label>
-                    <textarea
-                      id="monkey-packages"
-                      className={`${control} h-36 font-mono text-xs`}
-                      maxLength={256000}
-                      spellCheck={false}
-                      value={packageText}
-                      onChange={event => setPackageText(event.target.value)}
-                      placeholder="com.example.app"
-                    />
-                    <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
-                      <span>{new Set(packages).size} 个包</span>
-                      {config.mode === "blacklist" && (
-                        <button
-                          type="button"
-                          className="text-cyan-400 disabled:opacity-40"
-                          disabled={!defaultBlacklist.length}
-                          onClick={() =>
-                            setPackageText(defaultBlacklist.join("\n"))
-                          }
-                        >
-                          载入系统黑名单
-                        </button>
-                      )}
+              </label>
+              {config.multi_screen ? (
+                <MonkeyDisplays
+                  key={config.serial}
+                  serial={config.serial}
+                  value={config.multi_screen}
+                  defaultBlacklist={defaultBlacklist}
+                  onChange={value => update("multi_screen", value)}
+                />
+              ) : (
+                <div>
+                  <label
+                    htmlFor="monkey-mode"
+                    className="mb-2 block text-xs text-slate-400"
+                  >
+                    包名单模式
+                  </label>
+                  <select
+                    id="monkey-mode"
+                    className={control}
+                    value={config.mode}
+                    onChange={event =>
+                      update("mode", event.target.value as Config["mode"])
+                    }
+                  >
+                    <option value="blacklist">黑名单 · 排除指定应用</option>
+                    <option value="whitelist">白名单 · 仅进入指定应用</option>
+                    <option value="none">无名单 · 不限制应用</option>
+                  </select>
+                  {config.mode !== "none" && (
+                    <div className="mt-3">
+                      <label
+                        htmlFor="monkey-packages"
+                        className="mb-2 block text-xs text-slate-400"
+                      >
+                        每行一个完整包名，可粘贴 TXT 内容
+                      </label>
+                      <textarea
+                        id="monkey-packages"
+                        className={`${control} h-36 font-mono text-xs`}
+                        maxLength={256000}
+                        spellCheck={false}
+                        value={packageText}
+                        onChange={event => setPackageText(event.target.value)}
+                        placeholder="com.example.app"
+                      />
+                      <div className="mt-2 flex items-center justify-between text-xs text-slate-500">
+                        <span>{new Set(packages).size} 个包</span>
+                        {config.mode === "blacklist" && (
+                          <button
+                            type="button"
+                            className="text-cyan-400 disabled:opacity-40"
+                            disabled={!defaultBlacklist.length}
+                            onClick={() =>
+                              setPackageText(defaultBlacklist.join("\n"))
+                            }
+                          >
+                            载入系统黑名单
+                          </button>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
-              </div>
+                  )}
+                </div>
+              )}
               <div>
                 <label
                   htmlFor="monkey-duration"
@@ -617,51 +663,53 @@ export default function MonkeyTesting() {
                   />
                 )}
               </div>
-              <div>
-                <h3 className="mb-3 text-sm font-medium">
-                  事件占比{" "}
-                  <span
-                    className={
-                      total === 100 ? "text-emerald-400" : "text-rose-400"
-                    }
+              {!config.multi_screen && (
+                <div>
+                  <h3 className="mb-3 text-sm font-medium">
+                    事件占比{" "}
+                    <span
+                      className={
+                        total === 100 ? "text-emerald-400" : "text-rose-400"
+                      }
+                    >
+                      {total}% / 100%
+                    </span>
+                  </h3>
+                  <div className="grid grid-cols-2 gap-3">
+                    {Object.entries(labels).map(([key, label]) => (
+                      <label key={key} className="text-xs text-slate-400">
+                        {label} %
+                        <input
+                          aria-label={`${label}占比`}
+                          type="number"
+                          min={0}
+                          max={100}
+                          step={1}
+                          className={`${control} mt-1`}
+                          value={config.ratios[key]}
+                          onChange={event =>
+                            update("ratios", {
+                              ...config.ratios,
+                              [key]: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </label>
+                    ))}
+                  </div>
+                  <p className="mt-3 text-xs leading-5 text-slate-500">
+                    占比为事件生成概率，不保证实际耗时比例；滑动等动作可能产生多条底层事件。所有占比必须合计
+                    100%。
+                  </p>
+                  <button
+                    type="button"
+                    className="mt-2 text-xs text-cyan-400"
+                    onClick={() => update("ratios", initial.ratios)}
                   >
-                    {total}% / 100%
-                  </span>
-                </h3>
-                <div className="grid grid-cols-2 gap-3">
-                  {Object.entries(labels).map(([key, label]) => (
-                    <label key={key} className="text-xs text-slate-400">
-                      {label} %
-                      <input
-                        aria-label={`${label}占比`}
-                        type="number"
-                        min={0}
-                        max={100}
-                        step={1}
-                        className={`${control} mt-1`}
-                        value={config.ratios[key]}
-                        onChange={event =>
-                          update("ratios", {
-                            ...config.ratios,
-                            [key]: Number(event.target.value),
-                          })
-                        }
-                      />
-                    </label>
-                  ))}
+                    恢复默认比例
+                  </button>
                 </div>
-                <p className="mt-3 text-xs leading-5 text-slate-500">
-                  占比为事件生成概率，不保证实际耗时比例；滑动等动作可能产生多条底层事件。所有占比必须合计
-                  100%。
-                </p>
-                <button
-                  type="button"
-                  className="mt-2 text-xs text-cyan-400"
-                  onClick={() => update("ratios", initial.ratios)}
-                >
-                  恢复默认比例
-                </button>
-              </div>
+              )}
               <div className="grid grid-cols-2 gap-3">
                 <label className="text-xs text-slate-400">
                   事件间隔 ms
@@ -892,6 +940,12 @@ export default function MonkeyTesting() {
                 </div>
               )}
             </section>
+            {selected?.display_summary && (
+              <MonkeyScreenCoverage
+                summary={selected.display_summary}
+                download={file("display-summary.json")}
+              />
+            )}
             {result && (
               <section className={panel} aria-label="Monkey 全程性能汇总">
                 <h2 className="font-semibold">

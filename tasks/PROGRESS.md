@@ -12,6 +12,10 @@
 
 - [RELEASE-20261117](RELEASE-20261117.md) — VERIFYING
 
+- [MONKEY-MULTISCREEN-001](MONKEY-MULTISCREEN-001.md) — VERIFYING
+
+- [RELEASE-MONKEY-001](RELEASE-MONKEY-001.md) — VERIFYING
+
 ## 既有项目资料
 
 - [UI 自动化开发计划及已有验收记录](../UITest.md)与[页面地图设计及实施顺序](../docs/UI-NAVIGATION-DESIGN.md)保留原有需求、步骤和验证边界。

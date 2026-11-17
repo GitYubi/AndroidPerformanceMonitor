@@ -81,17 +81,21 @@ def focused_window_frame(window_dump, component):
     return next(iter(frames)) if len(frames) == 1 else None
 
 
-def default_physical_display(display_dump):
+def physical_display(display_dump, display_id):
     sections = re.split(r'^\s*Display (\d+):\s*$', display_dump, flags=re.M)
     for display, body in zip(sections[1::2], sections[2::2]):
-        if display != '0':
+        if display != str(display_id):
             continue
         match = re.search(r'^\s*mPrimaryDisplayDevice=.*?\(local:(\d+)\)', body, re.M)
         if not match:
             match = re.search(r'^\s*mBaseDisplayInfo=.*?\buniqueId "local:(\d+)"', body, re.M)
         if match:
             return match.group(1)
-    raise ValueError('无法确认默认屏幕对应的物理显示器')
+    raise ValueError('无法确认逻辑屏幕对应的物理显示器')
+
+
+def default_physical_display(display_dump):
+    return physical_display(display_dump, 0)
 
 
 def capture_default_screen(serial):
