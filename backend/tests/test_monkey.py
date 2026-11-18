@@ -8,6 +8,7 @@ import sys
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zipfile import ZipFile
 
 import pytest
 from fastapi import HTTPException
@@ -142,6 +143,22 @@ elif 'getprop' in args:
  print('30')
 elif 'date' in args:
  print('1000')
+elif len(args)>3 and args[2]=='shell' and 'acpm-snapshot' in args[3]:
+ source=args[3].rsplit(' ',1)[-1]
+ if source in ('/data/system/dropbox','/data/tombstones'):
+  print(source+'/fixture.log\0fixture-identity\0',end='')
+elif args[2:4]==['shell','-T']:
+ payload=sys.stdin.buffer.read()
+ assert payload.count(b'\0')==3
+ assert len(list(root.glob('monkey-data/*/device-logs.zip')))==1
+ print('1')
+elif len(args)>4 and args[2]=='pull' and args[3] in ('/data/anr','/data/dropbox','/data/system/dropbox','/data/tombstones'):
+ if args[3]=='/data/dropbox':
+  print('No such file or directory',file=sys.stderr);sys.exit(1)
+ destination=Path(args[4])
+ destination.mkdir()
+ if args[3]!='/data/anr':
+  (destination/'fixture.log').write_text(args[3])
 elif len(args)>4 and args[3]=='sh' and args[4].startswith('/data/local/tmp/acpm-monkey-'):
  if (root/'reject-launch').exists():
   print('Unknown option --pct-rotation',flush=True);sys.exit(1)
@@ -225,6 +242,10 @@ def test_multi_hour_run_rolls_exports_and_merges_without_reports(fake_adb):
         assert not monitor.active and monitor.reserved_by is None
         assert not ui.external_busy
         assert children and all(child.returncode is not None for child in children)
+        calls = [json.loads(line) for line in (tmp / "calls.jsonl").read_text().splitlines()]
+        assert [args[3] for args in calls if len(args) > 3 and args[2] == "pull"] == [
+            "/data/anr", "/data/dropbox", "/data/system/dropbox", "/data/tombstones"
+        ]
     asyncio.run(scenario())
 
 
@@ -260,6 +281,16 @@ def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatc
         detail = await m.detail(run["id"], request, offset=0)
         assert not detail["config"]["collect_performance"] and detail["segments"] == []
         assert "__ACPM_MONKEY_PID__" in detail["log_tail"]
+        assert detail["device_logs"]["ANR"]["status"] == "empty"
+        assert detail["device_logs"]["Crash"]["source"] == "/data/system/dropbox"
+        assert detail["device_logs"]["Tombstone"]["removed"] == 1
+        response = await m.download(run["id"], "device-logs.zip", request)
+        with ZipFile(response.path) as archive:
+            assert set(archive.namelist()) == {"Crash/fixture.log", "Tombstone/fixture.log", "manifest.json"}
+            assert archive.read("Tombstone/fixture.log") == b"/data/tombstones"
+            manifest = json.loads(archive.read("manifest.json"))
+            for kind, values in manifest.items():
+                assert all(detail["device_logs"][kind][key] == value for key, value in values.items())
         summary = await m.summary(run["id"], request)
         assert not summary["collect_performance"] and summary["sample_count"] == 0 and not summary["metrics"]
         if multiscreen:
@@ -307,6 +338,8 @@ def test_failure_paths_release_ownership_and_keep_records(fake_adb, failure):
         run = await manager.start(config(duration_hours=None))
         result = await settled(manager, run)
         assert result["state"] == "failed", result
+        if failure == "early-exit":
+            assert result["device_logs"]["Tombstone"]["status"] == "exported"
         assert not monitor.active and monitor.reserved_by is None and not ui.external_busy
         assert children and all(child.returncode is not None for child in children)
     asyncio.run(scenario())

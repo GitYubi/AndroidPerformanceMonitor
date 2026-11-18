@@ -3,6 +3,8 @@ from hashlib import sha256
 from pathlib import Path
 import shlex
 
+import pytest
+
 from app import device_logs
 from app.adb import AdbError
 
@@ -86,3 +88,94 @@ def test_log_export_continues_other_types_when_destination_is_blocked(tmp_path, 
     assert any(code == "log_export_anr" and severity == "warning" for code, severity, _ in events)
     assert result["Crash"]["exported"] == 1
     assert (folder / "Crash" / "log").read_text() == "crash fixture"
+
+
+def test_monitor_log_export_uses_direct_pull_and_keeps_successful_types(tmp_path, monkeypatch):
+    calls = []
+
+    async def adb(operation, source, destination=None, **kwargs):
+        assert kwargs["serial"] == "fixture"
+        if operation == "shell":
+            if source == "-T":
+                fields = kwargs["input_data"].decode().rstrip("\0").split("\0")
+                remote, identity, digest = fields
+                assert identity == "identity"
+                assert digest == sha256(remote.rsplit("/", 1)[0].encode()).hexdigest()
+                assert list(tmp_path.glob("DevicesLogs/*/*/fixture.log"))
+                return "1\n"
+            remote = shlex.split(source)[-1]
+            if remote == "/data/tombstones":
+                return f"{remote}/fixture.log\0identity\0"
+            raise AdbError("unavailable")
+        assert operation == "pull"
+        calls.append(source)
+        if source in {"/data/anr", "/data/dropbox"}:
+            raise AdbError("unavailable")
+        local = Path(destination)
+        local.mkdir()
+        (local / "fixture.log").write_text(source)
+        return ""
+
+    monkeypatch.setattr(device_logs, "run_adb", adb)
+    config = device_logs.DeviceLogConfig(
+        anr="/data/anr", crash="/data/dropbox", tombstone="/data/tombstones")
+    result = asyncio.run(device_logs.export_and_clean_device_logs(
+        "fixture", config, tmp_path, lambda *_: None,
+    ))
+    assert sorted(calls) == sorted(("/data/anr", "/data/dropbox", "/data/system/dropbox", "/data/tombstones"))
+    assert calls.index("/data/dropbox") < calls.index("/data/system/dropbox")
+    assert result["ANR"]["status"] == "error"
+    for kind in ("Crash", "Tombstone"):
+        log = result[kind]
+        assert log["status"] == "exported"
+        assert log["removed"] == (1 if kind == "Tombstone" else 0)
+        assert log["cleanup_pending"] == (0 if kind == "Tombstone" else 1)
+        assert (Path(log["target"]) / "fixture.log").read_text() == log["source"]
+
+
+@pytest.mark.parametrize("find_available", [False, True])
+def test_custom_log_path_falls_back_to_read_only_directory_pull(tmp_path, monkeypatch, find_available):
+    source = "/data/local/tmp/custom-logs"
+
+    async def adb(operation, *args, **kwargs):
+        if operation == "shell":
+            if args[0].startswith("find ") and find_available:
+                return f"{source}/trace.log\0"
+            if args[0].startswith(("find ", "stat ")):
+                raise AdbError("shell cannot enumerate or stat files")
+            pytest.fail(f"unexpected shell operation: {args}")
+        if args[0] != source:
+            raise AdbError("individual pull failed")
+        local = Path(args[1])
+        local.mkdir()
+        (local / "trace.log").write_text("fixture")
+        return ""
+
+    monkeypatch.setattr(device_logs, "run_adb", adb)
+    result = asyncio.run(device_logs.export_and_clean_device_logs(
+        "fixture", device_logs.DeviceLogConfig(anr=source), tmp_path, lambda *_: None,
+    ))["ANR"]
+    assert result["status"] == "exported" and result["removed"] == 0
+    assert (Path(result["target"]) / "trace.log").read_text() == "fixture"
+
+
+def test_archive_failure_does_not_delete_source_logs(tmp_path, monkeypatch):
+    async def adb(operation, *args, **kwargs):
+        assert kwargs.get("input_data") is None
+        if operation == "shell":
+            source = shlex.split(args[0])[-1]
+            return f"{source}/trace.log\0identity\0"
+        assert operation == "pull"
+        local = Path(args[1])
+        local.mkdir()
+        (local / "trace.log").write_text("fixture")
+        return ""
+
+    def archive(*args):
+        raise OSError("fixture archive write failed")
+
+    monkeypatch.setattr(device_logs, "run_adb", adb)
+    monkeypatch.setattr(device_logs, "_write_log_zip", archive)
+    with pytest.raises(OSError, match="fixture archive write failed"):
+        asyncio.run(device_logs.export_device_logs_zip("fixture", tmp_path / "device-logs.zip"))
+    assert not (tmp_path / "device-logs.zip").exists()

@@ -259,6 +259,25 @@ public final class Runner {
         boolean emit(Screen screen,int uid,long down,int action,int[][] points,boolean downPressure) throws Exception;
     }
 
+    static final class TargetMismatch extends Exception {
+        TargetMismatch(Throwable cause) { super(cause.getMessage(),cause); }
+    }
+
+    static boolean injectTarget(Method inject,Object input,Object event,int uid) throws Exception {
+        try {
+            return (boolean)inject.invoke(input,event,2,uid);
+        } catch(InvocationTargetException wrapped) {
+            Throwable cause=wrapped.getCause();
+            if(cause instanceof IllegalArgumentException) {
+                String message=cause.getMessage();
+                if(message!=null && message.startsWith("Targeted input event injection from pid ")
+                    && message.endsWith(" was not directed at a window owned by uid "+uid+"."))
+                    throw new TargetMismatch(cause);
+            }
+            throw wrapped;
+        }
+    }
+
     static final class Android implements GestureInput {
         final Object displays, input;
         final Method ids, info, inject, uptime, obtain, setDisplay, recycle;
@@ -344,7 +363,7 @@ public final class Runner {
             Object event=obtain.invoke(null,down,now(),action,points.length,p,c,0,0,1f,1f,0,0,0x1002,0);
             try {
                 setDisplay.invoke(event,screen.id);
-                return (boolean)inject.invoke(input,event,2,uid);
+                return injectTarget(inject,input,event,uid);
             } finally { recycle.invoke(event); }
         }
     }
@@ -416,9 +435,14 @@ public final class Runner {
 
     static void performGesture(GestureInput input,Screen screen,Window window,long sequence,
                                int action,int[][][] points,Path halt) throws Exception {
-        boolean accepted=injectGesture(input,screen,window,action,points,halt);
-        send("RESULT",sequence,screen.id,ACTIONS[action],accepted?"success":"skipped",window.pkg,
-            accepted?Arrays.deepToString(points):"定向输入被系统拒绝");
+        try {
+            boolean accepted=injectGesture(input,screen,window,action,points,halt);
+            send("RESULT",sequence,screen.id,ACTIONS[action],accepted?"success":"skipped",window.pkg,
+                accepted?Arrays.deepToString(points):"定向输入被系统拒绝");
+        } catch(TargetMismatch mismatch) {
+            send("RESULT",sequence,screen.id,ACTIONS[action],"skipped",window.pkg,
+                "触摸窗口归属不匹配（目标 UID "+window.uid+"）");
+        }
     }
 
     static boolean injectGesture(GestureInput input,Screen screen,Window window,
@@ -453,7 +477,10 @@ public final class Runner {
             pressed=false;
             return true;
         } finally {
-            if(pressed) input.emit(screen,window.uid,down,3,active,false);
+            if(pressed) {
+                try { input.emit(screen,window.uid,down,3,active,false); }
+                catch(TargetMismatch noLongerTargeted) { }
+            }
         }
     }
 

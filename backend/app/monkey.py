@@ -20,6 +20,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .adb import AdbError, list_devices, run_adb
+from .device_logs import export_device_logs_zip
 from .models import MetricsConfig, StartSessionRequest
 from .monkey_records import MonkeyRecords, MonkeyReportStore, connect
 from . import monkey_multiscreen as screens
@@ -492,7 +493,7 @@ class MonkeyManager:
             try:
                 run = self.store.get(runtime.id)
                 run.update(state="stopping", message=message or (
-                    "正在停止 Monkey 并归档记录" if runtime.config.collect_performance else "正在停止 Monkey"))
+                    "正在停止 Monkey 并归档记录" if runtime.config.collect_performance else "正在停止 Monkey 并导出设备日志"))
                 self.store.put(run)
             except Exception as exc:
                 warnings.append(f"停止状态写入失败：{exc}")
@@ -506,24 +507,32 @@ class MonkeyManager:
                 for pending in tasks:
                     pending.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+            ended = int(time.time() * 1000)
             try:
                 if current:
                     await self.monitor.stop(current, owner=runtime.id)
                 # Crash-safe pending pointer also covers an interrupted hourly export.
                 await self._archive_remaining(self.store.get(runtime.id))
-                ended = int(time.time() * 1000)
                 await asyncio.to_thread(self.store.summarize, runtime.id, state, ended)
             except Exception as exc:
                 state, message = "failed", f"归档未完成，原始性能记录仍保留：{exc}"
-            finally:
-                run = self.store.get(runtime.id)
-                if warnings:
-                    run["cleanup_warning"] = "；".join(warnings)
-                completion = "并合并记录" if runtime.config.collect_performance else ""
-                run.update(state=state, ended_at_ms=int(time.time() * 1000),
-                           message=message or {"completed": "已完成" + completion, "stopped": "已停止" + completion,
-                                               "interrupted": "已中断并保留记录"}.get(state, "执行失败"))
-                self.store.put(run)
+            logs = None
+            if runtime.received_pid:
+                try:
+                    logs = await export_device_logs_zip(
+                        runtime.config.serial, self.store.directory(runtime.id) / "device-logs.zip")
+                except Exception as exc:
+                    warnings.append(f"设备日志导出异常：{exc}")
+            run = self.store.get(runtime.id)
+            if warnings:
+                run["cleanup_warning"] = "；".join(warnings)
+            if logs is not None:
+                run["device_logs"] = logs
+            completion = "并合并记录" if runtime.config.collect_performance else ""
+            run.update(state=state, ended_at_ms=ended,
+                       message=message or {"completed": "已完成" + completion, "stopped": "已停止" + completion,
+                                           "interrupted": "已中断并保留记录"}.get(state, "执行失败"))
+            self.store.put(run)
         finally:
             if self.monitor.reserved_by == runtime.id:
                 self.monitor.reserved_by = None
@@ -725,6 +734,10 @@ async def download(run_id: str, name: str, request: Request):
             path = store.database(run_id) if name == "combined.db" else store.directory(run_id) / name
             if name == "combined.csv" and not path.is_file() and store.database(run_id).is_file():
                 path = await asyncio.to_thread(store.export_combined_csv, run_id)
+        elif name == "device-logs.zip":
+            if run["state"] not in TERMINAL:
+                raise HTTPException(409, "任务结束后可下载车机日志")
+            path = store.directory(run_id) / name
         elif name in {"summary.json", "display-summary.json"}:
             path = store.directory(run_id) / name
         elif re.fullmatch(r"hour-[0-9]{4,6}\.csv", name):

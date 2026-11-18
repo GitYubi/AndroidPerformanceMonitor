@@ -3,13 +3,15 @@
 - 导出位置：默认项目根目录/DevicesLogs/<结束时间>/ANR|Crash|Tombstone/
   结束时间格式 yyyy_MM_DD-hh_mm_ss；可通过 log_export_root 覆盖根目录。
 - 只处理用户配置了路径的类型；路径为空则不动作（前端提示）。
-- 仅清理已导出且仍匹配的源文件，保留目录。
+- 仅清理已保存且仍匹配的源文件；无法核验时保留原件。
 - 路径不可读/不存在/无文件均只写会话事件，不中断其他类型的导出。
 """
 
 from __future__ import annotations
 
+import asyncio
 from hashlib import file_digest
+import json
 import os
 import re
 import shlex
@@ -17,13 +19,22 @@ from tempfile import TemporaryDirectory
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
+from zipfile import ZipFile
 
 from .adb import AdbError, run_adb
 
 LOG_KIND_ANR = "ANR"
 LOG_KIND_CRASH = "Crash"
 LOG_KIND_TOMBSTONE = "Tombstone"
+DEFAULT_LOG_DIRECTORIES = (
+    (LOG_KIND_ANR, "/data/anr"),
+    (LOG_KIND_CRASH, "/data/dropbox"),
+    (LOG_KIND_TOMBSTONE, "/data/tombstones"),
+)
+DROPBOX_ALTERNATE = "/data/system/dropbox"
+STANDARD_DIRECTORIES = {path for _, path in DEFAULT_LOG_DIRECTORIES} | {DROPBOX_ALTERNATE}
+DIRECT_PULL_TIMEOUT_SECONDS = 45
 
 # 设备端路径只允许常规路径字符，避免 adb shell 拼接出注入。
 _DEVICE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -33,6 +44,26 @@ _REMOVE_MATCHING_FILE = f"""
 digest=$(sha256sum < "$1") && [ "${{digest%% *}}" = "$3" ] &&
 [ "$(stat -c {_FILE_IDENTITY} "$1")" = "$2" ] &&
 [ ! -L "$1" ] && rm -f -- "$1"
+"""
+_SNAPSHOT_FILES = f"""
+find "$1" -type f -exec sh -c '
+    for file do
+        identity=$(stat -c {_FILE_IDENTITY} "$file") || continue
+        printf "%s\\000%s\\000" "$file" "$identity"
+    done
+' acpm-stat {{}} +
+"""
+_REMOVE_SNAPSHOT_FILES = """
+remove_verified() {
+""" + _REMOVE_MATCHING_FILE + """
+}
+removed=0
+while IFS= read -r -d '' file && IFS= read -r -d '' identity && IFS= read -r -d '' digest; do
+    if [ "$(realpath "$file")" = "$file" ] && remove_verified "$file" "$identity" "$digest"; then
+        removed=$((removed + 1))
+    fi
+done
+printf "%s\\n" "$removed"
 """
 
 # 事件回调：(code, severity, message)
@@ -64,6 +95,173 @@ async def _list_files(serial: str, device_path: str) -> list[str]:
     return [path.rsplit("/", 1)[-1] for path in output.split("\0") if path]
 
 
+def _local_log_files(directory: Path) -> Iterator[Path]:
+    return (path for path in directory.rglob("*") if not path.is_symlink() and path.is_file())
+
+
+async def pull_device_log_directory(serial: str, source: str, target_dir: Path) -> dict[str, object]:
+    """Copy one log directory via ADB sync without running a device shell or deleting source logs."""
+    if not _DEVICE_PATH_RE.fullmatch(source):
+        return {"status": "invalid_path", "detail": "设备路径包含非法字符"}
+    try:
+        if target_dir.exists() and (not target_dir.is_dir() or any(target_dir.iterdir())):
+            raise OSError(f"本地导出目录已存在且不可替换：{target_dir}")
+        target_dir.parent.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".log-pull-", dir=target_dir.parent) as temporary:
+            local = Path(temporary) / "logs"
+            await run_adb("pull", source, str(local), serial=serial, timeout_seconds=DIRECT_PULL_TIMEOUT_SECONDS)
+            if not local.is_dir():
+                raise OSError("设备路径不是日志目录")
+            count = sum(1 for _ in _local_log_files(local))
+            if count == 0:
+                return {"status": "empty"}
+            if target_dir.is_dir():
+                target_dir.rmdir()
+            local.replace(target_dir)
+        return {"status": "exported", "exported": count, "failed": 0,
+                "target": str(target_dir), "cleaned": False, "removed": 0}
+    except (AdbError, OSError) as exc:
+        return {"status": "error", "detail": str(exc)}
+
+
+async def _snapshot_files(serial: str, source: str) -> dict[str, str]:
+    command = shlex.join(["sh", "-c", _SNAPSHOT_FILES, "acpm-snapshot", source])
+    try:
+        output = await run_adb("shell", command, serial=serial, timeout_seconds=8)
+    except AdbError:
+        return {}
+    entries = output.split("\0")
+    return {file: identity for file, identity in zip(entries[::2], entries[1::2])
+            if file.startswith(source + "/") and "\ufffd" not in file and identity}
+
+
+async def _pull_log_kind(
+    serial: str, kind: str, source: str, target_dir: Path, *, preserve: bool,
+) -> tuple[dict[str, object], dict[str, str]]:
+    async def pull(directory: str):
+        snapshot = {} if preserve else await _snapshot_files(serial, directory)
+        result = await pull_device_log_directory(serial, directory, target_dir)
+        return result, snapshot
+
+    active_source = source
+    try:
+        async with asyncio.timeout(DIRECT_PULL_TIMEOUT_SECONDS):
+            result, snapshot = await pull(source)
+            if kind == LOG_KIND_CRASH and source == "/data/dropbox" and result["status"] == "error":
+                active_source = DROPBOX_ALTERNATE
+                alternate, alternate_snapshot = await pull(active_source)
+                if alternate["status"] in {"exported", "empty"}:
+                    return {**alternate, "source": active_source}, alternate_snapshot
+                result["detail"] = f"{result.get('detail', '')}；备选路径 {active_source}：{alternate.get('detail', '')}"
+    except TimeoutError:
+        return {"source": active_source, "status": "error", "detail": "拉取设备日志超时"}, {}
+    return {**result, "source": source}, snapshot
+
+
+def _cleanup_payload(entries, source: str, snapshot: dict[str, str]) -> bytes:
+    payload = bytearray()
+    for name, open_copy in entries:
+        remote = f"{source}/{name}"
+        if remote in snapshot:
+            with open_copy() as copy:
+                digest = file_digest(copy, "sha256").hexdigest()
+            payload.extend(f"{remote}\0{snapshot[remote]}\0{digest}\0".encode())
+    return bytes(payload)
+
+
+def _directory_cleanup_payload(directory: Path, source: str, snapshot: dict[str, str]) -> bytes:
+    return _cleanup_payload(
+        ((path.relative_to(directory).as_posix(), lambda path=path: path.open("rb"))
+         for path in _local_log_files(directory)),
+        source, snapshot,
+    )
+
+
+async def _remove_exported_files(serial: str, result: dict[str, object], payload: bytes) -> None:
+    removed = 0
+    if payload:
+        try:
+            output = await run_adb("shell", "-T", _REMOVE_SNAPSHOT_FILES, serial=serial, timeout_seconds=12,
+                                   input_data=payload)
+            reported = int(output.strip())
+            if 0 <= reported <= payload.count(b"\0") // 3:
+                removed = reported
+        except (AdbError, ValueError):
+            pass
+    pending = int(result["exported"]) - removed
+    result.update(removed=removed, cleanup_pending=pending, cleaned=pending == 0)
+
+
+async def _export_directory(
+    serial: str, kind: str, source: str, target_dir: Path, on_event: EventSink,
+    *, preserve: bool = True,
+) -> dict[str, object]:
+    result, snapshot = await _pull_log_kind(serial, kind, source, target_dir, preserve=preserve)
+    code = f"log_export_{kind.lower()}"
+    if result["status"] == "exported":
+        cleanup = "车机原始日志已保留。"
+        if not preserve:
+            try:
+                payload = await asyncio.to_thread(_directory_cleanup_payload, target_dir, str(result["source"]), snapshot)
+            except OSError:
+                payload = b""
+            await _remove_exported_files(serial, result, payload)
+            cleanup = f"已清理 {result['removed']} 个源文件。"
+            if result["cleanup_pending"]:
+                on_event(code, "warning", f"{kind}：{result['cleanup_pending']} 个源文件未确认清理。")
+        on_event(code, "info",
+                 f"{kind}：已从 {result['source']} 拉取 {result['exported']} 个文件到 {target_dir}，{cleanup}")
+    elif result["status"] == "empty":
+        on_event(code, "info", f"{kind}：{result['source']} 下无日志文件。")
+    else:
+        on_event(code, "warning", f"{kind}：无法拉取 {source}（{result.get('detail', '')}）。")
+    return result
+
+
+def _write_log_zip(staging: Path, destination: Path, results: dict[str, dict[str, object]]) -> None:
+    temporary_zip = staging / destination.name
+    with ZipFile(temporary_zip, "w") as archive:
+        for kind, result in results.items():
+            if result["status"] == "exported":
+                for path in _local_log_files(staging / kind):
+                    archive.write(path, path.relative_to(staging).as_posix())
+        archive.writestr("manifest.json", json.dumps(results, ensure_ascii=False, indent=2))
+    temporary_zip.replace(destination)
+
+
+def _zip_cleanup_payloads(destination: Path, results, snapshots) -> dict[str, bytes]:
+    with ZipFile(destination) as archive:
+        filenames = archive.namelist()
+        return {
+            kind: _cleanup_payload(
+                ((name.split("/", 1)[1], lambda name=name: archive.open(name))
+                 for name in filenames if name.startswith(f"{kind}/")),
+                str(results[kind]["source"]), snapshot,
+            ) for kind, snapshot in snapshots.items()
+        }
+
+
+async def export_device_logs_zip(
+    serial: str, destination: Path, *, preserve: bool = False,
+) -> dict[str, dict[str, object]]:
+    with TemporaryDirectory(prefix=".device-logs-", dir=destination.parent) as temporary:
+        staging = Path(temporary)
+        results = {}
+        snapshots = {}
+        for kind, source in DEFAULT_LOG_DIRECTORIES:
+            pulled, snapshot = await _pull_log_kind(serial, kind, source, staging / kind, preserve=preserve)
+            results[kind] = {key: pulled[key] for key in ("source", "status", "exported", "detail") if key in pulled}
+            if not preserve and pulled["status"] == "exported":
+                snapshots[kind] = snapshot
+        if any(result["status"] == "exported" for result in results.values()):
+            await asyncio.to_thread(_write_log_zip, staging, destination, results)
+            if snapshots:
+                payloads = await asyncio.to_thread(_zip_cleanup_payloads, destination, results, snapshots)
+                for kind, payload in payloads.items():
+                    await _remove_exported_files(serial, results[kind], payload)
+        return results
+
+
 async def export_and_clean_device_logs(
     serial: str,
     config: DeviceLogConfig,
@@ -79,8 +277,16 @@ async def export_and_clean_device_logs(
 
     export_root = Path(config.export_root).expanduser() if config.export_root else project_root / "DevicesLogs"
     folder_name = time.strftime("%Y_%m_%d-%H_%M_%S")
+    standard = [(kind, path.rstrip("/")) for kind, path in pairs if path.rstrip("/") in STANDARD_DIRECTORIES]
+    direct = await asyncio.gather(*(
+        _export_directory(serial, kind, path, export_root / folder_name / kind, on_event, preserve=preserve)
+        for kind, path in standard
+    ))
+    results.update((kind, result) for (kind, _), result in zip(standard, direct))
 
     for kind, device_path in pairs:
+        if kind in results:
+            continue
         code = f"log_export_{kind.lower()}"
         if not _DEVICE_PATH_RE.fullmatch(device_path):
             on_event(code, "warning", f"{kind} 设备路径包含非法字符，已跳过导出：{device_path}")
@@ -88,18 +294,16 @@ async def export_and_clean_device_logs(
             continue
         if not device_path.startswith("/"):
             device_path = f"./{device_path}"
+        target_dir = export_root / folder_name / kind
         try:
             files = await _list_files(serial, device_path)
-        except AdbError as exc:
-            on_event(code, "warning", f"{kind}：无法读取 {device_path}（{exc}），已跳过导出。")
-            results[kind] = {"status": "error", "detail": str(exc)}
+        except AdbError:
+            results[kind] = await _export_directory(serial, kind, device_path, target_dir, on_event)
             continue
         if not files:
-            on_event(code, "info", f"{kind}：{device_path} 下无日志文件，跳过导出。")
-            results[kind] = {"status": "empty"}
+            results[kind] = await _export_directory(serial, kind, device_path, target_dir, on_event)
             continue
 
-        target_dir = export_root / folder_name / kind
         try:
             target_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -160,6 +364,8 @@ async def export_and_clean_device_logs(
                 "cleaned": removed == len(files), "removed": removed,
             }
         else:
-            on_event(code, "warning", f"{kind}：{device_path} 下 {len(files)} 个文件全部拉取失败：{'；'.join(failed_files[:3])}")
-            results[kind] = {"status": "pull_failed", "files": len(files)}
+            fallback = await _export_directory(serial, kind, device_path, target_dir, on_event)
+            if fallback["status"] != "exported":
+                on_event(code, "warning", f"{kind}：{device_path} 下 {len(files)} 个文件全部拉取失败：{'；'.join(failed_files[:3])}")
+            results[kind] = fallback
     return results

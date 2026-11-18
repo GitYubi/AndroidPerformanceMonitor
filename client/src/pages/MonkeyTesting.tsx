@@ -40,6 +40,14 @@ type Segment = {
   state: string;
   csv_ready?: boolean;
 };
+type DeviceLogExport = {
+  source: string;
+  status: "exported" | "empty" | "error" | "invalid_path";
+  exported?: number;
+  detail?: string;
+  removed?: number;
+  cleanup_pending?: number;
+};
 type Run = {
   id: string;
   serial: string;
@@ -57,6 +65,7 @@ type Run = {
   segments?: Segment[];
   log_tail?: string;
   display_summary?: DisplaySummary | null;
+  device_logs?: Record<string, DeviceLogExport>;
 };
 type Metric = {
   average: number | null;
@@ -408,8 +417,8 @@ export default function MonkeyTesting() {
       setSelected(current => (current ? { ...current, ...run } : run));
       toast.success(
         selected.config?.collect_performance === false
-          ? "正在停止 Monkey"
-          : "正在停止输入、归档末段并合并记录"
+          ? "正在停止 Monkey 并导出设备日志"
+          : "正在停止输入、合并性能记录并导出设备日志"
       );
     } catch (exc) {
       toast.error((exc as Error).message);
@@ -990,6 +999,40 @@ export default function MonkeyTesting() {
                 </div>
               )}
             </section>
+            {selected?.device_logs && (
+              <section className={panel} aria-label="车机日志">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h2 className="font-semibold">车机日志</h2>
+                  {Object.values(selected.device_logs).some(
+                    log => log.status === "exported"
+                  ) && (
+                    <a href={file("device-logs.zip")} className={button}>
+                      <Download size={14} />
+                      下载车机日志 ZIP
+                    </a>
+                  )}
+                </div>
+                <dl className="mt-3 space-y-2 break-words text-sm text-slate-400">
+                  {Object.entries(selected.device_logs).map(([kind, log]) => (
+                    <div key={kind}>
+                      <dt className="inline text-slate-200">{kind}</dt>
+                      <dd className="ml-2 inline">
+                        {log.source} ·{" "}
+                        {log.status === "exported"
+                          ? `已导出 ${log.exported} 个文件`
+                          : log.status === "empty"
+                            ? "目录为空"
+                            : `导出失败：${log.detail || "未知错误"}`}
+                        {log.removed !== undefined &&
+                          ` · 已清理车机源文件 ${log.removed} 个`}
+                        {!!log.cleanup_pending &&
+                          `，${log.cleanup_pending} 个未确认清理`}
+                      </dd>
+                    </div>
+                  ))}
+                </dl>
+              </section>
+            )}
             {selected?.display_summary && (
               <MonkeyScreenCoverage
                 summary={selected.display_summary}

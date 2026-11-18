@@ -249,11 +249,10 @@ def test_log_export_preserves_device_files_when_ui_overlaps(monkeypatch, tmp_pat
 
     async def adb(*args, **kwargs):
         commands.append(args)
-        if args[0] == 'shell':
-            assert args[1].startswith('find ')
-            return '/data/anr/trace.txt\0'
-        assert args[0] == 'pull'
-        Path(args[2]).write_text('fixture trace')
+        assert args[:2] == ('pull', '/data/anr')
+        destination = Path(args[2])
+        destination.mkdir()
+        (destination / 'trace.txt').write_text('fixture trace')
         return ''
 
     monkeypatch.setattr('app.device_logs.run_adb', adb)

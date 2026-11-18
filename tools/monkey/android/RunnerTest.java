@@ -2,6 +2,8 @@ package acpm.monkey;
 
 import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
@@ -74,20 +76,33 @@ public final class RunnerTest {
 
     static void checkInjectionRejection() throws Exception {
         Runner.Screen screen=new Runner.Screen(2,0,100,100,0,2,"secondary","test.app/.Main");
-        Runner.Window window=new Runner.Window(2,10300,"main","test.app",
+        Runner.Window window=new Runner.Window(2,1000,"main","test.app",
             Collections.singletonList(new Runner.Box(0,0,100,100)),screen.activity);
         int[][][] tap={{{40,50}}};
         int[][][] swipe={{{40,50}},{{60,70}}};
         List<Integer> events=new ArrayList<>();
         Set<Integer> rejected=new HashSet<>();
+        Set<Integer> mismatched=new HashSet<>();
+        class FakeInputService {
+            public boolean inject(int action,int mode,int uid) {
+                check(mode==2 && uid==window.uid);
+                if(mismatched.contains(action))
+                    throw new IllegalArgumentException("Targeted input event injection from pid 26374"
+                        +" was not directed at a window owned by uid "+uid+".");
+                if(action==99) throw new IllegalArgumentException("mode is invalid");
+                return !rejected.contains(action);
+            }
+        }
+        FakeInputService service=new FakeInputService();
+        Method inject=FakeInputService.class.getMethod("inject",int.class,int.class,int.class);
         Runner.GestureInput input=new Runner.GestureInput() {
             public long now() { return 100L; }
             public void verifyGeometry(Runner.Screen target) { check(target==screen); }
-            public boolean emit(Runner.Screen target,int uid,long down,int action,int[][] points,boolean downPressure) {
+            public boolean emit(Runner.Screen target,int uid,long down,int action,int[][] points,boolean downPressure) throws Exception {
                 check(target==screen && uid==window.uid && down==100L);
                 if(action==3) check(!downPressure && Arrays.deepEquals(points,tap[0]));
                 events.add(action);
-                return !rejected.contains(action);
+                return Runner.injectTarget(inject,service,action,uid);
             }
         };
         Path directory=Files.createTempDirectory("acpm-rejected-input");
@@ -114,18 +129,39 @@ public final class RunnerTest {
 
             events.clear();
             rejected.clear();
-            Runner.performGesture(input,screen,window,86,0,tap,halt);
+            mismatched.add(0);
+            Runner.performGesture(input,screen,window,86,1,tap,halt);
+            check(events.equals(Collections.singletonList(0)));
+
+            events.clear();
+            mismatched.clear();
+            mismatched.addAll(Arrays.asList(1,3));
+            Runner.performGesture(input,screen,window,87,1,tap,halt);
+            check(events.equals(Arrays.asList(0,1,3)));
+
+            events.clear();
+            mismatched.clear();
+            Runner.performGesture(input,screen,window,88,0,tap,halt);
             check(events.equals(Arrays.asList(0,1)));
+
+            try {
+                Runner.injectTarget(inject,service,99,window.uid);
+                throw new AssertionError("unrelated injection exception was ignored");
+            } catch(InvocationTargetException expected) {
+                check(expected.getCause().getMessage().equals("mode is invalid"));
+            }
         } finally {
             System.setOut(stdout);
             Files.delete(directory);
         }
         String[] results=bytes.toString("UTF-8").split("\\R");
-        check(results.length==4);
+        check(results.length==6);
         check(results[0].equals("@ACPM\tRESULT\t83\t2\tlong_press\tskipped\ttest.app\t定向输入被系统拒绝"));
         check(results[1].equals("@ACPM\tRESULT\t84\t2\tlong_press\tskipped\ttest.app\t定向输入被系统拒绝"));
         check(results[2].equals("@ACPM\tRESULT\t85\t2\tswipe\tskipped\ttest.app\t定向输入被系统拒绝"));
-        check(results[3].equals("@ACPM\tRESULT\t86\t2\ttap\tsuccess\ttest.app\t[[[40, 50]]]"));
+        check(results[3].equals("@ACPM\tRESULT\t86\t2\tlong_press\tskipped\ttest.app\t触摸窗口归属不匹配（目标 UID 1000）"));
+        check(results[4].equals("@ACPM\tRESULT\t87\t2\tlong_press\tskipped\ttest.app\t触摸窗口归属不匹配（目标 UID 1000）"));
+        check(results[5].equals("@ACPM\tRESULT\t88\t2\ttap\tsuccess\ttest.app\t[[[40, 50]]]"));
     }
 
     static void checkAppSwitch() throws Exception {
