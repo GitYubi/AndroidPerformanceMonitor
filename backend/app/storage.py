@@ -145,6 +145,34 @@ def _connect(database_path: Path, *, check_same_thread: bool = True) -> sqlite3.
         raise
 
 
+def query_process_rss_growth(connection: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+    """Rank positive changes between successive recorded RSS snapshots."""
+    rows = connection.execute("""
+        WITH snapshots AS (
+            SELECT sample_id, process_name, pid, MAX(rss_kb) AS rss_kb,
+                   DENSE_RANK() OVER (ORDER BY sample_id) AS snapshot
+            FROM process_sample
+            WHERE pid IS NOT NULL AND rss_kb > 0
+            GROUP BY sample_id, process_name, pid
+        ), previous AS (
+            SELECT *,
+                   LAG(snapshot) OVER process_order AS prior_snapshot,
+                   LAG(rss_kb) OVER process_order AS prior_rss
+            FROM snapshots
+            WINDOW process_order AS (PARTITION BY process_name, pid ORDER BY snapshot)
+        ), changes AS (
+            SELECT process_name, pid,
+                   rss_kb - CASE WHEN prior_snapshot = snapshot-1 THEN prior_rss ELSE 0 END AS growth
+            FROM previous WHERE snapshot > 1
+        )
+        SELECT process_name, pid, ROUND(AVG(growth), 2) AS average, MAX(growth) AS peak,
+               COUNT(*) AS samples
+        FROM changes WHERE growth > 0 GROUP BY process_name, pid
+        ORDER BY peak DESC, process_name, pid LIMIT ?
+    """, (limit,))
+    return [dict(row) for row in rows]
+
+
 def _read_session(connection: sqlite3.Connection) -> dict[str, Any] | None:
     row = connection.execute("SELECT * FROM session WHERE id = 1").fetchone()
     if row is None:
@@ -380,13 +408,16 @@ class SessionStore:
 
     def get_processes(self, session_id: str, metric: str, limit: int = 10) -> list[dict[str, Any]]:
         column = {"cpu": "cpu_pct", "pss": "pss_kb", "rss": "rss_kb"}.get(metric)
-        if column is None:
-            raise ValueError("metric 必须为 cpu、pss 或 rss")
+        if column is None and metric != "rss_growth":
+            raise ValueError("metric 必须为 cpu、pss、rss 或 rss_growth")
         path = self.database_path(session_id)
         if not path.exists():
             return []
+        limit = max(1, min(limit, 100))
         connection = _connect(path)
         try:
+            if metric == "rss_growth":
+                return query_process_rss_growth(connection, limit)
             rows = connection.execute(
                 f"""
                 SELECT process_name, MAX(pid) AS pid,
@@ -399,7 +430,7 @@ class SessionStore:
                 ORDER BY average DESC
                 LIMIT ?
                 """,
-                (max(1, min(limit, 100)),),
+                (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
         finally:

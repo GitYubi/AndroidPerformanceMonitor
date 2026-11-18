@@ -6,6 +6,8 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi import HTTPException
@@ -138,10 +140,16 @@ elif 'list' in args and 'packages' in args:
  print('package:com.example')
 elif 'getprop' in args:
  print('30')
+elif 'date' in args:
+ print('1000')
 elif len(args)>4 and args[3]=='sh' and args[4].startswith('/data/local/tmp/acpm-monkey-'):
  if (root/'reject-launch').exists():
   print('Unknown option --pct-rotation',flush=True);sys.exit(1)
  print('__ACPM_MONKEY_PID__=1234',flush=True)
+ if (root/'multiscreen').exists():
+  print('@ACPM\tREADY',flush=True)
+  print('@ACPM\tPLAN\t1\t2\ttap',flush=True)
+  print('@ACPM\tRESULT\t1\t2\ttap\tsuccess\tcom.example\t[[[40, 50]]]',flush=True)
  if (root/'flood').exists():
   for _ in range(30): print('x'*8191,flush=True)
  if (root/'early-exit').exists(): sys.exit(0)
@@ -217,6 +225,50 @@ def test_multi_hour_run_rolls_exports_and_merges_without_reports(fake_adb):
         assert not monitor.active and monitor.reserved_by is None
         assert not ui.external_busy
         assert children and all(child.returncode is not None for child in children)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("multiscreen,duration_hours", [(False, None), (True, 1)])
+def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatch, multiscreen, duration_hours):
+    tmp, children = fake_adb
+    settings = {}
+    if multiscreen:
+        (tmp / "multiscreen").touch()
+        settings["multi_screen"] = m.screens.MultiScreen(targets=[
+            {"display_id": 2, "fingerprint": "b" * 64, "packages": ["com.example"]}
+        ])
+        screen = {"display_id": 2, "input_supported": True, "reason": ""}
+        monkeypatch.setattr(m.screens, "prepare", AsyncMock(return_value=("plan", [screen])))
+        monkeypatch.setattr(m.screens, "watch_anomalies", AsyncMock())
+
+    async def scenario():
+        manager, monitor, ui = managers(tmp)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(monkey=manager)))
+        run = await manager.start(config(collect_performance=False, fps=True, duration_hours=duration_hours, **settings))
+        if duration_hours is None:
+            done_at = time.monotonic() + 5
+            while manager.store.get(run["id"])["state"] == "starting" and time.monotonic() < done_at:
+                await asyncio.sleep(0.01)
+            assert manager.store.get(run["id"])["state"] == "running"
+            manager.stop(run["id"])
+        result = await settled(manager, run)
+        assert result["state"] == ("completed" if duration_hours else "stopped"), result
+        assert not monitor.store.list_sessions() and not monitor.active
+        assert monitor.reserved_by is None and not ui.external_busy
+        assert children and all(child.returncode is not None for child in children)
+
+        detail = await m.detail(run["id"], request, offset=0)
+        assert not detail["config"]["collect_performance"] and detail["segments"] == []
+        assert "__ACPM_MONKEY_PID__" in detail["log_tail"]
+        summary = await m.summary(run["id"], request)
+        assert not summary["collect_performance"] and summary["sample_count"] == 0 and not summary["metrics"]
+        if multiscreen:
+            assert summary["display_summary"]["screens"][0]["actions"]["tap"]["success"] == 1
+        assert not manager.store.database(run["id"]).exists()
+        assert not list(manager.store.directory(run["id"]).glob("*.csv"))
+        with pytest.raises(HTTPException) as error:
+            await m.report(run["id"], request)
+        assert error.value.status_code == 404
     asyncio.run(scenario())
 
 

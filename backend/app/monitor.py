@@ -7,7 +7,7 @@ import logging
 import shlex
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .adb import (
@@ -24,6 +24,7 @@ from .adb import (
     parse_meminfo,
     parse_proc_stat_cpu,
     parse_proc_meminfo,
+    parse_process_rss,
     parse_surface_latency_stats,
     parse_top,
     run_adb,
@@ -69,6 +70,10 @@ class RuntimeSession:
     system_memory_task: asyncio.Task[SystemMemorySample] | None = None
     system_memory_result: SystemMemorySample | None = None
     system_memory_updated_monotonic: float = 0
+    process_rss_task: asyncio.Task[list[ProcessSample]] | None = None
+    next_system_memory_at: float | None = None
+    next_memory_at: float | None = None
+    next_process_rss_at: float | None = None
     memory_detail_supported: bool | None = None
     cpu_baseline: tuple[int, int] | None = None
     cpu_proc_supported: bool | None = None
@@ -78,6 +83,12 @@ class RuntimeSession:
 
 # 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
 FOREGROUND_REFRESH_CYCLES = 4
+MEMORY_DETAIL_INTERVAL_FACTOR = 3
+
+
+def _next_capture_at(deadline: float, now: float, interval: float) -> float:
+    """Advance the schedule past now, without replaying missed samples."""
+    return deadline + (int((now - deadline) / interval) + 1) * interval
 
 
 class MonitorManager:
@@ -123,6 +134,8 @@ class MonitorManager:
             "duration_seconds": request.duration_seconds,
             "interval_ms": request.interval_ms,
             "memory_cycle_skip": request.memory_cycle_skip,
+            "memory_interval_ms": request.memory_interval_ms,
+            "memory_detail_interval_ms": request.memory_interval_ms * MEMORY_DETAIL_INTERVAL_FACTOR,
             "enabled_metrics": request.metrics.model_dump(),
             "surface_layer": request.surface_layer,
             "sdk_version": sdk_version,
@@ -197,7 +210,9 @@ class MonitorManager:
         finally:
             try:
                 pending = set(runtime.inflight)
-                pending.update(task for task in (runtime.memory_task, runtime.system_memory_task) if task is not None)
+                pending.update(task for task in (
+                    runtime.memory_task, runtime.system_memory_task, runtime.process_rss_task
+                ) if task is not None)
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
@@ -281,46 +296,13 @@ class MonitorManager:
             except AdbError:
                 pass
             runtime.foreground_checked_cycle = runtime.sample_cycle
-        # 内存完全独立：命中采样节奏且无在途 meminfo 时后台启动 worker，
-        # 主循环不等待——全量 meminfo 在部分车机耗时数秒，异步化后
-        # CPU/FPS 周期严格按 interval 落点，内存值以最近一次完成结果更新。
         if runtime.request.metrics.memory:
-            # Lightweight /proc sampling shares the configured memory cadence but
-            # completes independently of a slow or unsupported dumpsys meminfo.
-            if runtime.system_memory_task is not None and runtime.system_memory_task.done():
-                try:
-                    runtime.system_memory_result = runtime.system_memory_task.result()
-                    runtime.system_memory_updated_monotonic = time.monotonic()
-                    if runtime.system_memory_result.memory_used_pct is None:
-                        self._record_error_once(runtime, "mem_available_unavailable", "未取得有效的 MemTotal / MemAvailable；系统内存率不使用 PSS 或 MemFree 推算。")
-                except Exception as exc:
-                    self._record_error_once(runtime, "system_memory_adb", f"系统内存读取失败：{exc}")
-                runtime.system_memory_task = None
-            if runtime.sample_cycle % runtime.request.memory_cycle_skip == 0 and runtime.system_memory_task is None:
-                runtime.system_memory_task = self._spawn(runtime, self._capture_system_memory(runtime.request.serial))
-            if runtime.system_memory_result is not None and time.monotonic() - runtime.system_memory_updated_monotonic <= max(30, runtime.request.interval_ms / 1000 * runtime.request.memory_cycle_skip * 3):
-                system_memory = runtime.system_memory_result
-            statuses["system_memory"] = "ok" if system_memory.memory_used_pct is not None else "unavailable"
-            fresh_memory_processes: list[ProcessSample] | None = None
-            if runtime.memory_task is not None and runtime.memory_task.done():
-                try:
-                    runtime.memory_result = runtime.memory_task.result()
-                    runtime.memory_updated_monotonic = time.monotonic()
-                    fresh_memory_processes = runtime.memory_result[3]
-                    statuses["memory"] = "ok"
-                except (AdbError, Exception) as exc:
-                    self._record_error_once(runtime, "memory_adb", f"内存采样失败：{exc}")
-                runtime.memory_task = None
-            if runtime.sample_cycle % runtime.request.memory_cycle_skip == 0 and runtime.memory_task is None:
-                runtime.memory_task = self._spawn(runtime, self._capture_memory(runtime))
-            if runtime.memory_result is not None and time.monotonic() - runtime.memory_updated_monotonic <= max(30, runtime.request.interval_ms / 1000 * runtime.request.memory_cycle_skip * 3):
-                pss_kb, rss_kb, total_ram_kb, processes = runtime.memory_result
-                # 一级内存值可沿用最近快照；进程明细只在快照实际完成时写一次，
-                # 避免同一结果随主循环重复入库。
-                if fresh_memory_processes is not None:
-                    process_sets.append(fresh_memory_processes)
-                    if not any(item.uss_kb is not None for item in fresh_memory_processes):
-                        self._record_error_once(runtime, "uss_unavailable", "当前设备未提供应用 USS 明细；整机 PSS 采样不受影响。")
+            if runtime.sample_cycle == 0 and runtime.next_system_memory_at is None:
+                now = time.monotonic()
+                runtime.next_system_memory_at = runtime.next_memory_at = now
+                runtime.next_process_rss_at = now + runtime.request.memory_interval_ms / 2000
+            system_memory = self._update_system_memory(runtime, statuses)
+            pss_kb, rss_kb, total_ram_kb = self._update_process_memory(runtime, process_sets, statuses)
         if runtime.request.metrics.fps:
             frame_output: list[str] = []
             fps_job = self._spawn(runtime, self._capture_fps(runtime, frame_output))
@@ -332,9 +314,6 @@ class MonitorManager:
                 statuses[metric] = "ok"
                 if metric == "cpu":
                     cpu_total, processes = result  # type: ignore[misc]
-                    process_sets.append(processes)
-                elif metric == "memory":
-                    pss_kb, rss_kb, total_ram_kb, processes = result  # type: ignore[misc]
                     process_sets.append(processes)
                 elif metric == "fps":
                     frame_stats = result  # type: ignore[assignment]
@@ -457,6 +436,79 @@ class MonitorManager:
             processes = []
             self._record_error_once(runtime, "cpu_process_unavailable", "进程 CPU 采集失败，整机 CPU 仍使用 /proc/stat。")
         return total, processes
+
+    def _update_system_memory(self, runtime: RuntimeSession, statuses: dict[str, str]) -> SystemMemorySample:
+        now = time.monotonic()
+        interval = runtime.request.memory_interval_ms / 1000
+        if runtime.system_memory_task is not None and runtime.system_memory_task.done():
+            try:
+                runtime.system_memory_result = runtime.system_memory_task.result()
+                runtime.system_memory_updated_monotonic = now
+                if runtime.system_memory_result.memory_used_pct is None:
+                    self._record_error_once(runtime, "mem_available_unavailable", "未取得有效的 MemTotal / MemAvailable；系统内存率不使用 PSS 或 MemFree 推算。")
+            except Exception as exc:
+                self._record_error_once(runtime, "system_memory_adb", f"系统内存读取失败：{exc}")
+            runtime.system_memory_task = None
+        if runtime.next_system_memory_at is not None and now >= runtime.next_system_memory_at:
+            runtime.next_system_memory_at = _next_capture_at(runtime.next_system_memory_at, now, interval)
+            if runtime.system_memory_task is None:
+                runtime.system_memory_task = self._spawn(runtime, self._capture_system_memory(runtime.request.serial))
+        result = runtime.system_memory_result
+        if result is None or now - runtime.system_memory_updated_monotonic > max(30, interval * 3):
+            result = SystemMemorySample()
+        statuses["system_memory"] = "ok" if result.memory_used_pct is not None else "unavailable"
+        return result
+
+    def _update_process_memory(
+        self, runtime: RuntimeSession, process_sets: list[list[ProcessSample]], statuses: dict[str, str]
+    ) -> tuple[int | None, int | None, int | None]:
+        now = time.monotonic()
+        interval = runtime.request.memory_interval_ms / 1000
+        detail_interval = interval * MEMORY_DETAIL_INTERVAL_FACTOR
+        if runtime.memory_task is not None and runtime.memory_task.done():
+            try:
+                runtime.memory_result = runtime.memory_task.result()
+                runtime.memory_updated_monotonic = now
+                processes = runtime.memory_result[3]
+                # Keep one consistent per-process RSS series. Detailed RSS is retained
+                # in the existing aggregate and in historical process rows.
+                process_sets.append([replace(item, rss_kb=None) for item in processes
+                                     if item.pss_kb is not None or item.uss_kb is not None])
+                statuses["memory"] = "ok"
+                if not any(item.uss_kb is not None for item in processes):
+                    self._record_error_once(runtime, "uss_unavailable", "当前设备未提供应用 USS 明细；整机 PSS 采样不受影响。")
+            except Exception as exc:
+                self._record_error_once(runtime, "memory_adb", f"内存采样失败：{exc}")
+            runtime.memory_task = None
+        if runtime.process_rss_task is not None and runtime.process_rss_task.done():
+            try:
+                process_sets.append(runtime.process_rss_task.result())
+                statuses["process_rss"] = "ok"
+            except Exception as exc:
+                statuses["process_rss"] = "unavailable"
+                self._record_error_once(runtime, "process_rss_unavailable", f"全进程 RSS 采集失败：{exc}")
+            runtime.process_rss_task = None
+        if runtime.next_memory_at is not None and now >= runtime.next_memory_at:
+            runtime.next_memory_at = _next_capture_at(runtime.next_memory_at, now, detail_interval)
+            if runtime.memory_task is None:
+                runtime.memory_task = self._spawn(runtime, self._capture_memory(runtime))
+        if runtime.next_process_rss_at is not None and now >= runtime.next_process_rss_at:
+            runtime.next_process_rss_at = _next_capture_at(runtime.next_process_rss_at, now, interval)
+            if runtime.process_rss_task is None:
+                runtime.process_rss_task = self._spawn(runtime, self._capture_process_rss(runtime.request.serial))
+        # Retain the snapshot through the next scheduled refresh plus one main-loop tick.
+        max_age = max(30, detail_interval + runtime.request.interval_ms / 1000)
+        if runtime.memory_result is not None and now - runtime.memory_updated_monotonic <= max_age:
+            pss, rss, total_ram, _ = runtime.memory_result
+            return pss, rss, total_ram
+        return None, None, None
+
+    async def _capture_process_rss(self, serial: str) -> list[ProcessSample]:
+        output = await run_adb("shell", "ps", "-A", "-o", "PID,RSS,NAME", serial=serial, timeout_seconds=5)
+        processes = parse_process_rss(output)
+        if not processes:
+            raise AdbError("设备未返回可用的 ps RSS 进程列表")
+        return processes
 
     async def _capture_system_memory(self, serial: str) -> SystemMemorySample:
         output = await run_adb("shell", "cat", "/proc/meminfo", serial=serial, timeout_seconds=5)

@@ -69,8 +69,9 @@ class MonkeyRequest(BaseModel):
     duration_hours: int | None = Field(default=1, ge=1, le=8760, strict=True)
     throttle_ms: int = Field(default=300, ge=50, le=10000, strict=True)
     seed: int = Field(default=42, ge=0, le=2147483647, strict=True)
+    collect_performance: bool = Field(default=True, strict=True)
     interval_ms: int = Field(default=2000, ge=1000, le=5000, strict=True)
-    memory_cycle_skip: int = Field(default=5, ge=1, le=60, strict=True)
+    memory_cycle_skip: int | None = Field(default=None, ge=1, le=60, strict=True)
     fps: bool = False
     ignore_crashes: bool = True
     ignore_timeouts: bool = True
@@ -429,21 +430,27 @@ class MonkeyManager:
             started = time.monotonic()
             deadline = started + runtime.config.duration_hours * HOUR_SECONDS if runtime.config.duration_hours else math.inf
             run = self.store.get(runtime.id)
-            run.update(state="running", started_at_ms=int(time.time() * 1000), message="Monkey 与性能采样运行中")
+            collecting = runtime.config.collect_performance
+            run.update(state="running", started_at_ms=int(time.time() * 1000),
+                       message="Monkey 与性能采样运行中" if collecting else "Monkey 运行中（不采集性能数据）")
             self.store.put(run)
-            self.store.started(runtime.id, run["started_at_ms"])
+            if collecting:
+                self.store.started(runtime.id, run["started_at_ms"])
             runtime.heartbeat = asyncio.create_task(self.heartbeat(runtime))
             if runtime.config.duration_hours:
                 runtime.timer = asyncio.create_task(self.deadline(runtime, max(0, deadline - time.monotonic())))
             wait_process = asyncio.create_task(runtime.process.wait())
             stop_wait = asyncio.create_task(runtime.stop.wait())
-            current = await self.start_segment(runtime, min(HOUR_SECONDS, deadline - time.monotonic()))
+            waiters = {wait_process, stop_wait}
+            if collecting:
+                current = await self.start_segment(runtime, min(HOUR_SECONDS, deadline - time.monotonic()))
             if runtime.evidence and not runtime.stop.is_set():
                 await run_adb("shell", "touch", remote_paths(runtime.id)["gate"], serial=runtime.config.serial)
             while True:
                 task = runtime.sampling_task
                 remaining = deadline - time.monotonic()
-                done, _ = await asyncio.wait({wait_process, stop_wait, task}, timeout=max(0, remaining), return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(waiters | ({task} if task else set()),
+                                             timeout=max(0, remaining), return_when=asyncio.FIRST_COMPLETED)
                 if runtime.failure:
                     raise ValueError(runtime.failure)
                 if stop_wait in done or runtime.stop.is_set():
@@ -454,7 +461,7 @@ class MonkeyManager:
                     break
                 if wait_process in done:
                     raise ValueError("Monkey 在计划结束前退出：" + runtime.tail.decode(errors="replace")[-1500:])
-                if task in done:
+                if task is not None and task in done:
                     await task
                     session = self.monitor.store.get_session(current)
                     if session["state"] != "completed":
@@ -484,7 +491,8 @@ class MonkeyManager:
             self.stop_input(runtime)
             try:
                 run = self.store.get(runtime.id)
-                run.update(state="stopping", message=message or "正在停止 Monkey 并归档记录")
+                run.update(state="stopping", message=message or (
+                    "正在停止 Monkey 并归档记录" if runtime.config.collect_performance else "正在停止 Monkey"))
                 self.store.put(run)
             except Exception as exc:
                 warnings.append(f"停止状态写入失败：{exc}")
@@ -511,8 +519,10 @@ class MonkeyManager:
                 run = self.store.get(runtime.id)
                 if warnings:
                     run["cleanup_warning"] = "；".join(warnings)
+                completion = "并合并记录" if runtime.config.collect_performance else ""
                 run.update(state=state, ended_at_ms=int(time.time() * 1000),
-                           message=message or {"completed": "已完成并合并记录", "stopped": "已停止并合并记录", "interrupted": "已中断并保留记录"}.get(state, "执行失败"))
+                           message=message or {"completed": "已完成" + completion, "stopped": "已停止" + completion,
+                                               "interrupted": "已中断并保留记录"}.get(state, "执行失败"))
                 self.store.put(run)
         finally:
             if self.monitor.reserved_by == runtime.id:
@@ -556,7 +566,8 @@ rm -f {shlex.join(list(paths.values()))}"""
                 runtime.task.cancel()
             elif run["state"] != "starting":
                 self.stop_input(runtime)
-            run.update(state="stopping", message="正在停止并归档，原始记录会保留")
+            run.update(state="stopping", message="正在停止并归档，原始记录会保留"
+                       if runtime.config.collect_performance else "正在停止 Monkey")
             self.store.put(run)
         return run
 
@@ -663,7 +674,7 @@ async def detail(run_id: str, request: Request, offset: int = Query(default=0, g
     try:
         store = manager(request).store
         run = store.get(run_id)
-        segments = store.segments(run_id, offset)
+        segments = store.segments(run_id, offset) if run["config"].get("collect_performance", True) else []
         for segment in segments:
             segment["csv_ready"] = (store.directory(run_id) / f"hour-{segment['number']:04d}.csv").is_file()
         return {**run, "segments": segments, "log_tail": store.tail(run_id),

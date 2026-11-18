@@ -47,7 +47,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { ScrollArea } from "@/components/ui/scroll-area";
 
 type MetricKey = "cpu" | "memory" | "fps";
-type ProcessMetric = "cpu" | "pss";
+type ProcessMetric = "cpu" | "pss" | "rss" | "rss_growth";
 
 interface Device {
   serial: string;
@@ -770,7 +770,7 @@ export default function Home() {
                 <input value={logPaths.tombstone} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, tombstone: event.target.value }))} placeholder="Tombstone 路径，如 /data/tombstones" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.exportRoot} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, exportRoot: event.target.value }))} placeholder="导出根目录（留空 = 项目根/DevicesLogs）" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
               </div>
-              <p className="mt-1.5 text-[10px] leading-4 text-slate-500">停止测试时自动导出到 <code className="font-telemetry">DevicesLogs/&lt;结束时间&gt;/ANR·Crash·Tombstone/</code> 并清理车机日志（保留目录）。留空的类型不导出，仅提示。</p></>}
+              </>}
             </section>
 
             <section>
@@ -857,8 +857,58 @@ export default function Home() {
 
           <section className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_330px]">
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">
-              <div className="flex items-center justify-between border-b border-slate-700/70 px-4 py-3"><div><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-cyan-200">Process pressure</p><h2 className="mt-0.5 text-sm font-semibold">应用 / 进程聚合排行</h2></div><select value={processMetric} onChange={(event) => setProcessMetric(event.target.value as ProcessMetric)} className="rounded-sm border border-slate-700 bg-slate-950/30 px-2 py-1 text-[11px] text-slate-300 outline-none"><option value="cpu">CPU</option><option value="pss">PSS</option></select></div>
-              <div className="overflow-x-auto"><table className="w-full min-w-[560px] text-left"><thead className="bg-slate-950/35 font-telemetry text-[10px] uppercase tracking-wider text-slate-500"><tr><th className="px-4 py-2.5 font-medium">Process</th><th className="px-3 py-2.5 font-medium">PID</th><th className="px-3 py-2.5 font-medium">Average</th><th className="px-3 py-2.5 font-medium">Peak</th><th className="px-4 py-2.5 text-right font-medium">Samples</th></tr></thead><tbody>{processes.length ? processes.map((row, index) => <tr key={`${row.process_name}-${row.pid ?? index}`} className="border-t border-slate-800/85 text-xs text-slate-300"><td className="max-w-[260px] truncate px-4 py-3 font-medium text-slate-200">{row.process_name}</td><td className="font-telemetry px-3 py-3 text-slate-500">{row.pid ?? "—"}</td><td className="font-telemetry px-3 py-3 text-cyan-100">{formatProcessValue(row.average, processMetric)}</td><td className="font-telemetry px-3 py-3 text-amber-100">{formatProcessValue(row.peak, processMetric)}</td><td className="font-telemetry px-4 py-3 text-right text-slate-500">{row.samples}</td></tr>) : <tr><td colSpan={5} className="px-4 py-9 text-center text-xs text-slate-500">开始采样后，按所选指标显示进程的平均值与峰值。</td></tr>}</tbody></table></div>
+              <div className="flex items-center justify-between border-b border-slate-800/70 px-4 py-3">
+                <div>
+                  <p className="font-telemetry text-[10px] uppercase tracking-wider text-slate-500">Process pressure</p>
+                  <h2 className="mt-0.5 text-sm font-semibold">应用 / 进程聚合排行</h2>
+                </div>
+                <select
+                  aria-label="进程排行指标"
+                  value={processMetric}
+                  onChange={(event) => setProcessMetric(event.target.value as ProcessMetric)}
+                  className="rounded-sm border border-slate-700 bg-slate-950/30 px-2 py-1 text-[11px] text-slate-300 outline-none"
+                >
+                  <option value="cpu">CPU</option>
+                  <option value="pss">PSS</option>
+                  <option value="rss">RSS</option>
+                  <option value="rss_growth">RSS 新增 / 增长</option>
+                </select>
+              </div>
+              {processMetric === "rss_growth" && (
+                <p className="border-b border-slate-800/70 px-4 py-2 text-xs text-slate-500">
+                  比较相邻有效 RSS 快照，新出现的进程按当次 RSS 计入。
+                </p>
+              )}
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[560px] text-left">
+                  <thead className="bg-slate-950/35 font-telemetry text-[10px] uppercase tracking-wider text-slate-500">
+                    <tr>
+                      <th className="px-4 py-2.5 font-medium">Process</th>
+                      <th className="px-3 py-2.5 font-medium">PID</th>
+                      <th className="px-3 py-2.5 font-medium">{processMetric === "rss_growth" ? "平均增量" : "Average"}</th>
+                      <th className="px-3 py-2.5 font-medium">{processMetric === "rss_growth" ? "最大增量" : "Peak"}</th>
+                      <th className="px-4 py-2.5 text-right font-medium">{processMetric === "rss_growth" ? "增长次数" : "Samples"}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {processes.length ? processes.map((row, index) => (
+                      <tr key={`${row.process_name}-${row.pid ?? index}`} className="border-t border-slate-800/85 text-xs text-slate-300">
+                        <td className="max-w-[260px] truncate px-4 py-3 font-medium text-slate-200">{row.process_name}</td>
+                        <td className="font-telemetry px-3 py-3 text-slate-500">{row.pid ?? "—"}</td>
+                        <td className="font-telemetry px-3 py-3 text-cyan-100">{formatProcessValue(row.average, processMetric)}</td>
+                        <td className="font-telemetry px-3 py-3 text-amber-100">{formatProcessValue(row.peak, processMetric)}</td>
+                        <td className="font-telemetry px-4 py-3 text-right text-slate-500">{row.samples}</td>
+                      </tr>
+                    )) : (
+                      <tr>
+                        <td colSpan={5} className="px-4 py-9 text-center text-xs text-slate-500">
+                          {processMetric === "rss_growth" ? "至少需要两次 RSS 快照，当前暂无可显示的新增或增长。" : "开始采样后，按所选指标显示进程的平均值与峰值。"}
+                        </td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
             </article>
             <article className="telemetry-panel overflow-hidden rounded-md border border-slate-700/70 bg-slate-900/80">
               <div className="border-b border-slate-700/70 px-4 py-3"><p className="font-telemetry text-[10px] uppercase tracking-[0.16em] text-amber-200">Session events</p><h2 className="mt-0.5 text-sm font-semibold">会话事件</h2></div>

@@ -23,8 +23,9 @@ type Config = {
   duration_hours: number | null;
   throttle_ms: number;
   seed: number;
+  collect_performance: boolean;
   interval_ms: number;
-  memory_cycle_skip: number;
+  memory_cycle_skip: number | null;
   fps: boolean;
   ignore_crashes: boolean;
   ignore_timeouts: boolean;
@@ -73,6 +74,13 @@ type Summary = {
   sample_count: number;
   segment_count: number;
   metrics: Record<string, Metric>;
+  rss_growth_processes?: {
+    process_name: string;
+    pid: number;
+    average: number;
+    peak: number;
+    samples: number;
+  }[];
   processes: {
     process_name: string;
     cpu_average_pct: number | null;
@@ -116,8 +124,9 @@ const initial: Config = {
   duration_hours: 1,
   throttle_ms: 300,
   seed: 42,
+  collect_performance: true,
   interval_ms: 2000,
-  memory_cycle_skip: 5,
+  memory_cycle_skip: null,
   fps: false,
   ignore_crashes: true,
   ignore_timeouts: true,
@@ -195,6 +204,10 @@ export default function MonkeyTesting() {
   const { projects, projectId, selectProject, projectError } =
     useWorkspaceProjects();
   const [config, setConfig] = useState<Config>(restored);
+  const memoryIntervalSeconds =
+    config.memory_cycle_skip == null
+      ? 10
+      : (config.interval_ms * config.memory_cycle_skip) / 1000;
   const [activeRuns, setActiveRuns] = useState<Run[]>([]);
   const [packageText, setPackageText] = useState(() =>
     restored().packages.join("\n")
@@ -323,7 +336,7 @@ export default function MonkeyTesting() {
           setSelected(detail);
           if (busy(detail) && detail.config && hydrated.current !== detail.id) {
             hydrated.current = detail.id;
-            setConfig(detail.config);
+            setConfig({ ...initial, ...detail.config });
             setPackageText(detail.config.packages.join("\n"));
             setCustomHours(
               detail.config.duration_hours != null &&
@@ -372,7 +385,11 @@ export default function MonkeyTesting() {
       setHistoryOffset(0);
       selectRun(run.id);
       setRuns(current => [run, ...current].slice(0, 50));
-      toast.success("Monkey 任务已创建，性能采样会自动开始");
+      toast.success(
+        config.collect_performance
+          ? "Monkey 任务已创建，性能采样会自动开始"
+          : "Monkey 任务已创建，本次不采集性能数据"
+      );
     } catch (exc) {
       toast.error((exc as Error).message);
     } finally {
@@ -389,7 +406,11 @@ export default function MonkeyTesting() {
         {}
       );
       setSelected(current => (current ? { ...current, ...run } : run));
-      toast.success("正在停止输入、归档末段并合并记录");
+      toast.success(
+        selected.config?.collect_performance === false
+          ? "正在停止 Monkey"
+          : "正在停止输入、归档末段并合并记录"
+      );
     } catch (exc) {
       toast.error((exc as Error).message);
     } finally {
@@ -410,13 +431,8 @@ export default function MonkeyTesting() {
               Monkey 压测
             </h1>
             <p className="mt-2 text-sm text-slate-400">
-              随机事件执行 · 每小时性能归档 · 全程记录合并
+              随机事件执行 · 可选性能采集
             </p>
-          </div>
-          <div className="text-right text-xs leading-6 text-slate-400">
-            CPU / 内存自动联动
-            <br />
-            按小时导出 CSV，结束合并 SQLite，不自动生成报告
           </div>
         </header>
         {error && (
@@ -744,48 +760,71 @@ export default function MonkeyTesting() {
               </div>
               <div className="border-t border-slate-800 pt-4">
                 <h3 className="mb-3 text-sm font-medium">性能采样与负载</h3>
-                <label className="block text-xs text-slate-400">
-                  CPU 采样周期
-                  <select
-                    aria-label="性能采样周期"
-                    className={`${control} mt-1`}
-                    value={config.interval_ms}
-                    onChange={event =>
-                      update("interval_ms", Number(event.target.value))
-                    }
-                  >
-                    <option value={1000}>1 秒</option>
-                    <option value={2000}>2 秒（默认）</option>
-                    <option value={5000}>5 秒</option>
-                  </select>
-                </label>
-                <label className="mt-3 block text-xs text-slate-400">
-                  每 N 个周期读取一次内存
-                  <input
-                    aria-label="内存采样降频"
-                    className={`${control} mt-1`}
-                    type="number"
-                    min={1}
-                    max={60}
-                    value={config.memory_cycle_skip}
-                    onChange={event =>
-                      update("memory_cycle_skip", Number(event.target.value))
-                    }
-                  />
-                </label>
-                <p className="mt-2 text-xs text-slate-500">
-                  当前约每{" "}
-                  {(config.interval_ms * config.memory_cycle_skip) / 1000}{" "}
-                  秒读取内存，CPU / 内存自动开启。
-                </p>
-                <label className="mt-3 flex items-center gap-2 text-xs">
+                <label className="flex items-center gap-2 text-sm">
                   <input
                     type="checkbox"
-                    checked={config.fps}
-                    onChange={event => update("fps", event.target.checked)}
+                    checked={config.collect_performance}
+                    onChange={event =>
+                      update("collect_performance", event.target.checked)
+                    }
                   />
-                  同时采集 FPS（增加设备诊断命令）
+                  采集性能数据
                 </label>
+                <p className="mt-2 text-xs text-slate-500">
+                  取消勾选后保留 Monkey 日志和多屏统计。
+                </p>
+                <fieldset
+                  disabled={!config.collect_performance}
+                  className="mt-3 disabled:opacity-60"
+                >
+                  <label className="block text-xs text-slate-400">
+                    CPU 采样周期
+                    <select
+                      aria-label="性能采样周期"
+                      className={`${control} mt-1`}
+                      value={config.interval_ms}
+                      onChange={event =>
+                        update("interval_ms", Number(event.target.value))
+                      }
+                    >
+                      <option value={1000}>1 秒</option>
+                      <option value={2000}>2 秒（默认）</option>
+                      <option value={5000}>5 秒</option>
+                    </select>
+                  </label>
+                  <label className="mt-3 block text-xs text-slate-400">
+                    自定义内存周期（每 N 个 CPU 周期）
+                    <input
+                      aria-label="内存采样降频"
+                      className={`${control} mt-1`}
+                      type="number"
+                      min={1}
+                      max={60}
+                      placeholder="自动（10 秒）"
+                      value={config.memory_cycle_skip ?? ""}
+                      onChange={event =>
+                        update(
+                          "memory_cycle_skip",
+                          event.target.value === ""
+                            ? null
+                            : Number(event.target.value)
+                        )
+                      }
+                    />
+                  </label>
+                  <p className="mt-2 text-xs text-slate-500">
+                    整机内存与全进程 RSS 约每 {memoryIntervalSeconds} 秒采集，
+                    全量 PSS / USS 约每 {memoryIntervalSeconds * 3} 秒采集。
+                  </p>
+                  <label className="mt-3 flex items-center gap-2 text-xs">
+                    <input
+                      type="checkbox"
+                      checked={config.fps}
+                      onChange={event => update("fps", event.target.checked)}
+                    />
+                    同时采集 FPS（增加设备诊断命令）
+                  </label>
+                </fieldset>
                 <label className="mt-3 flex items-center gap-2 text-xs">
                   <input
                     type="checkbox"
@@ -815,7 +854,7 @@ export default function MonkeyTesting() {
               onClick={() => void start()}
             >
               <Play size={15} />
-              {pending ? "正在处理…" : "启动 Monkey 与性能采样"}
+              {pending ? "正在处理…" : "启动 Monkey"}
             </button>
             <p className="mt-3 text-xs leading-5 text-slate-500">
               执行期间独占设备操作和性能采样；日志限制为两份各 8
@@ -838,7 +877,9 @@ export default function MonkeyTesting() {
                     onClick={() => void stop()}
                   >
                     <Square size={14} />
-                    停止并合并记录
+                    {selected.config?.collect_performance === false
+                      ? "停止 Monkey"
+                      : "停止并合并记录"}
                   </button>
                 )}
               </div>
@@ -872,10 +913,19 @@ export default function MonkeyTesting() {
                           ? `${selected.config.duration_hours} 小时`
                           : "持续执行",
                       ],
-                      ["已归档分段", String(selected.segment_count)],
+                      [
+                        "已归档分段",
+                        selected.config?.collect_performance === false
+                          ? "—"
+                          : String(selected.segment_count),
+                      ],
                       [
                         "当前采样",
-                        selected.current_session_id ? "运行中" : "—",
+                        selected.config?.collect_performance === false
+                          ? "未开启"
+                          : selected.current_session_id
+                            ? "运行中"
+                            : "—",
                       ],
                     ].map(([label, value]) => (
                       <div key={label}>
@@ -935,8 +985,8 @@ export default function MonkeyTesting() {
               ) : (
                 <div className="py-12 text-center text-sm leading-7 text-slate-500">
                   选择设备并配置事件比例后启动。
-                  <br />满 1 小时自动导出一次 CSV，结束时保存末段并生成全程性能
-                  CSV。
+                  <br />
+                  开启性能采集后，每小时归档一次，结束时生成全程性能 CSV。
                 </div>
               )}
             </section>
@@ -946,7 +996,7 @@ export default function MonkeyTesting() {
                 download={file("display-summary.json")}
               />
             )}
-            {result && (
+            {result && selected?.config?.collect_performance !== false && (
               <section className={panel} aria-label="Monkey 全程性能汇总">
                 <h2 className="font-semibold">
                   全程资源统计{" "}
@@ -1090,9 +1140,52 @@ export default function MonkeyTesting() {
                   进程 CPU 份额 = 该进程采样 CPU 总量 / 所有已采到进程 CPU
                   总量，不是整机容量占比。完整明细保留在合并 SQLite 中。
                 </p>
+                {!!result.rss_growth_processes?.length && (
+                  <div className="mt-5">
+                    <h3 className="mb-2 text-sm font-medium">
+                      进程 RSS 新增 / 增长排行
+                    </h3>
+                    <p className="mb-2 text-xs text-slate-500">
+                      比较相邻有效快照，新出现的进程按当次 RSS 计入。
+                    </p>
+                    <div className="max-h-64 overflow-auto">
+                      <table className="w-full whitespace-nowrap text-left text-xs">
+                        <thead className="text-slate-500">
+                          <tr>
+                            <th className="px-2 py-2 font-normal">进程</th>
+                            <th className="px-2 py-2 font-normal">PID</th>
+                            <th className="px-2 py-2 font-normal">最大增量</th>
+                            <th className="px-2 py-2 font-normal">增长次数</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {result.rss_growth_processes.map(process => (
+                            <tr
+                              key={`${process.process_name}-${process.pid}`}
+                              className="border-t border-slate-800/50"
+                            >
+                              <td className="px-2 py-2 font-mono">
+                                {process.process_name}
+                              </td>
+                              <td className="px-2 py-2">{process.pid}</td>
+                              <td className="px-2 py-2">
+                                {fmt(process.peak / 1024, " MiB")}
+                              </td>
+                              <td className="px-2 py-2">{process.samples}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </section>
             )}
-            <section className={panel} aria-label="每小时性能记录">
+            <section
+              className={panel}
+              aria-label="每小时性能记录"
+              hidden={selected?.config?.collect_performance === false}
+            >
               <div className="flex items-center justify-between gap-3">
                 <h2 className="font-semibold">每小时性能记录</h2>
                 <span className="text-xs text-slate-500">

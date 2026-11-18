@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import time
 
-from .storage import SessionStore, ensure_system_memory_columns
+from .storage import SessionStore, ensure_system_memory_columns, query_process_rss_growth
 
 CSV_FIELDS = ["ts_ms", "cpu_total_pct", "pss_kb", "rss_kb", "total_ram_kb", "fps",
               "app_render_fps", "jank_pct", "frame_count", "jank_count", "frame_source",
@@ -151,6 +151,8 @@ class MonkeyRecords:
     def initialize(self, run: dict) -> None:
         directory = self.root / run["id"]
         directory.mkdir(exist_ok=False)
+        if not run["config"].get("collect_performance", True):
+            return
         store = SessionStore(directory)
         writer = store.create_session(run["id"], {
             "session_id": run["id"],
@@ -215,6 +217,13 @@ class MonkeyRecords:
 
     def summarize(self, run_id: str, state: str, ended_at_ms: int) -> dict:
         """Time weights use actual sample timestamps; gaps >3 intervals are excluded."""
+        run = self.get(run_id)
+        if not run["config"].get("collect_performance", True):
+            summary = {"state": state, "collect_performance": False, "sample_count": 0, "segment_count": 0,
+                       "started_at_ms": run.get("started_at_ms"), "ended_at_ms": ended_at_ms,
+                       "metrics": {}, "processes": [], "definitions": {}}
+            self._write_summary(self.root / run_id, summary)
+            return summary
         database = self.database(run_id)
         with connect(database) as c:
             ensure_system_memory_columns(c)
@@ -256,6 +265,7 @@ class MonkeyRecords:
                        "segment_count": c.execute("SELECT COUNT(*) FROM monkey_segment").fetchone()[0],
                        "started_at_ms": session["started_at_ms"], "ended_at_ms": ended_at_ms,
                        "metrics": metrics, "processes": processes,
+                       "rss_growth_processes": query_process_rss_growth(c, 10),
                        "definitions": {"averages": "按实际采样间隔加权，单点最多计入3个采样间隔；丢失数据不按0处理。",
                                        "memory_used_pct": "系统内存占用率 = (MemTotal - MemAvailable) / MemTotal × 100%；同一份 /proc/meminfo 快照，包含可回收缓存的可用内存估计。缺失或无效时不使用 PSS / MemFree 替代。",
                                        "memory_pss_pct": "PSS / 物理RAM，不等同于系统已用内存率。",
@@ -264,12 +274,16 @@ class MonkeyRecords:
             c.execute("UPDATE session SET state=?, ended_at_ms=?, summary_json=? WHERE id=1", (state, ended_at_ms, json.dumps(summary, ensure_ascii=False)))
         with connect(database) as c:
             c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        destination = database.parent.parent / "summary.json"
+        self._write_summary(database.parent.parent, summary)
+        self.export_combined_csv(run_id)
+        return summary
+
+    @staticmethod
+    def _write_summary(directory: Path, summary: dict) -> None:
+        destination = directory / "summary.json"
         temp = destination.with_suffix(".tmp")
         temp.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(destination)
-        self.export_combined_csv(run_id)
-        return summary
 
     def export_combined_csv(self, run_id: str) -> Path:
         """Stream every archived sample into one CSV without holding the run in memory."""

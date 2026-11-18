@@ -287,6 +287,7 @@ def generate_report(
     events = store.get_events(session_id, limit=200) if "events" in included else []
     processes_cpu = store.get_processes(session_id, "cpu", 10) if "cpu" in included else []
     processes_pss = store.get_processes(session_id, "pss", 10) if "process_memory" in included else []
+    rss_growth = store.get_processes(session_id, "rss_growth", 10) if "process_memory" in included else []
     app_uss_trends = (
         _build_app_uss_trends(store.get_process_uss_series(session_id))
         if "process_memory" in included else []
@@ -452,8 +453,8 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
             parts.append('<p class="empty">该会话没有采样数据。</p>')
 
     # ---------- 进程排行 ----------
-    def process_table(title: str, rows: list[dict[str, Any]], unit: str, scale: float = 1.0) -> str:
-        # get_processes 的 PSS 为 KiB，显示 MiB 时需除以 1024。
+    def process_table(title: str, rows: list[dict[str, Any]], unit: str, scale: float = 1.0, *, growth: bool = False) -> str:
+        # 进程内存以 KiB 存储，显示 MiB 时需除以 1024。
         def scaled(value: float | None) -> float | None:
             return None if value is None else value / scale
 
@@ -465,16 +466,20 @@ footer{{margin-top:32px;border-top:1px solid var(--report-border);padding-top:12
         )
         return (
             f'<div class="chart"><h3>{_escape(title)}</h3>'
-            "<table><tr><th>进程</th><th>PID</th><th>平均</th><th>峰值</th><th>样本数</th></tr>"
-            f"{body}</table></div>"
+            "<table><tr><th>进程</th><th>PID</th>"
+            + ("<th>平均增量</th><th>最大增量</th><th>增长次数</th>" if growth else "<th>平均</th><th>峰值</th><th>样本数</th>")
+            + f"</tr>{body}</table></div>"
         )
 
-    if processes_cpu or processes_pss:
+    if processes_cpu or processes_pss or rss_growth:
         parts.append('<h2>进程排行</h2>')
         if processes_cpu:
             parts.append(process_table("进程 CPU 占用排行", processes_cpu, "%", scale=1))
         if processes_pss:
             parts.append(process_table("进程 PSS 占用排行", processes_pss, "MiB", scale=1024))
+        if rss_growth:
+            parts.append(process_table("进程 RSS 新增 / 增长排行", rss_growth, "MiB", scale=1024, growth=True))
+            parts.append('<p class="meaning">比较相邻有效 RSS 快照。首次快照作基线，之后新出现的进程按当次 RSS 计入。RSS 包含共享页。</p>')
 
     # ---------- 各应用 USS 趋势 ----------
     if app_uss_trends:

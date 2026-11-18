@@ -9,10 +9,10 @@ import uuid
 
 import pytest
 
-from app.adb import AdbError, parse_proc_meminfo
-from app.models import MetricsConfig, SamplePayload, StartSessionRequest
+from app.adb import AdbError, parse_proc_meminfo, parse_process_rss
+from app.models import MetricsConfig, ProcessSample, SamplePayload, StartSessionRequest
 from app.monitor import MonitorManager, RuntimeSession
-from app.monkey_records import MonkeyRecords, connect
+from app.monkey_records import MonkeyRecords, MonkeyReportStore, connect
 from app.report import generate_report
 from app.storage import SessionStore, SYSTEM_MEMORY_COLUMNS
 
@@ -158,4 +158,188 @@ def test_system_memory_does_not_wait_for_slow_pss_and_expires(tmp_path, monkeypa
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+    asyncio.run(scenario())
+
+
+def test_parse_android_process_rss_keeps_all_valid_processes():
+    output = """  PID    RSS NAME
+    1  16864 init
+    2      0 [kthreadd]
+    3      - system_hidden
+ 1842 743656 system_server
+ 2400  54000 a process with spaces
+ bad   56000 malformed
+    """
+    assert parse_process_rss(output) == [
+        ProcessSample("init", 1, rss_kb=16864),
+        ProcessSample("system_server", 1842, rss_kb=743656),
+        ProcessSample("a process with spaces", 2400, rss_kb=54000),
+    ]
+    assert parse_process_rss("unexpected ps usage\n1 16864 init") == []
+
+
+@pytest.mark.parametrize("cpu_interval,legacy_skip,base", [(500, None, 10), (2000, None, 10), (1000, 4, 4)])
+def test_memory_lanes_have_independent_cadence_and_write_once(tmp_path, monkeypatch, cpu_interval, legacy_skip, base):
+    async def scenario():
+        manager = MonitorManager(tmp_path)
+        clock = SimpleNamespace(now=0)
+        monkeypatch.setattr("app.monitor.time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
+        observed = {"system": [], "pss": [], "rss": []}
+
+        async def system(_serial):
+            observed["system"].append(clock.now)
+            return parse_proc_meminfo("MemTotal: 1000 kB\nMemAvailable: 900 kB")
+
+        async def full(_runtime):
+            observed["pss"].append(clock.now)
+            return (100, 120, 1000, [ProcessSample("app", 2, pss_kb=100, rss_kb=120, uss_kb=5)])
+
+        async def lightweight(_serial):
+            observed["rss"].append(clock.now)
+            return [ProcessSample("app", 2, rss_kb=130), ProcessSample("native", 3, rss_kb=50)]
+
+        monkeypatch.setattr(manager, "_capture_system_memory", system)
+        monkeypatch.setattr(manager, "_capture_memory", full)
+        monkeypatch.setattr(manager, "_capture_process_rss", lightweight)
+        request = StartSessionRequest(serial="test", interval_ms=cpu_interval, memory_cycle_skip=legacy_skip,
+                                      metrics=MetricsConfig(cpu=False, fps=False))
+        runtime = RuntimeSession("test", request, SimpleNamespace(add_event=lambda *_: None))
+        points = []
+        for tick_ms in range(0, base * 4 * 1000 + 1, cpu_interval):
+            clock.now = tick_ms / 1000
+            points.append(await manager._capture_once(runtime))
+            runtime.sample_cycle += 1
+            await asyncio.sleep(0)
+        assert observed == {
+            "system": [i * base for i in range(5)],
+            "pss": [0, base * 3],
+            "rss": [((i * base + base / 2) * 1000 + cpu_interval - 1) // cpu_interval * cpu_interval / 1000
+                    for i in range(4)],
+        }
+        assert sum(p.memory_used_pct == 10 for p in points) == len(points) - 1
+        assert sum(any(row.pss_kb == 100 for row in p.processes) for p in points) == 2
+        assert sum(any(row.rss_kb == 130 for row in p.processes) for p in points) == 4
+        assert all(row.rss_kb != 120 for p in points for row in p.processes)
+        assert all(p.rss_kb == 120 for p in points[1:])
+    asyncio.run(scenario())
+
+
+def test_rss_failure_does_not_restart_full_query_and_pending_rss_is_cancelled(tmp_path, monkeypatch):
+    async def scenario():
+        manager = MonitorManager(tmp_path)
+        request = StartSessionRequest(serial="test", interval_ms=500, memory_cycle_skip=1,
+                                      duration_seconds=30, metrics=MetricsConfig(cpu=False, fps=False))
+        clock = SimpleNamespace(now=0)
+        monkeypatch.setattr("app.monitor.time", SimpleNamespace(monotonic=lambda: clock.now, time=time.time))
+        calls = []
+        cancelled = asyncio.Event()
+
+        async def adb(*args, **kwargs):
+            calls.append(args)
+            if args[1] == "ps":
+                if calls.count(args) == 1:
+                    raise AdbError("unsupported output")
+                try:
+                    await asyncio.Future()
+                finally:
+                    cancelled.set()
+            if args[-1] == "/proc/meminfo":
+                return "MemTotal: 1000 kB\nMemAvailable: 900 kB\n"
+            return "Total PSS by process:\n 100K: app (pid 8)\nTotal RAM: 1000K\n"
+
+        monkeypatch.setattr("app.monitor.run_adb", adb)
+        events = []
+        runtime = RuntimeSession("test", request, SimpleNamespace(
+            add_event=lambda *args: events.append(args), finish=lambda *_: None))
+        for pos in (0, .25, .5, .75, 1):
+            clock.now = pos
+            await manager._capture_once(runtime)
+            await asyncio.sleep(0)
+        assert sum(call[1] == "dumpsys" for call in calls) == 1
+        assert sum(call[1] == "ps" for call in calls) == 2
+        assert any(e[1] == "process_rss_unavailable" for e in events)
+        assert runtime.process_rss_task is not None and not runtime.process_rss_task.done()
+        runtime.stop_event.set()
+        await manager._run(runtime)
+        assert cancelled.is_set()
+    asyncio.run(scenario())
+
+
+def test_rss_growth_survives_slice_archive_and_keeps_existing_memory_metrics(tmp_path):
+    store = SessionStore(tmp_path / "session-data")
+    sid = uuid.uuid4().hex
+    writer = store.create_session(sid, {"session_id": sid, "serial": "test", "created_at_ms": 1000,
+        "duration_seconds": 30, "interval_ms": 1000, "enabled_metrics": {"cpu": True, "memory": True, "fps": False}})
+    writer.write_sample(SamplePayload(ts_ms=1000, processes=[
+        ProcessSample("resident", 1, rss_kb=30720), ProcessSample("background", 2, rss_kb=45000)
+    ]))
+    writer.write_sample(SamplePayload(ts_ms=6000, pss_kb=25000, total_ram_kb=100000, memory_used_pct=75,
+        processes=[ProcessSample("resident", 1, pss_kb=25000, uss_kb=300)]))
+    writer.write_sample(SamplePayload(ts_ms=11000, processes=[
+        ProcessSample("resident", 1, rss_kb=32768), ProcessSample("short-lived", 3, rss_kb=25000)
+    ]))
+    writer.write_sample(SamplePayload(ts_ms=21000, processes=[ProcessSample("resident", 1, rss_kb=32000)]))
+    writer.finish("completed")
+
+    growth = store.get_processes(sid, "rss_growth")
+    assert growth == [
+        {"process_name": "short-lived", "pid": 3, "average": 25000, "peak": 25000, "samples": 1},
+        {"process_name": "resident", "pid": 1, "average": 2048, "peak": 2048, "samples": 1},
+    ]
+    assert store.get_processes(sid, "rss")[0]["process_name"] == "background"
+    assert store.get_processes(sid, "pss")[0]["process_name"] == "resident"
+    assert store.get_process_uss_series(sid)[0]["uss_kb"] == 300
+    assert "进程 RSS 新增 / 增长排行" in generate_report(sid, store)
+
+    records = MonkeyRecords(tmp_path / "monkey-data")
+    run_id = "b" * 32
+    run = {"id": run_id, "serial": "test", "state": "running", "created_at_ms": 1000,
+           "config": {"duration_hours": 1, "interval_ms": 1000, "fps": False}}
+    records.put(run)
+    records.initialize(run)
+    records.archive(run_id, sid, store.database_path(sid))
+    summary = records.summarize(run_id, "completed", 22000)
+    assert summary["rss_growth_processes"] == growth
+    assert summary["metrics"]["memory_used_pct"]["average"] == 75
+    assert summary["metrics"]["memory_pss"]["peak"] == 25000
+    assert summary["metrics"]["memory_rss"]["valid_samples"] == 0
+    report = generate_report(run_id, MonkeyReportStore(records.database(run_id)))
+    assert "short-lived" in report and "进程 PSS 占用排行" in report
+
+
+def test_cancelling_an_adb_command_during_spawn_reaps_the_child(monkeypatch):
+    from app.adb import run_adb
+
+    async def scenario():
+        creating = asyncio.Event()
+        spawn_complete = asyncio.Event()
+        reaped = asyncio.Event()
+
+        class Child:
+            returncode = None
+
+            def kill(self):
+                self.returncode = -9
+
+            async def communicate(self):
+                reaped.set()
+                return b"", b""
+
+        async def spawn(*args, **kwargs):
+            creating.set()
+            await spawn_complete.wait()
+            return Child()
+
+        monkeypatch.setattr("app.adb.shutil.which", lambda *_: "test-adb")
+        monkeypatch.setattr("app.adb.asyncio.create_subprocess_exec", spawn)
+        task = asyncio.create_task(run_adb("shell", "ps"))
+        await creating.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        spawn_complete.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert reaped.is_set()
+
     asyncio.run(scenario())

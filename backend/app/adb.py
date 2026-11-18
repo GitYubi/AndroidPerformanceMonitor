@@ -78,17 +78,25 @@ async def run_adb(
         command.extend(["-s", serial])
     command.extend(arguments)
 
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+        *command,
+        stdin=asyncio.subprocess.PIPE if input_data is not None else None,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    ))
+    process = None
     try:
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            stdin=asyncio.subprocess.PIPE if input_data is not None else None,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        process = await asyncio.shield(spawn)
         communication = process.communicate(input_data) if input_data is not None else process.communicate()
         stdout, stderr = await asyncio.wait_for(communication, timeout=timeout_seconds)
     except asyncio.CancelledError:
-        if "process" in locals() and process.returncode is None:
+        if process is None and not spawn.cancelled():
+            # Cancellation during process creation still needs to reap the child.
+            try:
+                process = await spawn
+            except OSError:
+                pass
+        if process is not None and process.returncode is None:
             try:
                 process.kill()
             except ProcessLookupError:
@@ -96,8 +104,11 @@ async def run_adb(
             await process.communicate()
         raise
     except TimeoutError as exc:
-        if "process" in locals() and process.returncode is None:
-            process.kill()
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
             await process.communicate()
         raise AdbError(f"ADB 命令超时（{timeout_seconds:.0f}s）") from exc
     except OSError as exc:
@@ -260,6 +271,24 @@ def merge_processes(*collections: Iterable[ProcessSample]) -> list[ProcessSample
             existing.rss_kb = item.rss_kb if item.rss_kb is not None else existing.rss_kb
             existing.uss_kb = item.uss_kb if item.uss_kb is not None else existing.uss_kb
     return list(merged.values())
+
+
+def parse_process_rss(output: str) -> list[ProcessSample]:
+    """Read positive resident sizes (KiB) from Android ps -A -o PID,RSS,NAME."""
+    lines = output.splitlines()
+    if not lines or lines[0].split() != ["PID", "RSS", "NAME"]:
+        return []
+    processes = {}
+    for line in lines[1:]:
+        columns = line.split(maxsplit=2)
+        if len(columns) != 3:
+            continue
+        pid_text, rss_text, name = columns
+        if pid_text.isascii() and pid_text.isdigit() and rss_text.isascii() and rss_text.isdigit():
+            pid, rss = int(pid_text), int(rss_text)
+            if pid > 0 and rss > 0:
+                processes[pid] = ProcessSample(process_name=name.strip(), pid=pid, rss_kb=rss)
+    return list(processes.values())
 
 
 def parse_proc_meminfo(output: str) -> SystemMemorySample:
