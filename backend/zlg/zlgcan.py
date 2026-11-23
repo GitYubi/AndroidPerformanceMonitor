@@ -1334,28 +1334,53 @@ class zlgCan:
             return message.cycle_time or 100
         return 100
 
-    def start_wake(self, channel, profile, *, background=False):
+    def start_wake(self, channel, profile, *, background=False, update=False):
         with self._state_lock:
             if channel not in self.channels:
                 raise RuntimeError(f"通道 {channel} 未打开。")
             if not profile:
-                raise ValueError("请先保存唤醒配置。")
+                raise ValueError("请先添加唤醒报文并设置信号值。")
+            if update and not any(
+                key[0] == channel and task.get("wake") and task["func"].is_alive()
+                for key, task in self.thread_messages.items()
+            ):
+                raise RuntimeError(f"通道 {channel} 未在唤醒，请先点击唤醒车机。")
             prepared = []
+            new_slots = 0
             for name, selected in profile.items():
                 message = self.db.get_message_by_name(name)
                 task = self.thread_messages.get((channel, name))
-                if task and isinstance(task["func"], PulseSend) and task["func"].is_alive():
+                worker = task["func"] if task else None
+                live = worker is not None and worker.is_alive()
+                if update and live and not task.get("wake"):
+                    continue  # Applying a wake draft must not undo a manual takeover.
+                if live and isinstance(worker, PulseSend):
                     raise RuntimeError(f"报文 {name} 正在脉冲发送，请等待完成或先取消。")
-                previous = task["data"] if task and task["func"].is_alive() else None
+                previous = task["data"] if live else None
                 values, payload = encode_wake_message(message, selected, previous)
                 frame = self._message(channel, message, payload, message.is_fd, False)
-                prepared.append((name, values, frame, self._default_period(message, task)))
+                if update and live and previous == values and worker.payload == bytes(frame.data):
+                    continue
+                period_ms = self._default_period(message, task)
+                if self.hardware_periodic:
+                    if not 1 <= period_ms <= self._backend.max_period_ms:
+                        raise ValueError(f"报文 {name} 的硬件定时周期超出范围。")
+                    new_slots += not isinstance(worker, HardwarePeriodicSend)
+                prepared.append((name, values, frame, period_ms))
+            if self.hardware_periodic and new_slots:
+                used_slots = sum(
+                    key[0] == channel and isinstance(task["func"], HardwarePeriodicSend)
+                    for key, task in self.thread_messages.items()
+                )
+                if used_slots + new_slots > self._backend.periodic_slots:
+                    raise RuntimeError(f"通道 {channel} 的硬件定时任务已满，无法添加新报文。")
             try:
                 for name, values, frame, period_ms in prepared:
                     self._schedule(name, values, frame, period_ms * 1_000_000, wake=True,
                                    background=background)
             except (RuntimeError, OSError):
-                self.stop_wake()
+                self._stop_periodic_tasks(key for key, task in self.thread_messages.items()
+                                          if key[0] == channel and task.get("wake"))
                 raise
 
     def stop_wake(self):

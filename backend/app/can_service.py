@@ -98,6 +98,7 @@ class CanService:
 
     def save_wake_profile(self, profile):
         with self.lock:
+            if not profile: raise ValueError('唤醒配置为空，未覆盖已保存的配置')
             if self.device and self.device.wake_active: raise ValueError('请先取消唤醒再修改配置')
             if not self.dbc_path: raise ValueError('请先选择 DBC')
             if hashlib.sha256(self.dbc_path.read_bytes()).hexdigest() != self.dbc_key:
@@ -106,20 +107,39 @@ class CanService:
                 for name, selected in profile.items():
                     encode_wake_message(db.get_message_by_name(name), selected)
             path = self.profile_path()
-            temporary = path.with_suffix('.tmp')
-            temporary.write_text(json.dumps(profile, ensure_ascii=False, allow_nan=False), encoding='utf-8')
-            temporary.replace(path)
+            current = path.read_text(encoding='utf-8') if path.is_file() else None
+            if current is not None:
+                try:
+                    previous = json.loads(current)
+                except ValueError:
+                    previous = None
+                if previous == profile:
+                    return profile
+                if isinstance(previous, dict) and previous:
+                    self._write_profile_file(path.with_suffix('.bak.json'), current)
+            self._write_profile_file(path, json.dumps(profile, ensure_ascii=False, allow_nan=False))
             return profile
 
-    def start_wake(self, channel):
+    @staticmethod
+    def _write_profile_file(path, contents):
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(contents, encoding='utf-8')
+        temporary.replace(path)
+
+    def start_wake(self, channel, profile=None, *, update=False):
         with self.lock:
             d = self.require()
             if hashlib.sha256(self.dbc_path.read_bytes()).hexdigest() != self.dbc_key:
                 raise ValueError('DBC 文件已改变，请关闭设备并重新加载')
-            profile = self.wake_profile()
+            if profile is None:
+                profile = self.wake_profile()
             for name in profile:
                 self._check_message_owner(d, (channel, name))
-            d.start_wake(channel, profile, background=True)
+            d.start_wake(channel, profile, background=True, update=update)
+
+    def stop_wake(self):
+        with self.lock:
+            self.require().stop_wake()
 
     def _receive(self):
         next_health_check = time.monotonic() + 1.0
@@ -220,8 +240,9 @@ class CanService:
         d = self.device
         if not d: return {'open': False, 'error': self.error, 'tasks': [], 'wake_active': False, 'dbc_path': str(self.dbc_path or '')}
         with d._state_lock:
-            tasks = [{'channel': ch, 'name': name, 'signals': task['data'], 'active': task['func'].is_alive(), 'error': getattr(task['func'], 'error', None)} for (ch, name), task in d.thread_messages.items()]
-        return {'open': True, 'channels': list(d.channels), 'recording': d.custom_log is not None, 'tasks': tasks, 'error': self.error or d.receive_error, 'hardware_periodic': d.hardware_periodic, 'wake_active': d.wake_active, 'dbc_path': str(self.dbc_path or '')}
+            tasks = [{'channel': ch, 'name': name, 'signals': task['data'], 'active': task['func'].is_alive(), 'wake': bool(task.get('wake')), 'error': getattr(task['func'], 'error', None)} for (ch, name), task in d.thread_messages.items()]
+            wake_active = any(task['wake'] and task['active'] for task in tasks)
+        return {'open': True, 'channels': list(d.channels), 'recording': d.custom_log is not None, 'tasks': tasks, 'error': self.error or d.receive_error, 'hardware_periodic': d.hardware_periodic, 'wake_active': wake_active, 'dbc_path': str(self.dbc_path or '')}
 
     def _ui_message(self, device, options):
         if options['dbcKey'] != self.dbc_key:
@@ -443,9 +464,13 @@ def record_stop(request: Request):
 class DbcLoad(BaseModel):
     path: str
 class WakeProfile(BaseModel):
-    profile: dict[str, dict] = Field(default_factory=dict)
+    profile: dict[str, dict]
 class WakeStart(BaseModel):
     channel: int = 0
+    profile: dict[str, dict] | None = None
+class WakeUpdate(BaseModel):
+    channel: int = 0
+    profile: dict[str, dict]
 
 @router.get('/files')
 def browse_files(path: str = ''):
@@ -472,11 +497,15 @@ def save_profile(p: WakeProfile, request: Request):
     return call(service(request).save_wake_profile, p.profile)
 @router.post('/wake/start')
 def start_wake(p: WakeStart, request: Request):
-    call(service(request).start_wake, p.channel)
+    call(service(request).start_wake, p.channel, p.profile)
+    return service(request).status()
+@router.post('/wake/update')
+def update_wake(p: WakeUpdate, request: Request):
+    call(service(request).start_wake, p.channel, p.profile, update=True)
     return service(request).status()
 @router.post('/wake/stop')
 def stop_wake(request: Request):
-    call(call(service(request).require).stop_wake)
+    call(service(request).stop_wake)
     return service(request).status()
 
 

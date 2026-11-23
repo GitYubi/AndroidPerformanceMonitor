@@ -29,6 +29,7 @@ type Config = {
   fps: boolean;
   ignore_crashes: boolean;
   ignore_timeouts: boolean;
+  crash_path?: string | null;
   multi_screen?: MultiScreen | null;
 };
 type Segment = {
@@ -388,6 +389,7 @@ export default function MonkeyTesting() {
       const run = await api<Run>("/monkey/runs", undefined, {
         ...config,
         project_id: projectId,
+        crash_path: config.crash_path?.trim() || null,
         mode: config.multi_screen ? "none" : config.mode,
         packages: config.multi_screen || config.mode === "none" ? [] : packages,
       });
@@ -855,6 +857,16 @@ export default function MonkeyTesting() {
                   应用 ANR 后继续 Monkey
                 </label>
               </div>
+              <label className="block text-xs text-slate-400">
+                Crash 日志路径
+                <input
+                  className={`${control} mt-1`}
+                  maxLength={256}
+                  placeholder="留空默认 /data/system/dropbox"
+                  value={config.crash_path ?? ""}
+                  onChange={event => update("crash_path", event.target.value)}
+                />
+              </label>
             </fieldset>
             <button
               type="button"

@@ -99,7 +99,7 @@ def test_monitor_can_restart_after_stop_times_out_exporting_logs(tmp_path, monke
     async def scenario():
         manager = MonitorManager(tmp_path)
         reached_export = asyncio.Event()
-        request = StartSessionRequest(serial="fixture", anr_path="/data/anr")
+        request = StartSessionRequest(serial="fixture")
 
         async def devices():
             return [SimpleNamespace(serial=request.serial, state="device")]

@@ -76,6 +76,7 @@ class MonkeyRequest(BaseModel):
     fps: bool = False
     ignore_crashes: bool = True
     ignore_timeouts: bool = True
+    crash_path: str | None = Field(default=None, max_length=256)
     multi_screen: screens.MultiScreen | None = None
 
     @field_validator("serial")
@@ -520,7 +521,9 @@ class MonkeyManager:
             if runtime.received_pid:
                 try:
                     logs = await export_device_logs_zip(
-                        runtime.config.serial, self.store.directory(runtime.id) / "device-logs.zip")
+                        runtime.config.serial, self.store.directory(runtime.id) / "device-logs.zip",
+                        crash_path=runtime.config.crash_path,
+                    )
                 except Exception as exc:
                     warnings.append(f"设备日志导出异常：{exc}")
             run = self.store.get(runtime.id)

@@ -222,16 +222,30 @@ function WorkspaceNav() {
 }
 
 function Router() {
+  const [location] = useLocation();
+  const uiVisible = location === "/ui" || location === "/ui/";
+  const [visitedUi, setVisitedUi] = useState(uiVisible);
+  useEffect(() => {
+    if (uiVisible) setVisitedUi(true);
+  }, [uiVisible]);
+
   return (
-    <Switch>
-      <Route path={"/"} component={Home} />
-      <Route path={"/ui"} component={UITesting} />
-      <Route path={"/monkey"} component={MonkeyTesting} />
-      <Route path={"/can"} component={CanBus} />
-      <Route path={"/404"} component={NotFound} />
-      {/* Final fallback route */}
-      <Route component={NotFound} />
-    </Switch>
+    <>
+      {(uiVisible || visitedUi) && (
+        <div hidden={!uiVisible}>
+          <UITesting visible={uiVisible} />
+        </div>
+      )}
+      {!uiVisible && (
+        <Switch>
+          <Route path={"/"} component={Home} />
+          <Route path={"/monkey"} component={MonkeyTesting} />
+          <Route path={"/can"} component={CanBus} />
+          <Route path={"/404"} component={NotFound} />
+          <Route component={NotFound} />
+        </Switch>
+      )}
+    </>
   );
 }
 

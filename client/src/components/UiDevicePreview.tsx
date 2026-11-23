@@ -9,7 +9,10 @@ import { Button } from "@/components/ui/button";
 import { Copy } from "lucide-react";
 import { toast } from "sonner";
 import ScrcpyScreen, { type ScrcpyHandle } from "@/components/ScrcpyScreen";
+import { UiBaselineDialog } from "@/components/UiBaselineDialog";
 import { BACKEND_URL } from "@/lib/backend";
+import type { UiBaseline, UiImage, UiProject } from "@/lib/uiImages";
+import { useImageRegion } from "@/lib/useImageRegion";
 import {
   boundsStyle,
   candidateLabel,
@@ -34,6 +37,8 @@ type Props = {
   target: string;
   onTargetChange: (id: string) => void;
   onApply: (selector: Selector) => void;
+  project: UiProject;
+  onImageSaved: (projectId: string, image: UiImage) => void;
 };
 
 async function readDevice<T>(
@@ -44,7 +49,10 @@ async function readDevice<T>(
   const response = await fetch(`${BACKEND_URL}/api/ui/map/${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ serial, ...(path === "observe" ? { inspectWindows: true } : {}) }),
+    body: JSON.stringify({
+      serial,
+      ...(path === "observe" ? { inspectWindows: true } : {}),
+    }),
     signal,
   });
   const result = await response.json();
@@ -72,9 +80,11 @@ function selectorFor(node: MapNode, observation: Observation): Selector {
   );
   if (node.resourceId && sameIdentity.length === 1) return selector;
   const label = node.text || node.description || node.label;
-  const needsPath = (!node.resourceId && !label) ||
+  const needsPath =
+    (!node.resourceId && !label) ||
     sameIdentity.filter(
-      other => !label || [other.text, other.description, other.label].includes(label)
+      other =>
+        !label || [other.text, other.description, other.label].includes(label)
     ).length > 1;
   return {
     ...selector,
@@ -137,7 +147,17 @@ function PixelMarker({
 
 export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
   function UiDevicePreview(
-    { serial, disabled, running, targets, target, onTargetChange, onApply },
+    {
+      serial,
+      disabled,
+      running,
+      targets,
+      target,
+      onTargetChange,
+      onApply,
+      project,
+      onImageSaved,
+    },
     ref
   ) {
     const [live, setLive] = useState(false);
@@ -149,6 +169,14 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
     const [clickedPoint, setClickedPoint] = useState<Pixel | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
+    const [selectingRegion, setSelectingRegion] = useState(false);
+    const [baseline, setBaseline] = useState<UiBaseline | null>(null);
+    const canSaveImage =
+      Boolean(frame) && !live && !loading && !disabled && !running;
+    const { region, startRegion, drawRegion, cancelRegion } = useImageRegion(
+      frame,
+      canSaveImage && selectingRegion
+    );
     const scrcpy = useRef<ScrcpyHandle>(null);
     const pending = useRef<Promise<void> | null>(null);
     const request = useRef<AbortController>(null);
@@ -170,6 +198,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
       const controller = new AbortController();
       request.current = controller;
       setLoading(true);
+      setSelectingRegion(false);
       setHovered([]);
       setError("");
       pending.current = (async () => {
@@ -206,7 +235,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
     useEffect(() => () => request.current?.abort(), []);
 
     function pick(event: React.MouseEvent<HTMLImageElement>) {
-      if (!frame || loading) return;
+      if (!frame || loading || selectingRegion) return;
       const point = screenPixel(
         frame,
         event.currentTarget.getBoundingClientRect(),
@@ -242,6 +271,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
                 return;
               }
               setError("");
+              setSelectingRegion(false);
               setLive(true);
             }}
           >
@@ -266,6 +296,66 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
             刷新截图
           </Button>
         </div>
+        {frame && !live && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Button
+              type="button"
+              variant={selectingRegion ? "secondary" : "outline"}
+              size="sm"
+              disabled={!canSaveImage}
+              onClick={() => {
+                setHovered([]);
+                setSelectingRegion(value => !value);
+              }}
+            >
+              {selectingRegion ? "退出框选" : "框选基准图"}
+            </Button>
+            {selectingRegion ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={!canSaveImage || !region}
+                  onClick={() =>
+                    region &&
+                    setBaseline({ image: frame.image, region, source: "roi" })
+                  }
+                >
+                  保存框选基准图
+                </Button>
+                <span className="text-xs text-muted-foreground">
+                  {region
+                    ? `${region[2] - region[0]} × ${region[3] - region[1]} px`
+                    : "在画面上拖动选择区域"}
+                </span>
+              </>
+            ) : (
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                disabled={!canSaveImage || !bounds || !node}
+                onClick={() => {
+                  if (!node || !bounds) return;
+                  const [left, top, right, bottom] = bounds;
+                  setBaseline({
+                    image: frame.image,
+                    region: [left, top, right, bottom],
+                    source: "element",
+                    name: (
+                      node.label ||
+                      node.resourceId ||
+                      node.className
+                    ).slice(0, 120),
+                  });
+                }}
+              >
+                保存元素基准图
+              </Button>
+            )}
+          </div>
+        )}
         {live && serial ? (
           <ScrcpyScreen
             ref={scrcpy}
@@ -280,26 +370,54 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
               alt="当前车机画面"
               draggable={false}
               className="block h-auto max-h-[50dvh] w-auto max-w-full cursor-crosshair"
+              style={selectingRegion ? { touchAction: "none" } : undefined}
               onClick={pick}
               onPointerLeave={() => setHovered([])}
-              onPointerMove={event =>
-                setHovered(observation && !loading ? pointCandidates(observation, event) : [])
-              }
+              onPointerDown={startRegion}
+              onPointerUp={drawRegion}
+              onPointerCancel={cancelRegion}
+              onPointerMove={event => {
+                if (selectingRegion) drawRegion(event);
+                else
+                  setHovered(
+                    observation && !loading
+                      ? pointCandidates(observation, event)
+                      : []
+                  );
+              }}
             />
-            {hovered.map(item => item.bounds && (
-              <span key={item.index} aria-hidden="true"
-                className="pointer-events-none absolute border border-dashed border-cyan-400/70"
-                style={boundsStyle(frame, item.bounds)} />
-            ))}
-            {bounds && (
+            {selectingRegion && region && (
+              <span
+                aria-hidden="true"
+                className="pointer-events-none absolute border-2 border-cyan-400 bg-cyan-400/15"
+                style={boundsStyle(frame, region)}
+              />
+            )}
+            {!selectingRegion &&
+              hovered.map(
+                item =>
+                  item.bounds && (
+                    <span
+                      key={item.index}
+                      aria-hidden="true"
+                      className="pointer-events-none absolute border border-dashed border-cyan-400/70"
+                      style={boundsStyle(frame, item.bounds)}
+                    />
+                  )
+              )}
+            {!selectingRegion && bounds && (
               <span
                 aria-hidden="true"
                 className="pointer-events-none absolute border-2 border-cyan-400"
                 style={boundsStyle(frame, bounds)}
               />
             )}
-            {center && <PixelMarker point={center} frame={frame} center />}
-            {clickedPoint && <PixelMarker point={clickedPoint} frame={frame} />}
+            {!selectingRegion && center && (
+              <PixelMarker point={center} frame={frame} center />
+            )}
+            {!selectingRegion && clickedPoint && (
+              <PixelMarker point={clickedPoint} frame={frame} />
+            )}
           </div>
         ) : (
           <div className="grid min-h-56 place-items-center rounded-md border border-dashed border-border px-4 text-center text-sm text-muted-foreground">
@@ -315,7 +433,7 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
             {error}
           </p>
         )}
-        {!live && clickedPoint && (
+        {!live && !selectingRegion && clickedPoint && (
           <div className="flex flex-wrap items-center gap-x-4 gap-y-1 rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-xs">
             <span className="inline-flex items-center gap-1.5 text-muted-foreground">
               <span
@@ -337,9 +455,13 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
             )}
           </div>
         )}
-        {!live && observation && (
+        {!live && !selectingRegion && observation && (
           <div className="space-y-2 text-xs">
-            {observation.treeSource && <p className="text-muted-foreground">{treeSourceLabel[observation.treeSource]}</p>}
+            {observation.treeSource && (
+              <p className="text-muted-foreground">
+                {treeSourceLabel[observation.treeSource]}
+              </p>
+            )}
             {!node && observation.nodes.length > 0 && (
               <p className="text-muted-foreground">点击画面中的元素进行选择</p>
             )}
@@ -405,6 +527,14 @@ export const UiDevicePreview = forwardRef<UiDevicePreviewHandle, Props>(
               </>
             )}
           </div>
+        )}
+        {baseline && (
+          <UiBaselineDialog
+            draft={baseline}
+            project={project}
+            onClose={() => setBaseline(null)}
+            onSaved={onImageSaved}
+          />
         )}
       </section>
     );

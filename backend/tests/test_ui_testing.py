@@ -249,8 +249,8 @@ def test_log_export_preserves_device_files_when_ui_overlaps(monkeypatch, tmp_pat
 
     async def adb(*args, **kwargs):
         commands.append(args)
-        assert args[:2] == ('pull', '/data/anr')
-        destination = Path(args[2])
+        assert args[0] == 'pull' and args[1] in {'/data/anr', '/data/system/dropbox'}
+        destination = Path(kwargs.get('cwd', '')) / args[2]
         destination.mkdir()
         (destination / 'trace.txt').write_text('fixture trace')
         return ''
@@ -259,6 +259,8 @@ def test_log_export_preserves_device_files_when_ui_overlaps(monkeypatch, tmp_pat
     results = asyncio.run(export_and_clean_device_logs('test', DeviceLogConfig(anr='/data/anr'), tmp_path, lambda *args: None, preserve=True))
     assert results['ANR']['exported'] == 1
     assert results['ANR']['cleaned'] is False
+    assert results['Crash']['exported'] == 1
+    assert results['Crash']['cleaned'] is False
     assert not any('rm' in command for command in commands)
 
 

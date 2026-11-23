@@ -242,8 +242,12 @@ def test_extract_foreground_package_none() -> None:
 def test_device_log_config_enabled_pairs() -> None:
     config = DeviceLogConfig(anr="/data/anr", tombstone="/data/tombstones")
     pairs = config.enabled_pairs()
-    assert pairs == [(LOG_KIND_ANR, "/data/anr"), (LOG_KIND_TOMBSTONE, "/data/tombstones")]
-    assert DeviceLogConfig().enabled_pairs() == []
+    assert pairs == [
+        (LOG_KIND_ANR, "/data/anr"), (LOG_KIND_CRASH, "/data/system/dropbox"),
+        (LOG_KIND_TOMBSTONE, "/data/tombstones"),
+    ]
+    for blank in (None, "", "  "):
+        assert DeviceLogConfig(crash=blank).enabled_pairs() == [(LOG_KIND_CRASH, "/data/system/dropbox")]
     assert DeviceLogConfig(crash="/data/crash").enabled_pairs() == [(LOG_KIND_CRASH, "/data/crash")]
 
 

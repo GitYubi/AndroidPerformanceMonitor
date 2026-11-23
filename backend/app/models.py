@@ -31,7 +31,7 @@ class StartSessionRequest(BaseModel):
     surface_layer: str | None = Field(default=None, max_length=256)
     # 旧客户端可显式按 CPU 周期指定轻量内存采样间隔。
     memory_cycle_skip: int | None = Field(default=None, ge=1, le=60)
-    # 设备日志导出：留空表示不导出该类型（仅前端提示）
+    # Crash 留空使用默认目录，ANR 和 Tombstone 留空不导出。
     anr_path: str | None = Field(default=None, max_length=256)
     crash_path: str | None = Field(default=None, max_length=256)
     tombstone_path: str | None = Field(default=None, max_length=256)
@@ -54,9 +54,6 @@ class StartSessionRequest(BaseModel):
     @property
     def memory_interval_ms(self) -> int:
         return 10_000 if self.memory_cycle_skip is None else self.interval_ms * self.memory_cycle_skip
-
-    def log_export_enabled(self) -> bool:
-        return any((self.anr_path, self.crash_path, self.tombstone_path))
 
 
 @dataclass(slots=True)

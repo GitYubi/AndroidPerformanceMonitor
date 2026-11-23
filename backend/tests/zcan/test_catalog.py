@@ -1,9 +1,13 @@
 import os
+import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
-from app.can_service import CanService, browse_files, ROOT
+from fastapi import HTTPException
+from app.can_service import CanService, WakeProfile, WakeStart, WakeUpdate, browse_files, save_profile, start_wake, stop_wake, update_wake, ROOT
 
 class CatalogTests(unittest.TestCase):
     def setUp(self):
@@ -34,6 +38,85 @@ class CatalogTests(unittest.TestCase):
         self.s.send_msg_by_name(0,'TestButtons',{'PressA':0},cycle_time=50)
         self.s.require().stop_wake()
         self.assertTrue(self.s.status()['tasks'][0]['active'])
+
+    def test_empty_wake_profile_cannot_overwrite_saved_configuration(self):
+        self.s.load_dbc(str(self.path))
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(can=self.s)))
+        initial = {'TestButtons': {'PressA': 1}}
+        updated = {'TestButtons': {'PressA': 0, 'PressB': 1}}
+        save_profile(WakeProfile(profile=initial), request)
+        save_profile(WakeProfile(profile=updated), request)
+        save_profile(WakeProfile(profile=updated), request)
+        with self.assertRaises(HTTPException) as error:
+            save_profile(WakeProfile(profile={}), request)
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertEqual(self.s.wake_profile(), updated)
+        self.assertEqual(json.loads(self.s.profile_path().with_suffix('.bak.json').read_text()), initial)
+
+    def test_wake_restart_uses_submitted_draft_without_overwriting_saved_profile(self):
+        # Consume simulated TX echoes directly so the service receiver cannot race the test.
+        with patch.object(self.s, '_receive'):
+            self.s.open('simulation', str(self.path), [0])
+        device = self.s.require()
+        message = device.db.get_message_by_name('TestSpeed')
+        saved = {'TestSpeed': {'DisplaySpeed': 20}, 'TestButtons': {'PressA': {'raw': 1}}}
+        self.s.save_wake_profile(saved)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(can=self.s)))
+
+        def expect_transmitted_speed(expected):
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                payloads = [bytes(f['data']) for f in device.get_receive_data()
+                            if f['arbitration_id'] == 453 and not f['is_rx']]
+                if payloads:
+                    self.assertTrue(all(message.decode(payload, decode_choices=False)['DisplaySpeed'] == expected
+                                        for payload in payloads))
+                    return
+                time.sleep(.01)
+            self.fail('No simulated TestSpeed transmission')
+
+        self.assertTrue(start_wake(WakeStart(channel=0), request)['wake_active'])
+        expect_transmitted_speed(20)
+        self.assertFalse(stop_wake(request)['wake_active'])
+        device.get_receive_data()  # Discard any echoes queued before the stop.
+        draft = {**saved, 'TestSpeed': {'DisplaySpeed': 10}, 'TestClassicA': {'Value': 7}}
+        status = start_wake(WakeStart(channel=0, profile=draft), request)
+        self.assertTrue(status['wake_active'])
+        expect_transmitted_speed(10)
+        self.assertEqual(next(t for t in status['tasks'] if t['name'] == 'TestButtons')['signals']['PressA'], 1)
+        self.assertTrue(next(t for t in status['tasks'] if t['name'] == 'TestClassicA')['wake'])
+        self.assertEqual(self.s.wake_profile(), saved)
+
+    def test_live_wake_update_validates_before_adding_new_tasks_and_cannot_restart_stopped_wake(self):
+        self.s.open('simulation', str(self.path), [0])
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(can=self.s)))
+        initial = {'TestButtons': {'PressA': 1}}
+        start_wake(WakeStart(profile=initial), request)
+        with self.assertRaises(HTTPException):
+            update_wake(WakeUpdate(profile={**initial, 'TestSpeed': {'DisplaySpeed': 350}}), request)
+        self.assertEqual([task['name'] for task in self.s.status()['tasks']], ['TestButtons'])
+        status = update_wake(WakeUpdate(profile={**initial, 'TestSpeed': {'DisplaySpeed': 10}}), request)
+        self.assertEqual({task['name'] for task in status['tasks'] if task['wake']}, {'TestButtons', 'TestSpeed'})
+        stop_wake(request)
+        with self.assertRaises(HTTPException):
+            update_wake(WakeUpdate(profile=initial), request)
+        self.assertEqual(self.s.status()['tasks'], [])
+
+    def test_invalid_or_empty_draft_does_not_start_the_saved_profile_or_partial_tasks(self):
+        self.s.open('simulation', str(self.path), [0])
+        saved = {'TestButtons': {'PressA': 1}}
+        self.s.save_wake_profile(saved)
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(can=self.s)))
+        for draft in ({}, {'TestButtons': {'PressA': 0}, 'TestSpeed': {'DisplaySpeed': 350}}):
+            with self.subTest(draft=draft):
+                with self.assertRaises(HTTPException) as error:
+                    start_wake(WakeStart(profile=draft), request)
+                self.assertEqual(error.exception.status_code, 400)
+                status = self.s.status()
+                self.assertFalse(status['wake_active'])
+                self.assertEqual(status['tasks'], [])
+                self.assertEqual(self.s.wake_profile(), saved)
+
     def test_catalog_cannot_change_while_connected(self):
         self.s.open('simulation',str(self.path),[0])
         with self.assertRaises(ValueError): self.s.load_dbc(str(self.path))
@@ -44,9 +127,8 @@ class CatalogTests(unittest.TestCase):
         with self.assertRaises(ValueError): self.s.start_wake(0)
 
     def test_import_original_qsettings_ini_and_wrong_dbc(self):
-        import io, json
-        from types import SimpleNamespace
-        from fastapi import UploadFile, HTTPException
+        import io
+        from fastapi import UploadFile
         from app.can_service import import_wake_profile
         self.s.load_dbc(str(self.path))
         profile={'TestButtons':{'PressA':1}}

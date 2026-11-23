@@ -2,7 +2,7 @@
 
 - 导出位置：默认项目根目录/DevicesLogs/<结束时间>/ANR|Crash|Tombstone/
   结束时间格式 yyyy_MM_DD-hh_mm_ss；可通过 log_export_root 覆盖根目录。
-- 只处理用户配置了路径的类型；路径为空则不动作（前端提示）。
+- Crash 留空使用默认目录；ANR 和 Tombstone 在独立性能监控中留空不导出。
 - 仅清理已保存且仍匹配的源文件；无法核验时保留原件。
 - 路径不可读/不存在/无文件均只写会话事件，不中断其他类型的导出。
 """
@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 from tempfile import TemporaryDirectory
 import time
 from dataclasses import dataclass
@@ -27,14 +28,15 @@ from .adb import AdbError, run_adb
 LOG_KIND_ANR = "ANR"
 LOG_KIND_CRASH = "Crash"
 LOG_KIND_TOMBSTONE = "Tombstone"
+DEFAULT_CRASH_PATH = "/data/system/dropbox"
 DEFAULT_LOG_DIRECTORIES = (
     (LOG_KIND_ANR, "/data/anr"),
-    (LOG_KIND_CRASH, "/data/dropbox"),
+    (LOG_KIND_CRASH, DEFAULT_CRASH_PATH),
     (LOG_KIND_TOMBSTONE, "/data/tombstones"),
 )
-DROPBOX_ALTERNATE = "/data/system/dropbox"
-STANDARD_DIRECTORIES = {path for _, path in DEFAULT_LOG_DIRECTORIES} | {DROPBOX_ALTERNATE}
+STANDARD_DIRECTORIES = {path for _, path in DEFAULT_LOG_DIRECTORIES} | {"/data/dropbox"}
 DIRECT_PULL_TIMEOUT_SECONDS = 45
+_WINDOWS = os.name == "nt"
 
 # 设备端路径只允许常规路径字符，避免 adb shell 拼接出注入。
 _DEVICE_PATH_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
@@ -70,6 +72,10 @@ printf "%s\\n" "$removed"
 EventSink = Callable[[str, str, str], None]
 
 
+def _crash_source(path: str | None) -> str:
+    return (path or "").strip() or DEFAULT_CRASH_PATH
+
+
 @dataclass(slots=True)
 class DeviceLogConfig:
     anr: str | None = None
@@ -81,8 +87,7 @@ class DeviceLogConfig:
         pairs: list[tuple[str, str]] = []
         if self.anr:
             pairs.append((LOG_KIND_ANR, self.anr))
-        if self.crash:
-            pairs.append((LOG_KIND_CRASH, self.crash))
+        pairs.append((LOG_KIND_CRASH, _crash_source(self.crash)))
         if self.tombstone:
             pairs.append((LOG_KIND_TOMBSTONE, self.tombstone))
         return pairs
@@ -99,6 +104,28 @@ def _local_log_files(directory: Path) -> Iterator[Path]:
     return (path for path in directory.rglob("*") if not path.is_symlink() and path.is_file())
 
 
+async def _pull_to_staging(serial: str, source: str, local: Path, timeout_seconds: float) -> None:
+    if not _WINDOWS:
+        await run_adb("pull", source, str(local), serial=serial, timeout_seconds=timeout_seconds)
+        return
+
+    # Keep the installation path out of Windows ADB's local path handling.
+    # Only the parent should exist so ADB does not append the remote basename.
+    with TemporaryDirectory(prefix="acpm-") as temporary:
+        await run_adb("pull", source, local.name, serial=serial, timeout_seconds=timeout_seconds, cwd=temporary)
+        pulled = Path(temporary) / local.name
+        if not pulled.exists():
+            return  # ADB can succeed without creating a destination for an empty directory.
+        # The system temporary directory and the report directory can be on different drives.
+        move = asyncio.create_task(asyncio.to_thread(shutil.move, pulled, local))
+        try:
+            await asyncio.shield(move)
+        except asyncio.CancelledError:
+            # Do not remove either staging directory while a cross-drive copy is running.
+            await asyncio.gather(move, return_exceptions=True)
+            raise
+
+
 async def pull_device_log_directory(serial: str, source: str, target_dir: Path) -> dict[str, object]:
     """Copy one log directory via ADB sync without running a device shell or deleting source logs."""
     if not _DEVICE_PATH_RE.fullmatch(source):
@@ -109,7 +136,7 @@ async def pull_device_log_directory(serial: str, source: str, target_dir: Path) 
         target_dir.parent.mkdir(parents=True, exist_ok=True)
         with TemporaryDirectory(prefix=".log-pull-", dir=target_dir.parent) as temporary:
             local = Path(temporary) / "logs"
-            await run_adb("pull", source, str(local), serial=serial, timeout_seconds=DIRECT_PULL_TIMEOUT_SECONDS)
+            await _pull_to_staging(serial, source, local, DIRECT_PULL_TIMEOUT_SECONDS)
             if not local.is_dir():
                 raise OSError("设备路径不是日志目录")
             count = sum(1 for _ in _local_log_files(local))
@@ -135,26 +162,17 @@ async def _snapshot_files(serial: str, source: str) -> dict[str, str]:
             if file.startswith(source + "/") and "\ufffd" not in file and identity}
 
 
-async def _pull_log_kind(
-    serial: str, kind: str, source: str, target_dir: Path, *, preserve: bool,
+async def _pull_log_directory(
+    serial: str, source: str, target_dir: Path, *, preserve: bool,
 ) -> tuple[dict[str, object], dict[str, str]]:
-    async def pull(directory: str):
-        snapshot = {} if preserve else await _snapshot_files(serial, directory)
-        result = await pull_device_log_directory(serial, directory, target_dir)
-        return result, snapshot
-
-    active_source = source
+    if not _DEVICE_PATH_RE.fullmatch(source):
+        return {"source": source, "status": "invalid_path", "detail": "设备路径包含非法字符"}, {}
     try:
         async with asyncio.timeout(DIRECT_PULL_TIMEOUT_SECONDS):
-            result, snapshot = await pull(source)
-            if kind == LOG_KIND_CRASH and source == "/data/dropbox" and result["status"] == "error":
-                active_source = DROPBOX_ALTERNATE
-                alternate, alternate_snapshot = await pull(active_source)
-                if alternate["status"] in {"exported", "empty"}:
-                    return {**alternate, "source": active_source}, alternate_snapshot
-                result["detail"] = f"{result.get('detail', '')}；备选路径 {active_source}：{alternate.get('detail', '')}"
+            snapshot = {} if preserve else await _snapshot_files(serial, source)
+            result = await pull_device_log_directory(serial, source, target_dir)
     except TimeoutError:
-        return {"source": active_source, "status": "error", "detail": "拉取设备日志超时"}, {}
+        return {"source": source, "status": "error", "detail": "拉取设备日志超时"}, {}
     return {**result, "source": source}, snapshot
 
 
@@ -196,7 +214,7 @@ async def _export_directory(
     serial: str, kind: str, source: str, target_dir: Path, on_event: EventSink,
     *, preserve: bool = True,
 ) -> dict[str, object]:
-    result, snapshot = await _pull_log_kind(serial, kind, source, target_dir, preserve=preserve)
+    result, snapshot = await _pull_log_directory(serial, source, target_dir, preserve=preserve)
     code = f"log_export_{kind.lower()}"
     if result["status"] == "exported":
         cleanup = "车机原始日志已保留。"
@@ -242,14 +260,18 @@ def _zip_cleanup_payloads(destination: Path, results, snapshots) -> dict[str, by
 
 
 async def export_device_logs_zip(
-    serial: str, destination: Path, *, preserve: bool = False,
+    serial: str, destination: Path, *, preserve: bool = False, crash_path: str | None = None,
 ) -> dict[str, dict[str, object]]:
     with TemporaryDirectory(prefix=".device-logs-", dir=destination.parent) as temporary:
         staging = Path(temporary)
         results = {}
         snapshots = {}
         for kind, source in DEFAULT_LOG_DIRECTORIES:
-            pulled, snapshot = await _pull_log_kind(serial, kind, source, staging / kind, preserve=preserve)
+            if kind == LOG_KIND_CRASH:
+                source = _crash_source(crash_path).rstrip("/")
+                if source and not source.startswith("/"):
+                    source = f"./{source}"
+            pulled, snapshot = await _pull_log_directory(serial, source, staging / kind, preserve=preserve)
             results[kind] = {key: pulled[key] for key in ("source", "status", "exported", "detail") if key in pulled}
             if not preserve and pulled["status"] == "exported":
                 snapshots[kind] = snapshot
@@ -272,8 +294,6 @@ async def export_and_clean_device_logs(
     """执行全部已配置类型的日志导出与清理，返回各类型结果摘要。"""
     results: dict[str, object] = {}
     pairs = config.enabled_pairs()
-    if not pairs:
-        return results
 
     export_root = Path(config.export_root).expanduser() if config.export_root else project_root / "DevicesLogs"
     folder_name = time.strftime("%Y_%m_%d-%H_%M_%S")
@@ -331,7 +351,7 @@ async def export_and_clean_device_logs(
             try:
                 with TemporaryDirectory(prefix=".pull-", dir=target_dir) as temporary:
                     local = Path(temporary) / "log"
-                    await run_adb("pull", source, str(local), serial=serial, timeout_seconds=120)
+                    await _pull_to_staging(serial, source, local, 120)
                     digest = ""
                     if identity:
                         with local.open("rb") as copy:

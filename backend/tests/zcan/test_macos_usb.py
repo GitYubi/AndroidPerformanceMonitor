@@ -70,6 +70,42 @@ class MacUsbWireTests(unittest.TestCase):
             finally:
                 device.close()
 
+    def test_wake_update_programs_new_slot_without_rewriting_unchanged_or_manual_tasks(self):
+        backend = self.periodic_backend()
+        backend.periodic_slots = 3
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"ZCAN_DATA_DIR": directory}), \
+                patch("zlg.zlgcan.open_backend", return_value=backend):
+            device = zlgCan(0, str(ROOT / "config" / "Example.dbc"), hardware_periodic=True)
+            try:
+                device.chn_open(0)
+                initial = {"TestButtons": {"PressA": 1}, "TestClassicA": {"Value": 7}}
+                device.start_wake(0, initial)
+                device.single_send(0, "TestClassicA", {"Value": 9}, can_fd=False, cycle_time=50)
+                backend._command.reset_mock()
+
+                draft = {**initial, "TestSpeed": {"DisplaySpeed": 10}}
+                device.start_wake(0, draft, update=True)
+                commands = [entry.args for entry in backend._command.call_args_list if entry.args[0] == 0x16]
+                self.assertEqual(len(commands), 1)
+                _, _, packet = commands[0]
+                self.assertEqual(unpack_from("<IHBB", packet), (200, 0, 2, 1))
+                self.assertEqual(unpack_from("<I", packet, 12)[0], 0x1C5)
+                self.assertEqual(packet[24:32], bytes.fromhex("64 00 00 00 00 00 00 00"))
+
+                backend._command.reset_mock()
+                draft["TestButtons"] = {"PressA": 0, "PressB": 1}
+                with self.assertRaisesRegex(RuntimeError, "定时任务已满"):
+                    device.start_wake(0, {**draft, "TestClassicB": {"Value": 1}}, update=True)
+                backend._command.assert_not_called()
+                self.assertEqual(device.periodic_payload("TestButtons")[0], 1)
+                device.start_wake(0, draft, update=True)
+                self.assertEqual(device.periodic_payload("TestButtons")[0], 2)
+                device.stop_wake()
+                self.assertIsNone(device.periodic_payload("TestSpeed"))
+                self.assertEqual(device.periodic_payload("TestClassicA")[0], 9)
+            finally:
+                device.close()
+
     def test_uncertain_hardware_reply_stops_channel_and_drops_tasks(self):
         backend = self.periodic_backend()
         dbc = ROOT / "config" / "Example.dbc"

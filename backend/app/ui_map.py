@@ -307,6 +307,7 @@ class Device:
 
 class MapStore:
     def __init__(self, root: Path):
+        self.session_id = uid()
         root.mkdir(parents=True, exist_ok=True)
         self.db = root / 'maps.db'
         with self.connect() as c:
@@ -521,6 +522,11 @@ def get_node(obs, index):
 @router.post('/graph')
 async def graph(value: Serial, request: Request):
     return store(request).graph(value.serial)
+
+
+@router.get('/session')
+async def map_session(request: Request):
+    return {'id': store(request).session_id}
 
 
 @router.post('/observe')

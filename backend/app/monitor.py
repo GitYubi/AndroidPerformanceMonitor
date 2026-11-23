@@ -79,6 +79,7 @@ class RuntimeSession:
     cpu_proc_supported: bool | None = None
     preserve_device_logs: bool = False
     inflight: set[asyncio.Task] = field(default_factory=set)
+    export_device_logs: bool = True
 
 
 # 前台包名刷新周期（0.5s 间隔下 ≈ 2s 检测一次应用切换）
@@ -110,9 +111,9 @@ class MonitorManager:
         async with self.start_lock:
             if self.reserved_by and owner != self.reserved_by:
                 raise ValueError("性能采样由 Monkey 管理，请在 Monkey 页面停止任务")
-            return await self._start(request)
+            return await self._start(request, export_device_logs=self.reserved_by is None)
 
-    async def _start(self, request: StartSessionRequest) -> str:
+    async def _start(self, request: StartSessionRequest, *, export_device_logs: bool) -> str:
         if self.active:
             raise ValueError("已有测试会话运行中；请先停止当前会话")
         devices = await list_devices()
@@ -149,6 +150,7 @@ class MonitorManager:
             writer=writer,
             selected_surface_layer=request.surface_layer,
             sdk_version=sdk_version,
+            export_device_logs=export_device_logs,
         )
         if sdk_version is None:
             writer.add_event("warning", "sdk_probe_failed", "无法读取设备 SDK 版本；帧率数据源将按未知版本探测并降级。")
@@ -216,7 +218,7 @@ class MonitorManager:
                 for task in pending:
                     task.cancel()
                 await asyncio.gather(*pending, return_exceptions=True)
-                if runtime.request.log_export_enabled():
+                if runtime.export_device_logs:
                     try:
                         await self._export_device_logs(runtime)
                     except asyncio.CancelledError:

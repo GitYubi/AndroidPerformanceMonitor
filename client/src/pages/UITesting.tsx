@@ -202,10 +202,15 @@ async function api<T>(path: string, body?: unknown): Promise<T> {
   return data;
 }
 
-export default function UITesting() {
+export default function UITesting({ visible }: { visible: boolean }) {
   const [search] = useSearchParams();
   const [, navigate] = useLocation();
   const section = getUiSection(search);
+  const mapVisible = visible && section === "structure";
+  const [visitedMap, setVisitedMap] = useState(mapVisible);
+  useEffect(() => {
+    if (mapVisible) setVisitedMap(true);
+  }, [mapVisible]);
   const [devices, setDevices] = useState<
     { serial: string; state: string; model?: string }[]
   >([]);
@@ -223,6 +228,7 @@ export default function UITesting() {
     id: string;
     items: UiImage[];
   } | null>(null);
+  const [imageRevision, setImageRevision] = useState(0);
   const caseProjectId = draft.projectId ?? defaultProject.id;
   const catalogId = section === "execute" ? caseProjectId : projectId;
   const images = catalog?.id === catalogId ? catalog.items : [];
@@ -255,7 +261,7 @@ export default function UITesting() {
 
   useLayoutEffect(() => {
     const list = stepList.current;
-    if (!dragged || !list) return;
+    if (!visible || section !== "execute" || !dragged || !list) return;
     let frame = 0;
     let point: { x: number; y: number } | null = null;
     function scroll() {
@@ -300,10 +306,12 @@ export default function UITesting() {
       document.removeEventListener("dragover", track, true);
       document.removeEventListener("dragleave", leave, true);
     };
-  }, [dragged, section]);
+  }, [dragged, section, visible]);
 
   const editCanSteps =
-    section === "execute" && draft.steps.some(step => isCanStep(step.type));
+    visible &&
+    section === "execute" &&
+    draft.steps.some(step => isCanStep(step.type));
   useEffect(() => {
     let disposed = false;
     api<UiProject[]>("/ui/projects")
@@ -325,9 +333,8 @@ export default function UITesting() {
     };
   }, []);
   useEffect(() => {
-    if (section !== "images" && section !== "execute") return;
+    if (!visible || (section !== "images" && section !== "execute")) return;
     let disposed = false;
-    setCatalog(null);
     api<UiImage[]>(uiImagesPath(catalogId))
       .then(items => {
         if (!disposed) setCatalog({ id: catalogId, items });
@@ -341,7 +348,7 @@ export default function UITesting() {
     return () => {
       disposed = true;
     };
-  }, [catalogId, section]);
+  }, [catalogId, section, visible, imageRevision]);
   useEffect(() => {
     if (!editCanSteps) return;
     let disposed = false;
@@ -387,11 +394,13 @@ export default function UITesting() {
     }
   }, []);
   useEffect(() => {
+    if (!visible) return;
     void refresh();
     const timer = window.setInterval(refresh, 3000);
     return () => clearInterval(timer);
-  }, [refresh]);
+  }, [refresh, visible]);
   useEffect(() => {
+    if (!visible) return;
     if (!runId) {
       setRun(null);
       setEvents([]);
@@ -432,7 +441,7 @@ export default function UITesting() {
       disposed = true;
       clearInterval(timer);
     };
-  }, [runId]);
+  }, [runId, visible]);
 
   async function perform(fn: () => Promise<void>) {
     setBusy(true);
@@ -964,12 +973,15 @@ export default function UITesting() {
           onDelete={deleteProject}
         />
       )}
-      {section === "structure" && (
-        <PageMapWorkbench
-          projects={projects}
-          projectId={projectId}
-          onProjectChange={setProjectId}
-        />
+      {(mapVisible || visitedMap) && (
+        <div hidden={!mapVisible}>
+          <PageMapWorkbench
+            visible={mapVisible}
+            projects={projects}
+            projectId={projectId}
+            onProjectChange={setProjectId}
+          />
+        </div>
       )}
       {section === "images" && (
         <UiImageLibrary
@@ -990,7 +1002,7 @@ export default function UITesting() {
           }
         />
       )}
-      {section === "execute" && (
+      {visible && section === "execute" && (
         <div className="grid gap-4 xl:grid-cols-[minmax(0,1.3fr)_minmax(300px,0.7fr)]">
           <section className="@container min-w-0 space-y-2.5">
             <div className="flex flex-wrap gap-1.5">
@@ -1586,6 +1598,21 @@ export default function UITesting() {
                 target={pickTarget}
                 onTargetChange={setPickStepId}
                 onApply={applyElement}
+                project={projects.find(project => project.id === caseProjectId) ?? {
+                  id: caseProjectId,
+                  name: "当前用例项目",
+                }}
+                onImageSaved={(id, image) => {
+                  if (id === caseProjectId) {
+                    setCatalog(current => ({
+                      id,
+                      items: [image, ...(current?.id === id
+                        ? current.items.filter(item => item.id !== image.id)
+                        : [])],
+                    }));
+                    setImageRevision(previous => previous + 1);
+                  }
+                }}
               />
             ) : (
               <>
@@ -1995,7 +2022,7 @@ export default function UITesting() {
         </section>
       )}
 
-      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+      <Dialog open={visible && settingsOpen} onOpenChange={setSettingsOpen}>
         <DialogContent className="max-h-[90vh] overflow-y-auto">
           <DialogHeader>
             <DialogTitle>UI 自动化设置</DialogTitle>

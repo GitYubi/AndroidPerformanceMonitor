@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+from os import PathLike
 import re
 import shutil
 import statistics
@@ -66,6 +67,7 @@ async def run_adb(
     serial: str | None = None,
     timeout_seconds: float = 6.0,
     input_data: bytes | None = None,
+    cwd: str | PathLike[str] | None = None,
 ) -> str:
     """运行单个 ADB 命令，并为卡住的设备调用建立硬超时。"""
 
@@ -83,6 +85,7 @@ async def run_adb(
         stdin=asyncio.subprocess.PIPE if input_data is not None else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
     ))
     process = None
     try:

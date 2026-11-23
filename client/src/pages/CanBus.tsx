@@ -25,6 +25,7 @@ type Task = {
   channel: number;
   name: string;
   active: boolean;
+  wake?: boolean;
   signals: Record<string, unknown>;
   error?: string;
 };
@@ -87,7 +88,7 @@ export default function CanBus() {
   const [wakeDrafts, setWakeDrafts] = useState<
     Record<string, Record<string, string>>
   >({});
-  const [profile, setProfile] = useState<Profile>({});
+  const [loadedWakeKey, setLoadedWakeKey] = useState<string | null>(null);
 
   const [stopAfter, setStopAfter] = useState(true);
 
@@ -151,10 +152,22 @@ export default function CanBus() {
     };
   }, [refresh, request, scanDevices]);
   useEffect(() => {
-    if (!catalog?.key) return;
+    const key = catalog?.key;
+    if (!key) return;
+    let live = true;
     void request("/wake/profile")
-      .then(acceptProfile)
-      .catch(e => setError(String(e)));
+      .then(p => {
+        if (live) {
+          acceptProfile(p);
+          setLoadedWakeKey(key);
+        }
+      })
+      .catch(e => {
+        if (live) setError(String(e));
+      });
+    return () => {
+      live = false;
+    };
   }, [catalog?.key, request]);
   useEffect(() => {
     if (!status.open || section !== "receive") return;
@@ -202,6 +215,7 @@ export default function CanBus() {
       setCatalog(d);
       setDirectory(null);
       if (d.key !== catalog?.key) {
+        setLoadedWakeKey(null);
         setName("");
         setDrafts({});
         acceptProfile({});
@@ -209,7 +223,11 @@ export default function CanBus() {
     }
   };
   const waking = section === "wake";
-  const selectedNames = waking ? Object.keys(profile) : Object.keys(drafts);
+  const wakeReady = !!catalog?.key && loadedWakeKey === catalog.key;
+  const channelWaking = status.tasks.some(
+    task => task.channel === channel && task.active && task.wake
+  );
+  const selectedNames = Object.keys(waking ? wakeDrafts : drafts);
   const message = selectedNames.includes(name)
     ? catalog?.messages.find(m => m.name === name)
     : undefined;
@@ -239,7 +257,6 @@ export default function CanBus() {
     else updateDraft(name, { values: v });
   }
   function acceptProfile(p: Profile) {
-    setProfile(p);
     setWakeDrafts(
       Object.fromEntries(
         Object.entries(p).map(([n, v]) => [
@@ -255,21 +272,15 @@ export default function CanBus() {
     );
   }
   function selectMessage(m?: Message) {
-    if (!m) return;
+    if (!m || (waking && !wakeReady)) return;
     setName(m.name);
     if (waking) {
-      setProfile(p => (p[m.name] ? p : { ...p, [m.name]: {} }));
-      setWakeDrafts(p => ({ ...p, [m.name]: p[m.name] || {} }));
+      setWakeDrafts(p => (p[m.name] ? p : { ...p, [m.name]: {} }));
     } else
       setDrafts(p => (p[m.name] ? p : { ...p, [m.name]: defaultDraft(m) }));
   }
   function removeMessage(n: string) {
     if (waking) {
-      setProfile(p => {
-        const c = { ...p };
-        delete c[n];
-        return c;
-      });
       setWakeDrafts(p => {
         const c = { ...p };
         delete c[n];
@@ -331,21 +342,36 @@ export default function CanBus() {
       const data = await r.json();
       if (!r.ok) throw Error(data.detail);
       acceptProfile(data);
+      setLoadedWakeKey(catalog?.key ?? null);
       toast.success("唤醒配置已导入并保存");
     } catch (e) {
       setError(String(e));
     }
   };
+  const buildWakeProfile = (): Profile =>
+    Object.fromEntries(
+      Object.entries(wakeDrafts).map(([name, values]) => {
+        const signals = parsedValues(values);
+        if (!Object.keys(signals).length)
+          throw Error(`${name} 请至少填写一个信号值`);
+        return [name, signals];
+      })
+    );
   const saveWake = async () => {
     try {
-      const p: Profile = {};
-      for (const n of Object.keys(profile)) {
-        const v = parsedValues(wakeDrafts[n] || {});
-        if (!Object.keys(v).length) throw Error(`${n} 请至少填写一个信号值`);
-        p[n] = v;
-      }
-      const result = await action("/wake/profile", { profile: p });
-      if (result) acceptProfile(result);
+      await action("/wake/profile", { profile: buildWakeProfile() });
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+  const submitWake = async (update: boolean) => {
+    try {
+      const result = await action(
+        update ? "/wake/update" : "/wake/start",
+        { channel, profile: buildWakeProfile() },
+        false
+      );
+      if (result) toast.success(update ? "已应用唤醒配置" : "已启动唤醒");
     } catch (e) {
       setError(String(e));
     }
@@ -495,7 +521,7 @@ export default function CanBus() {
       </div>
       <div className="shrink-0 border-t border-border px-3 py-1.5 text-[11px] text-muted-foreground">
         留空沿用已有值 · 物理值按 DBC 范围和步长校验
-        {waking && " · 编辑后点击保存唤醒配置"}
+        {waking && (channelWaking ? " · 编辑后点击应用当前配置" : " · 启动唤醒时使用当前设置")}
       </div>
     </section>
   );
@@ -623,7 +649,8 @@ export default function CanBus() {
                   <button
                     key={m.name}
                     title={`${m.name} · 点击添加到配置`}
-                    className={`flex w-full items-center gap-2 border-b border-border/40 px-3 py-2 text-left text-xs ${name === m.name ? "bg-accent text-accent-foreground" : "hover:bg-muted/60"}`}
+                    className={`flex w-full items-center gap-2 border-b border-border/40 px-3 py-2 text-left text-xs disabled:opacity-50 ${name === m.name ? "bg-accent text-accent-foreground" : "hover:bg-muted/60"}`}
+                    disabled={waking && (!wakeReady || busy)}
                     onClick={() => selectMessage(m)}
                   >
                     <span className="w-12 shrink-0 font-mono text-muted-foreground">
@@ -667,7 +694,7 @@ export default function CanBus() {
                           type="file"
                           accept=".ini,.json"
                           className="hidden"
-                          disabled={status.wake_active}
+                          disabled={busy || !catalog?.key || status.wake_active}
                           onChange={e => {
                             const f = e.target.files?.[0];
                             if (f) void importWake(f);
@@ -677,23 +704,34 @@ export default function CanBus() {
                       </label>
                       <button
                         className={button}
-                        disabled={busy || status.wake_active}
+                        disabled={
+                          busy || !wakeReady || !selectedNames.length || status.wake_active
+                        }
                         onClick={() => void saveWake()}
                       >
                         保存配置
                       </button>
                       <button
                         className={button}
-                        disabled={busy || !status.open}
-                        onClick={() =>
-                          void action(
-                            status.wake_active ? "/wake/stop" : "/wake/start",
-                            { channel }
-                          )
+                        disabled={
+                          busy ||
+                          !wakeReady ||
+                          !status.channels?.includes(channel) ||
+                          !selectedNames.length
                         }
+                        onClick={() => void submitWake(channelWaking)}
                       >
-                        {status.wake_active ? "取消唤醒" : "唤醒车机"}
+                        {channelWaking ? "应用当前配置" : "唤醒车机"}
                       </button>
+                      {status.wake_active && (
+                        <button
+                          className={button}
+                          disabled={busy}
+                          onClick={() => void action("/wake/stop", {})}
+                        >
+                          取消唤醒
+                        </button>
+                      )}
                     </div>
                   ) : (
                     <label className="text-xs text-muted-foreground">
@@ -709,7 +747,9 @@ export default function CanBus() {
                 <div className="min-h-0 flex-1 overflow-auto overscroll-contain">
                   {!selectedNames.length ? (
                     <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-                      从左侧选择需要配置的报文
+                      {waking && catalog?.key && !wakeReady
+                        ? "唤醒配置尚未载入，可刷新页面重试"
+                        : "从左侧选择需要配置的报文"}
                     </div>
                   ) : (
                     <table className="w-full min-w-[650px] text-left text-xs">
@@ -740,10 +780,11 @@ export default function CanBus() {
                           const m = catalog?.messages.find(x => x.name === n);
                           if (!m) return null;
                           const d = drafts[n] || defaultDraft(m);
-                          const task = status.tasks.find(
+                          const scheduled = status.tasks.find(
                             t =>
-                              t.name === n && t.channel === channel && t.active
+                              t.name === n && t.channel === channel
                           );
+                          const task = scheduled?.active ? scheduled : undefined;
                           return (
                             <tr
                               key={n}
@@ -774,8 +815,12 @@ export default function CanBus() {
                                     }{" "}
                                     个
                                   </td>
-                                  <td className="px-2">
-                                    {task ? "发送中" : "已配置"}
+                                  <td className="px-2" title={scheduled?.error}>
+                                    {scheduled?.error
+                                      ? <span className="text-destructive">发送失败：{scheduled.error}</span>
+                                      : task
+                                        ? (task.wake ? "发送中" : "手动发送中")
+                                        : (channelWaking ? "待应用" : "已配置")}
                                   </td>
                                 </>
                               ) : (
@@ -903,7 +948,7 @@ export default function CanBus() {
                 </div>
                 <div className="shrink-0 truncate border-t border-border px-3 py-1.5 text-[11px] text-muted-foreground">
                   {waking
-                    ? "按 DBC 单独保存 · 点击报文在下方编辑 · 手动发送可接管唤醒任务"
+                    ? "唤醒中可应用当前配置 · 保存配置用于下次打开 · 手动发送可接管唤醒任务"
                     : "每条报文独立保留信号、周期及次数 · -1 持续 · 脉冲为 N 帧触发值 + N 帧复位值"}
                 </div>
               </section>

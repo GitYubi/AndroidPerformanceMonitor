@@ -3,7 +3,6 @@ import {
   boundsStyle,
   candidateLabel,
   pointCandidates,
-  screenPixel,
   treeSourceLabel,
   type MapNode as Node,
   type Observation,
@@ -14,20 +13,12 @@ import {
   useEffect,
   useRef,
   useState,
-  type PointerEvent,
 } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { UiBaselineDialog } from "@/components/UiBaselineDialog";
 import { UiProjectOptions } from "@/components/UiImageLibrary";
-import { uiImagesPath, type UiProject } from "@/lib/uiImages";
-import { toast } from "sonner";
+import type { UiBaseline, UiProject } from "@/lib/uiImages";
+import { useImageRegion } from "@/lib/useImageRegion";
 const API = BACKEND_URL;
 type App = { id: string; name: string; package: string | null };
 type Page = {
@@ -75,12 +66,6 @@ type Graph = {
   deleted: unknown[];
 };
 type Pick = { obs: Observation; node: Node };
-type Region = [left: number, top: number, right: number, bottom: number];
-type BaselineDraft = {
-  image: string;
-  region: Region;
-  source: "roi" | "element";
-};
 type Menu = {
   x: number;
   y: number;
@@ -116,10 +101,12 @@ async function api(path: string, body: unknown) {
   return data;
 }
 export default function PageMapWorkbench({
+  visible,
   projects,
   projectId,
   onProjectChange,
 }: {
+  visible: boolean;
   projects: UiProject[];
   projectId: string;
   onProjectChange: (id: string) => void;
@@ -128,6 +115,8 @@ export default function PageMapWorkbench({
       []
     ),
     [serial, setSerial] = useState("");
+  const mapSession = useRef<string | undefined>(undefined);
+  const [mapGeneration, setMapGeneration] = useState(0);
   const [viewParentId, setViewParentId] = useState("");
   const [pendingEntryId, setPendingEntryId] = useState("");
   const [appId, setAppId] = useState("");
@@ -162,14 +151,11 @@ export default function PageMapWorkbench({
   const [menu, setMenu] = useState<Menu | null>(null),
     [undo, setUndo] = useState("");
   const [selectingRegion, setSelectingRegion] = useState(false);
-  const [region, setRegion] = useState<Region | null>(null);
-  const dragStart = useRef<{ x: number; y: number; pointerId: number } | null>(
-    null
+  const { region, startRegion, drawRegion, cancelRegion } = useImageRegion(
+    frame,
+    visible && selectingRegion
   );
-  const [baselineDraft, setBaselineDraft] = useState<BaselineDraft | null>(
-    null
-  );
-  const [baselineName, setBaselineName] = useState("");
+  const [baselineDraft, setBaselineDraft] = useState<UiBaseline | null>(null);
   const inspectionPaused = useRef(false);
   const working = useRef(false),
     serialRef = useRef(serial),
@@ -177,10 +163,6 @@ export default function PageMapWorkbench({
   serialRef.current = serial;
   const imageRef = useRef<HTMLImageElement>(null),
     cropRef = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    setRegion(null);
-    dragStart.current = null;
-  }, [frame?.image]);
   const refreshDevices = useCallback(async () => {
     try {
       const r = await fetch(`${API}/api/devices`);
@@ -194,6 +176,32 @@ export default function PageMapWorkbench({
     void refreshDevices();
   }, [refreshDevices]);
   useEffect(() => {
+    if (!visible) {
+      setMode("inspect");
+      setHovered([]);
+      setMenu(null);
+      return;
+    }
+    const controller = new AbortController();
+    void fetch(`${API}/api/ui/map/session`, {
+      cache: "no-store",
+      signal: controller.signal,
+    })
+      .then(async response => {
+        if (!response.ok) return;
+        const { id } = await response.json();
+        if (controller.signal.aborted || typeof id !== "string") return;
+        if (mapSession.current !== undefined && mapSession.current !== id) {
+          setMapGeneration(previous => previous + 1);
+        }
+        mapSession.current = id;
+      })
+      .catch(() => {
+        // Keep the last snapshot during a temporary backend outage.
+      });
+    return () => controller.abort();
+  }, [visible]);
+  useEffect(() => {
     setViewParentId("");
     setPendingEntryId("");
     setAppId("");
@@ -204,24 +212,34 @@ export default function PageMapWorkbench({
     setObs(null);
     setFrame(null);
     setSelectingRegion(false);
-    setRegion(null);
-    dragStart.current = null;
     setPick(null);
-    setRegion(null);
-    dragStart.current = null;
     setCandidates([]);
+    setHovered([]);
     setMenu(null);
+    setDialog(null);
+    setBaselineDraft(null);
     setGraph(empty);
     setUndo("");
     setLive(false);
     setError("");
-    if (serial)
-      api("graph", { serial })
-        .then(g => {
-          if (serialRef.current === serial) setGraph(g);
-        })
-        .catch(e => setError(String(e)));
-  }, [serial]);
+    setStatus(
+      serial
+        ? "已选择设备，可读取当前画面与控件。"
+        : "连接设备后读取当前页面，不会启动任何应用。"
+    );
+    if (!serial) return;
+    let stale = false;
+    api("graph", { serial })
+      .then(g => {
+        if (!stale && serialRef.current === serial) setGraph(g);
+      })
+      .catch(e => {
+        if (!stale) setError(String(e));
+      });
+    return () => {
+      stale = true;
+    };
+  }, [serial, mapGeneration]);
   async function job(fn: () => Promise<void>) {
     if (working.current) return;
     if (frameBusy.current) {
@@ -257,7 +275,7 @@ export default function PageMapWorkbench({
     return o;
   }
   useEffect(() => {
-    if (!live || !serial || mode !== "inspect") return;
+    if (!visible || !live || !serial || mode !== "inspect") return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const poll = async () => {
@@ -282,14 +300,15 @@ export default function PageMapWorkbench({
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [live, serial, mode]);
+  }, [live, serial, mode, visible]);
   useEffect(() => {
+    if (!visible) return;
     const close = (e: KeyboardEvent) => {
       if (e.key === "Escape") setMenu(null);
     };
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
-  }, []);
+  }, [visible]);
   useEffect(() => {
     if (!pick || !cropRef.current || !pick.node.bounds) return;
     const canvas = cropRef.current;
@@ -352,111 +371,17 @@ export default function PageMapWorkbench({
     if (right) menuAt(e.clientX, e.clientY, { kind: "screen", pick: { obs, node } });
     else setStatus("已选中元素，可切换同点候选或保存到所选父节点。");
   }
-  function startRegion(event: PointerEvent<HTMLImageElement>) {
-    if (
-      !selectingRegion ||
-      !frame ||
-      busy ||
-      !event.isPrimary ||
-      event.button !== 0
-    )
-      return;
-    const point = screenPixel(
-      frame,
-      event.currentTarget.getBoundingClientRect(),
-      event.clientX,
-      event.clientY
-    );
-    if (!point) return;
-    event.currentTarget.setPointerCapture(event.pointerId);
-    dragStart.current = { ...point, pointerId: event.pointerId };
-    setRegion(null);
-  }
-  function drawRegion(event: PointerEvent<HTMLImageElement>) {
-    const start = dragStart.current;
-    if (!frame || start?.pointerId !== event.pointerId) return;
-    const end = screenPixel(
-      frame,
-      event.currentTarget.getBoundingClientRect(),
-      event.clientX,
-      event.clientY
-    );
-    if (!end) return;
-    setRegion(
-      start.x === end.x && start.y === end.y
-        ? null
-        : [
-            Math.min(start.x, end.x),
-            Math.min(start.y, end.y),
-            Math.max(start.x, end.x) + 1,
-            Math.max(start.y, end.y) + 1,
-          ]
-    );
-    if (event.type === "pointerup") dragStart.current = null;
-  }
   function saveElementBaseline() {
     if (!pick?.node.bounds) return;
     const [left, top, right, bottom] = pick.node.bounds;
-    setBaselineName(
-      (pick.node.label || pick.node.resourceId || pick.node.className).slice(
-        0,
-        120
-      )
-    );
     setBaselineDraft({
       image: pick.obs.image,
       region: [left, top, right, bottom],
       source: "element",
-    });
-  }
-  async function saveBaseline() {
-    if (!baselineDraft || !baselineName.trim()) return;
-    await job(async () => {
-      const source = new Image();
-      source.src = baselineDraft.image;
-      await source.decode();
-      const [left, top, right, bottom] = baselineDraft.region;
-      const x = Math.max(0, left);
-      const y = Math.max(0, top);
-      const width = Math.min(source.naturalWidth, right) - x;
-      const height = Math.min(source.naturalHeight, bottom) - y;
-      if (width <= 0 || height <= 0 || width * height > 16_000_000)
-        throw Error("截图范围无效或过大");
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const context = canvas.getContext("2d");
-      if (!context) throw Error("当前浏览器无法生成截图");
-      context.drawImage(source, x, y, width, height, 0, 0, width, height);
-      const png = await new Promise<Blob | null>(resolve =>
-        canvas.toBlob(resolve, "image/png")
-      );
-      if (!png) throw Error("截图生成失败");
-      const data = new FormData();
-      data.append("file", png, "baseline.png");
-      data.append("name", baselineName.trim());
-      data.append("source", baselineDraft.source);
-      data.append(
-        "region",
-        JSON.stringify({
-          left: x,
-          top: y,
-          right: x + width,
-          bottom: y + height,
-        })
-      );
-      const response = await fetch(`${API}/api${uiImagesPath(projectId)}`, {
-        method: "POST",
-        body: data,
-      });
-      if (!response.ok) {
-        const result = await response.json();
-        throw Error(
-          typeof result.detail === "string" ? result.detail : "基准图保存失败"
-        );
-      }
-      setBaselineDraft(null);
-      toast.success("基准图已保存到项目图片库");
+      name: (pick.node.label || pick.node.resourceId || pick.node.className).slice(
+        0,
+        120
+      ),
     });
   }
   async function switchMode(next: string) {
@@ -470,8 +395,6 @@ export default function PageMapWorkbench({
     }
     if (next === "operate") {
       setSelectingRegion(false);
-      setRegion(null);
-      dragStart.current = null;
       setPick(null);
       setCandidates([]);
       setDraftToken("");
@@ -1011,8 +934,6 @@ export default function PageMapWorkbench({
                   setLive(false);
                   setMenu(null);
                   setSelectingRegion(!selectingRegion);
-                  setRegion(null);
-                  dragStart.current = null;
                 }}
               >
                 {selectingRegion ? "退出框选" : "框选基准图"}
@@ -1026,7 +947,6 @@ export default function PageMapWorkbench({
                     disabled={!region || busy}
                     onClick={() => {
                       if (!frame || !region) return;
-                      setBaselineName("");
                       setBaselineDraft({
                         image: frame.image,
                         region,
@@ -1059,7 +979,7 @@ export default function PageMapWorkbench({
               )}
             </div>
           )}
-          {mode === "operate" ? (
+          {visible && mode === "operate" ? (
             <ScrcpyScreen
               ref={scrcpy}
               api={API}
@@ -1078,7 +998,9 @@ export default function PageMapWorkbench({
                 style={{ touchAction: "none" }}
                 onClick={e => screenClick(e)}
                 onContextMenu={e => screenClick(e, true)}
-                onPointerDown={startRegion}
+                onPointerDown={event => {
+                  if (!busy) startRegion(event);
+                }}
                 onPointerMove={event => {
                   drawRegion(event);
                   setHovered(!selectingRegion && !busy && !live && obs && frame === obs
@@ -1087,11 +1009,7 @@ export default function PageMapWorkbench({
                 }}
                 onPointerLeave={() => setHovered([])}
                 onPointerUp={drawRegion}
-                onPointerCancel={event => {
-                  if (dragStart.current?.pointerId !== event.pointerId) return;
-                  dragStart.current = null;
-                  setRegion(null);
-                }}
+                onPointerCancel={cancelRegion}
               />
               {!selectingRegion && !busy && !live && frame === obs && hovered.map(node => node.bounds && (
                 <span key={node.index} aria-hidden="true"
@@ -1101,12 +1019,7 @@ export default function PageMapWorkbench({
               {selectingRegion && region && (
                 <div
                   className="pointer-events-none absolute border-2 border-cyan-400 bg-cyan-400/15"
-                  style={{
-                    left: `${(region[0] / frame.width) * 100}%`,
-                    top: `${(region[1] / frame.height) * 100}%`,
-                    width: `${((region[2] - region[0]) / frame.width) * 100}%`,
-                    height: `${((region[3] - region[1]) / frame.height) * 100}%`,
-                  }}
+                  style={boundsStyle(frame, region)}
                 />
               )}
               {!selectingRegion &&
@@ -1127,47 +1040,17 @@ export default function PageMapWorkbench({
           )}
         </div>
       </div>
-      <Dialog
-        open={Boolean(baselineDraft)}
-        onOpenChange={open => {
-          if (!open && !busy) setBaselineDraft(null);
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>保存基准图</DialogTitle>
-            <DialogDescription>
-              项目 · {projects.find(project => project.id === projectId)?.name}
-            </DialogDescription>
-          </DialogHeader>
-          <form
-            className="space-y-3"
-            onSubmit={event => {
-              event.preventDefault();
-              void saveBaseline();
-            }}
-          >
-            <label className="grid gap-1 text-sm">
-              基准图名称
-              <Input
-                value={baselineName}
-                maxLength={120}
-                onChange={event => setBaselineName(event.target.value)}
-              />
-            </label>
-            {error && (
-              <p role="alert" className="text-sm text-destructive">
-                {error}
-              </p>
-            )}
-            <div className="flex justify-end">
-              <Button type="submit" disabled={busy || !baselineName.trim()}>
-                保存到图片库
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {baselineDraft && (
+        <UiBaselineDialog
+          draft={baselineDraft}
+          project={projects.find(project => project.id === projectId) ?? {
+            id: projectId,
+            name: "当前项目",
+          }}
+          open={visible}
+          onClose={() => setBaselineDraft(null)}
+        />
+      )}
       {error && (
         <p
           role="alert"

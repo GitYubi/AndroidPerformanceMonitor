@@ -145,16 +145,14 @@ elif 'date' in args:
  print('1000')
 elif len(args)>3 and args[2]=='shell' and 'acpm-snapshot' in args[3]:
  source=args[3].rsplit(' ',1)[-1]
- if source in ('/data/system/dropbox','/data/tombstones'):
+ if source in ('/data/system/dropbox','/data/vendor/crash','/data/tombstones'):
   print(source+'/fixture.log\0fixture-identity\0',end='')
 elif args[2:4]==['shell','-T']:
  payload=sys.stdin.buffer.read()
  assert payload.count(b'\0')==3
  assert len(list(root.glob('monkey-data/*/device-logs.zip')))==1
  print('1')
-elif len(args)>4 and args[2]=='pull' and args[3] in ('/data/anr','/data/dropbox','/data/system/dropbox','/data/tombstones'):
- if args[3]=='/data/dropbox':
-  print('No such file or directory',file=sys.stderr);sys.exit(1)
+elif len(args)>4 and args[2]=='pull' and args[3] in ('/data/anr','/data/system/dropbox','/data/vendor/crash','/data/tombstones'):
  destination=Path(args[4])
  destination.mkdir()
  if args[3]!='/data/anr':
@@ -244,7 +242,7 @@ def test_multi_hour_run_rolls_exports_and_merges_without_reports(fake_adb):
         assert children and all(child.returncode is not None for child in children)
         calls = [json.loads(line) for line in (tmp / "calls.jsonl").read_text().splitlines()]
         assert [args[3] for args in calls if len(args) > 3 and args[2] == "pull"] == [
-            "/data/anr", "/data/dropbox", "/data/system/dropbox", "/data/tombstones"
+            "/data/anr", "/data/system/dropbox", "/data/tombstones"
         ]
     asyncio.run(scenario())
 
@@ -253,7 +251,10 @@ def test_multi_hour_run_rolls_exports_and_merges_without_reports(fake_adb):
 def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatch, multiscreen, duration_hours):
     tmp, children = fake_adb
     settings = {}
+    crash_path = "/data/system/dropbox"
     if multiscreen:
+        crash_path = "/data/vendor/crash"
+        settings["crash_path"] = crash_path
         (tmp / "multiscreen").touch()
         settings["multi_screen"] = m.screens.MultiScreen(targets=[
             {"display_id": 2, "fingerprint": "b" * 64, "packages": ["com.example"]}
@@ -282,11 +283,13 @@ def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatc
         assert not detail["config"]["collect_performance"] and detail["segments"] == []
         assert "__ACPM_MONKEY_PID__" in detail["log_tail"]
         assert detail["device_logs"]["ANR"]["status"] == "empty"
-        assert detail["device_logs"]["Crash"]["source"] == "/data/system/dropbox"
+        assert detail["device_logs"]["Crash"]["source"] == crash_path
+        assert detail["device_logs"]["Crash"]["removed"] == 1
         assert detail["device_logs"]["Tombstone"]["removed"] == 1
         response = await m.download(run["id"], "device-logs.zip", request)
         with ZipFile(response.path) as archive:
             assert set(archive.namelist()) == {"Crash/fixture.log", "Tombstone/fixture.log", "manifest.json"}
+            assert archive.read("Crash/fixture.log") == crash_path.encode()
             assert archive.read("Tombstone/fixture.log") == b"/data/tombstones"
             manifest = json.loads(archive.read("manifest.json"))
             for kind, values in manifest.items():
