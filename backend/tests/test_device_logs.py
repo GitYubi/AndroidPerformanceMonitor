@@ -4,12 +4,15 @@ from hashlib import sha256
 from pathlib import Path
 import shlex
 import sys
+from types import SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
 
 from app import device_logs
 from app.adb import AdbError, run_adb
+from app.models import StartSessionRequest
+from app.monitor import MonitorManager
 
 DEFAULT_CRASH_PATH = "/data/system/dropbox"
 
@@ -78,7 +81,7 @@ def test_windows_monkey_log_export_uses_system_staging(tmp_path, monkeypatch, co
     monkeypatch.setattr(device_logs, "run_adb", adb)
     monkeypatch.setattr(device_logs.os, "rename", rename_across_drives)
     monkeypatch.setattr(device_logs.shutil, "copytree", copy_to_report)
-    results = asyncio.run(device_logs.export_device_logs_zip("fixture", destination))
+    results = asyncio.run(device_logs.export_device_logs_zip("fixture", destination, preserve=False))
     assert results["ANR"]["status"] == results["Tombstone"]["status"] == "empty"
     if copy_fails:
         assert results["Crash"]["status"] == "error"
@@ -139,7 +142,7 @@ def test_log_export_cleans_only_verified_originals(tmp_path, monkeypatch, window
 
     monkeypatch.setattr(device_logs, "run_adb", adb)
     result = asyncio.run(device_logs.export_and_clean_device_logs(
-        "fixture", device_logs.DeviceLogConfig(crash=folder), tmp_path, lambda *_: None,
+        "fixture", device_logs.DeviceLogConfig(crash=folder), tmp_path, lambda *_: None, preserve=False,
     ))["Crash"]
     assert set(device) == {failed, replaced, corrupt, new}
     assert (Path(result["target"]) / Path(good).name).read_bytes() == good.encode()
@@ -204,7 +207,7 @@ def test_monitor_log_export_uses_default_crash_path_and_keeps_successful_types(t
     monkeypatch.setattr(device_logs, "run_adb", adb)
     config = device_logs.DeviceLogConfig(anr="/data/anr", tombstone="/data/tombstones")
     result = asyncio.run(device_logs.export_and_clean_device_logs(
-        "fixture", config, tmp_path, lambda *_: None,
+        "fixture", config, tmp_path, lambda *_: None, preserve=False,
     ))
     assert sorted(calls) == sorted(("/data/anr", DEFAULT_CRASH_PATH, "/data/tombstones"))
     assert result["ANR"]["status"] == "error"
@@ -270,7 +273,7 @@ def test_custom_log_path_falls_back_to_read_only_directory_pull(tmp_path, monkey
 
     monkeypatch.setattr(device_logs, "run_adb", adb)
     result = asyncio.run(device_logs.export_and_clean_device_logs(
-        "fixture", device_logs.DeviceLogConfig(crash=source), tmp_path, lambda *_: None,
+        "fixture", device_logs.DeviceLogConfig(crash=source), tmp_path, lambda *_: None, preserve=False,
     ))["Crash"]
     assert result["status"] == "exported" and result["removed"] == 0
     assert (Path(result["target"]) / "trace.log").read_text() == "fixture"
@@ -294,5 +297,45 @@ def test_archive_failure_does_not_delete_source_logs(tmp_path, monkeypatch):
     monkeypatch.setattr(device_logs, "run_adb", adb)
     monkeypatch.setattr(device_logs, "_write_log_zip", archive)
     with pytest.raises(OSError, match="fixture archive write failed"):
-        asyncio.run(device_logs.export_device_logs_zip("fixture", tmp_path / "device-logs.zip"))
+        asyncio.run(device_logs.export_device_logs_zip("fixture", tmp_path / "device-logs.zip", preserve=False))
     assert not (tmp_path / "device-logs.zip").exists()
+
+
+@pytest.mark.parametrize(
+    "delete, ui_active, protected, expected_preserve",
+    [(None, False, False, True), (False, False, False, True), (True, False, False, False),
+     (True, True, False, True), (True, False, True, True)],
+)
+def test_performance_export_obeys_session_cleanup_setting(tmp_path, monkeypatch, delete, ui_active, protected, expected_preserve):
+    commands = []
+    events = []
+
+    async def adb(operation, *args, **kwargs):
+        commands.append(operation)
+        if operation == "shell":
+            assert not expected_preserve
+            if args[0] == "-T":
+                assert list(tmp_path.glob("*/Crash/trace.log"))
+                return "1"
+            return f"{DEFAULT_CRASH_PATH}/trace.log\0identity\0"
+        assert operation == "pull"
+        local = Path(kwargs.get("cwd", "")) / args[1]
+        local.mkdir()
+        (local / "trace.log").write_text("fixture")
+        return ""
+
+    monkeypatch.setattr(device_logs, "run_adb", adb)
+    options = {} if delete is None else {"delete_device_logs": delete}
+    request = StartSessionRequest(serial="fixture", log_export_root=str(tmp_path), **options)
+    manager = MonitorManager(tmp_path / "sessions")
+    if ui_active:
+        manager.ui_manager = SimpleNamespace(device_lock=lambda _: asyncio.Lock(), has_active_device=lambda _: True)
+    runtime = SimpleNamespace(
+        request=request, preserve_device_logs=protected,
+        writer=SimpleNamespace(add_event=lambda *event: events.append(event)),
+    )
+    asyncio.run(manager._export_device_logs(runtime))
+    assert commands == (["pull"] if expected_preserve else ["shell", "pull", "shell"])
+    assert events[0][:2] == ("info", "log_cleanup_policy")
+    assert ("保留车机" in events[0][2]) is expected_preserve
+    assert len(list(tmp_path.glob("*/Crash/trace.log"))) == 1

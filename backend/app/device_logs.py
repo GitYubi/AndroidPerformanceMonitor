@@ -1,9 +1,9 @@
-"""测试结束后导出并清理车机 ANR / Crash / Tombstone 日志。
+"""测试结束后导出车机 ANR / Crash / Tombstone 日志，可选清理源文件。
 
 - 导出位置：默认项目根目录/DevicesLogs/<结束时间>/ANR|Crash|Tombstone/
   结束时间格式 yyyy_MM_DD-hh_mm_ss；可通过 log_export_root 覆盖根目录。
 - Crash 留空使用默认目录；ANR 和 Tombstone 在独立性能监控中留空不导出。
-- 仅清理已保存且仍匹配的源文件；无法核验时保留原件。
+- 默认保留原件。启用清理时，仅删除已保存且仍匹配的源文件。
 - 路径不可读/不存在/无文件均只写会话事件，不中断其他类型的导出。
 """
 
@@ -260,7 +260,7 @@ def _zip_cleanup_payloads(destination: Path, results, snapshots) -> dict[str, by
 
 
 async def export_device_logs_zip(
-    serial: str, destination: Path, *, preserve: bool = False, crash_path: str | None = None,
+    serial: str, destination: Path, *, preserve: bool = True, crash_path: str | None = None,
 ) -> dict[str, dict[str, object]]:
     with TemporaryDirectory(prefix=".device-logs-", dir=destination.parent) as temporary:
         staging = Path(temporary)
@@ -273,8 +273,10 @@ async def export_device_logs_zip(
                     source = f"./{source}"
             pulled, snapshot = await _pull_log_directory(serial, source, staging / kind, preserve=preserve)
             results[kind] = {key: pulled[key] for key in ("source", "status", "exported", "detail") if key in pulled}
-            if not preserve and pulled["status"] == "exported":
-                snapshots[kind] = snapshot
+            if pulled["status"] == "exported":
+                results[kind]["cleanup_requested"] = not preserve
+                if not preserve:
+                    snapshots[kind] = snapshot
         if any(result["status"] == "exported" for result in results.values()):
             await asyncio.to_thread(_write_log_zip, staging, destination, results)
             if snapshots:
@@ -289,7 +291,7 @@ async def export_and_clean_device_logs(
     config: DeviceLogConfig,
     project_root: Path,
     on_event: EventSink,
-    preserve: bool = False,
+    preserve: bool = True,
 ) -> dict[str, object]:
     """执行全部已配置类型的日志导出与清理，返回各类型结果摘要。"""
     results: dict[str, object] = {}

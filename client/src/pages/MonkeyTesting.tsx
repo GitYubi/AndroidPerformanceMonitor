@@ -46,6 +46,7 @@ type DeviceLogExport = {
   status: "exported" | "empty" | "error" | "invalid_path";
   exported?: number;
   detail?: string;
+  cleanup_requested?: boolean;
   removed?: number;
   cleanup_pending?: number;
 };
@@ -230,6 +231,7 @@ export default function MonkeyTesting() {
   const [result, setResult] = useState<Summary | null>(null);
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [deleteDeviceLogs, setDeleteDeviceLogs] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [historyOffset, setHistoryOffset] = useState(0);
   const [segmentOffset, setSegmentOffset] = useState(0);
@@ -390,6 +392,7 @@ export default function MonkeyTesting() {
         ...config,
         project_id: projectId,
         crash_path: config.crash_path?.trim() || null,
+        delete_device_logs: deleteDeviceLogs,
         mode: config.multi_screen ? "none" : config.mode,
         packages: config.multi_screen || config.mode === "none" ? [] : packages,
       });
@@ -867,6 +870,19 @@ export default function MonkeyTesting() {
                   onChange={event => update("crash_path", event.target.value)}
                 />
               </label>
+              <div>
+                <label className="flex items-center gap-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={deleteDeviceLogs}
+                    onChange={event => setDeleteDeviceLogs(event.target.checked)}
+                  />
+                  导出后删除车机源日志
+                </label>
+                <p className="mt-1 text-xs text-slate-500">
+                  只删除已成功导出且核验通过的文件。
+                </p>
+              </div>
             </fieldset>
             <button
               type="button"
@@ -1035,6 +1051,7 @@ export default function MonkeyTesting() {
                           : log.status === "empty"
                             ? "目录为空"
                             : `导出失败：${log.detail || "未知错误"}`}
+                        {log.cleanup_requested === false && " · 已保留车机源日志"}
                         {log.removed !== undefined &&
                           ` · 已清理车机源文件 ${log.removed} 个`}
                         {!!log.cleanup_pending &&

@@ -19,7 +19,7 @@ import zipfile
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, FiniteFloat, StrictBool, StrictInt, model_validator
 
@@ -29,6 +29,7 @@ from .ui_images import DEFAULT_PROJECT, IMAGE_ID, MAX_PNG, PROJECT_ID, png_size
 from .ui_navigation import NavigationStore
 from .ui_metrics import step_metrics
 from .ui_store import TERMINAL, UIStore
+from .ui_stress import MAX_FAILURE_STEPS, UIStress
 from .record_cleanup import stage_directory, restore_directory, finish_directory
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -425,6 +426,16 @@ class RunRequest(BaseModel):
     timeoutSeconds: int = Field(default=900, ge=10, le=3600)
 
 
+class StressRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    serial: str = Field(default='', pattern=r'^[a-zA-Z0-9._:-]{0,128}$')
+    caseId: str = Field(pattern=NAME)
+    repetitions: int = Field(ge=1, le=2000, strict=True)
+    stopOnFailure: bool = False
+    parameters: dict[str, str] = Field(default_factory=dict, max_length=50)
+    timeoutSeconds: int = Field(default=900, ge=10, le=3600)
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra='forbid')
     baseUrl: str = 'https://api.deepseek.com'
@@ -516,6 +527,7 @@ class UIManager:
         self.device_locks: dict[str, asyncio.Lock] = {}
         self.external_busy: dict[str, str] = {}
         self.store.recover()
+        self.stress = UIStress(self)
 
     def device_lock(self, serial):
         return self.device_locks.setdefault(serial, asyncio.Lock())
@@ -572,45 +584,73 @@ class UIManager:
                 env[name] = settings[field]
         return env
 
-    async def start(self, request: RunRequest):
+    def run_target(self, request):
         enabled = list(request.testCase.enabled_steps())
         can_steps = {step.id: (step.type, step.options.model_dump())
                      for step in enabled if step.type in CAN_STEPS}
-        needs_device = not enabled or any((step.condition or step).type not in DEVICE_FREE_STEPS for step in enabled)
-        serial = request.serial if needs_device else ''
+        return (request.serial if self.requires_device(request.testCase) else ''), can_steps
+
+    async def prepare_run(self, request, serial, can_steps):
+        if self.has_active_device(serial):
+            raise ValueError('该设备已有 UI 测试运行中' if serial else '已有本机用例运行中')
+        if serial or self.requires_device(request.testCase):
+            if not serial:
+                raise ValueError('请为此用例选择目标设备')
+            devices = await list_devices()
+            if not any(d.serial == serial and d.state == 'device' for d in devices):
+                raise ValueError('指定设备未连接或未授权')
+        can_session = None
+        if can_steps:
+            if self.can is None:
+                raise ValueError('总线服务不可用')
+            can_session = await asyncio.to_thread(self.can.prepare_ui_run, can_steps.values())
+        parameters = {p.name: p.default for p in request.testCase.parameters}
+        if set(request.parameters) - set(parameters):
+            raise ValueError('存在未声明的执行参数')
+        parameters.update(request.parameters)
+        if any(p.secret and not parameters[p.name] for p in request.testCase.parameters):
+            raise ValueError('请填写敏感参数')
+        if any(len(v) > 8000 for v in parameters.values()):
+            raise ValueError('参数值过长')
+        return self.store.validate_baselines(request.testCase), parameters, can_session
+
+    @staticmethod
+    def requires_device(test_case):
+        enabled = list(test_case.enabled_steps())
+        return not enabled or any((step.condition or step).type not in DEVICE_FREE_STEPS for step in enabled)
+
+    def make_job(self, request, serial, parameters, baselines, output, sensitive, *, compact=False):
+        baseline_dir = output / '.baselines'
+        snapshots = {}
+        for key, original in baselines.items():
+            snapshot = baseline_dir / f'{key}.png'
+            snapshot.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(original, snapshot)
+            snapshots[key] = str(snapshot.resolve())
+        job = {'serial': serial, 'testCase': request.testCase.model_dump(),
+               'parameters': parameters, 'outputDir': str(output.resolve()), 'sensitive': sensitive,
+               'timeoutSeconds': request.timeoutSeconds, 'baselineDir': str(baseline_dir.resolve()),
+               'baselineFiles': snapshots, 'pythonExecutable': sys.executable}
+        if compact:
+            job['compactReport'] = True
+        if serial and not sensitive:
+            try:
+                job['navigation'] = self.navigation.load(serial)
+            except (ValueError, OSError, sqlite3.Error):
+                pass
+        return job
+
+    async def start(self, request: RunRequest):
+        serial, can_steps = self.run_target(request)
         async with self.lock, self.device_lock(serial):
-            if self.has_active_device(serial):
-                raise ValueError('该设备已有 UI 测试运行中' if needs_device else '已有本机用例运行中')
-            if needs_device:
-                devices = await list_devices()
-                if not any(d.serial == serial and d.state == 'device' for d in devices):
-                    raise ValueError('指定设备未连接或未授权')
-            can_session = None
-            if can_steps:
-                if self.can is None:
-                    raise ValueError('总线服务不可用')
-                can_session = await asyncio.to_thread(self.can.prepare_ui_run, can_steps.values())
-            parameters = {p.name: p.default for p in request.testCase.parameters}
-            if set(request.parameters) - set(parameters):
-                raise ValueError('存在未声明的执行参数')
-            parameters.update(request.parameters)
-            if any(p.secret and not parameters[p.name] for p in request.testCase.parameters):
-                raise ValueError('请填写敏感参数')
-            if any(len(v) > 8000 for v in parameters.values()):
-                raise ValueError('参数值过长')
-            baseline_files = self.store.validate_baselines(request.testCase)
+            baselines, parameters, can_session = await self.prepare_run(request, serial, can_steps)
             run_id = uuid.uuid4().hex
             settings = self.settings()
             output = (Path(settings['reportRoot']) if settings['reportRoot'] else self.store.root / 'runs') / run_id
             output.mkdir(parents=True)
-            baseline_dir = output / '.baselines'
+            sensitive = any(p.secret for p in request.testCase.parameters)
             try:
-                # Image-library mutations use the same lock as run creation.
-                for key, original in baseline_files.items():
-                    snapshot = baseline_dir / f'{key}.png'
-                    snapshot.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copyfile(original, snapshot)
-                    baseline_files[key] = str(snapshot.resolve())
+                job = self.make_job(request, serial, parameters, baselines, output, sensitive)
             except OSError:
                 shutil.rmtree(output, ignore_errors=True)
                 raise
@@ -630,15 +670,6 @@ class UIManager:
                 'kind': 'scan' if any(s.type == 'scan' for s in request.testCase.steps) else 'test',
             }
             self.store.put('runs', run)
-            job = {'serial': serial, 'testCase': request.testCase.model_dump(), 'parameters': parameters, 'outputDir': run['outputDir'], 'sensitive': run['sensitive'], 'timeoutSeconds': request.timeoutSeconds}
-            job['baselineDir'] = str(baseline_dir.resolve())
-            job['baselineFiles'] = baseline_files
-            job['pythonExecutable'] = sys.executable
-            if serial and not run['sensitive']:
-                try:
-                    job['navigation'] = self.navigation.load(serial)
-                except (ValueError, OSError, sqlite3.Error):
-                    pass  # Optional knowledge must not prevent normal Midscene execution.
             self.tasks[run_id] = asyncio.create_task(
                 self.execute(run_id, job, self.environment(), request.timeoutSeconds, can_steps, can_session))
             return run
@@ -679,8 +710,9 @@ class UIManager:
             self.tasks.pop(run_id, None)
             self.cancelled.discard(run_id)
 
-    async def _execute_run(self, run_id, job, env, timeout, can_steps, can_session):
-        run = self.store.get('runs', run_id)
+    async def _execute_run(self, run_id, job, env, timeout, can_steps, can_session, *, summary=None):
+        run, collect = summary if summary is not None else (self.store.get('runs', run_id), None)
+        controls = {}
         process = None
         owned = {}
         pending_can_step = None
@@ -694,7 +726,8 @@ class UIManager:
                 await self.terminate(process)
                 return
             run['state'] = 'running'
-            self.store.put('runs', run)
+            if collect is None:
+                self.store.put('runs', run)
             async with asyncio.timeout(timeout):
                 process.stdin.write((json.dumps(job) + '\n').encode())
                 await process.stdin.drain()
@@ -739,7 +772,12 @@ class UIManager:
                             except (ValueError, OSError, sqlite3.Error):
                                 pass
                         continue
-                    self.store.event(run_id, event)
+                    if collect is not None and event.get('type') == 'exploration' and event.get('control'):
+                        controls[event['control']] = event
+                    if collect is None:
+                        self.store.event(run_id, event)
+                    else:
+                        collect(event)
                     if event.get('type') == 'finished' and event.get('state') in TERMINAL:
                         run['state'] = event['state']
                         run['report'] = event.get('report')
@@ -762,21 +800,21 @@ class UIManager:
                 run['state'] = 'cancelled'
             if run['state'] not in TERMINAL:
                 run['state'] = 'interrupted'
-            controls = {}
-            try:
-                events = self.store.events(run_id)
-            except (OSError, sqlite3.Error, ValueError):
-                logging.getLogger(__name__).exception("Could not read final UI events for %s", run_id)
-                if run['state'] != 'cancelled':
-                    run['state'] = 'error'
-                run['message'] = '无法读取执行事件，请检查运行记录与设备状态'
-                events = []
-            for event in events:
-                if event.get('type') == 'exploration' and event.get('control'):
-                    controls[event['control']] = event
+            if collect is None:
+                try:
+                    for event in self.store.events(run_id):
+                        if event.get('type') == 'exploration' and event.get('control'):
+                            controls[event['control']] = event
+                except (OSError, sqlite3.Error, ValueError):
+                    logging.getLogger(__name__).exception("Could not read final UI events for %s", run_id)
+                    if run['state'] != 'cancelled':
+                        run['state'] = 'error'
+                    run['message'] = '无法读取执行事件，请检查运行记录与设备状态'
             pending = [name for name, event in controls.items() if event.get('state') in {'running', 'passed', 'failed', 'needs_review'}]
             if pending:
                 run['message'] = '探索控件未确认恢复，请检查：' + '、'.join(pending)
+                if collect is not None and run['state'] not in {'cancelled', 'interrupted'}:
+                    run['state'] = 'error'
             if owned:
                 errors = await asyncio.to_thread(self.can.stop_ui_sends, can_session, owned)
                 if errors:
@@ -784,9 +822,10 @@ class UIManager:
                         run['state'] = 'error'
                     run['message'] = '部分循环发送停止失败，请检查总线任务：' + '；'.join(errors)
             run['endedAt'] = int(time.time() * 1000)
-            run['performanceSessionId'] = self.store.get('runs', run_id).get('performanceSessionId')
-            self.store.put('runs', run)
-            self.store.event(run_id, {'type': 'task_end', 'state': run['state'], 'time': run['endedAt'], 'message': run.get('message')})
+            if collect is None:
+                run['performanceSessionId'] = self.store.get('runs', run_id).get('performanceSessionId')
+                self.store.put('runs', run)
+                self.store.event(run_id, {'type': 'task_end', 'state': run['state'], 'time': run['endedAt'], 'message': run.get('message')})
 
     async def cancel(self, run_id):
         self.store.get('runs', run_id)
@@ -800,6 +839,7 @@ class UIManager:
         return self.store.get('runs', run_id)
 
     async def close(self):
+        await self.stress.close()
         pending = list(self.tasks)
         tasks = list(self.tasks.values())
         for task in tasks:
@@ -894,6 +934,8 @@ async def delete_ui_project(project_id: str, request: Request):
             raise HTTPException(409, '项目的性能测试正在运行，请等待运行结束后再删除')
         if monkey and any(runtime.config.project_id == project_id for runtime in monkey.active.values()):
             raise HTTPException(409, '项目的 Monkey 测试正在运行，请等待运行结束后再删除')
+        if any(project_id in projects for projects in service.stress.projects.values()):
+            raise HTTPException(409, '项目相关用例正在压测，请先停止压测')
         performance = monitor.store.list_sessions(limit=None, project_id=project_id) if monitor else []
         monkey_runs = []
         if monkey:
@@ -917,6 +959,8 @@ async def delete_ui_project(project_id: str, request: Request):
 
             removed_runs = [run for run in runs if (run.get('testCase') or {}).get('projectId', DEFAULT_PROJECT) == project_id]
             directories = [store.images.root / project_id]
+            directories.extend(service.stress.evidence_dir(batch['id'])
+                               for batch in store.stress_batches(project_id, limit=-1))
             if monitor:
                 directories.extend(monitor.store.data_root / session['dir_name'] for session in performance)
             if monkey:
@@ -979,6 +1023,8 @@ async def delete_ui_project(project_id: str, request: Request):
                     conn.execute('DELETE FROM runs WHERE id=?', (run['id'],))
                 conn.execute('DELETE FROM ui_images WHERE project_id=?', (project_id,))
                 conn.execute('DELETE FROM ui_projects WHERE id=?', (project_id,))
+                conn.execute('DELETE FROM stress_rounds WHERE batch_id IN (SELECT id FROM stress_batches WHERE project_id=?)', (project_id,))
+                conn.execute('DELETE FROM stress_batches WHERE project_id=?', (project_id,))
                 if monkey:
                     conn.executemany('DELETE FROM monkey_jobs.jobs WHERE id=?', [(run['id'],) for run in monkey_runs])
                 conn.commit()
@@ -1322,6 +1368,90 @@ async def run_start(value: RunRequest, request: Request):
         return await manager(request).start(value)
     except (ValueError, OSError) as error:
         raise HTTPException(409, str(error)) from error
+
+
+def get_stress(service, batch_id):
+    try:
+        return service.store.get('stress_batches', batch_id)
+    except KeyError:
+        raise HTTPException(404, '未找到压测任务') from None
+
+
+@router.post('/stress', status_code=201)
+async def stress_start(value: StressRequest, request: Request):
+    service = manager(request)
+    try:
+        case = service.store.get('cases', value.caseId)
+    except KeyError:
+        raise HTTPException(404, '未找到用例，请先保存到用例库') from None
+    try:
+        run = RunRequest(serial=value.serial, testCase=case, parameters=value.parameters,
+                         timeoutSeconds=value.timeoutSeconds)
+        return await service.stress.start(run, value.repetitions, value.stopOnFailure)
+    except (ValueError, OSError) as error:
+        raise HTTPException(409, str(error)) from error
+
+
+@router.get('/stress')
+def stress_list(request: Request, projectId: str = DEFAULT_PROJECT):
+    return manager(request).store.stress_batches(projectId)
+
+
+@router.get('/stress/{batch_id}')
+def stress_detail(batch_id: str, request: Request, offset: int = Query(0, ge=0),
+                  limit: int = Query(50, ge=1, le=100), failures: bool = False):
+    service = manager(request)
+    batch = get_stress(service, batch_id)
+    return {'batch': batch, **service.store.stress_rounds(batch_id, offset, limit, failures)}
+
+
+@router.get('/stress/{batch_id}/report')
+def stress_report(batch_id: str, request: Request):
+    service = manager(request)
+    batch = get_stress(service, batch_id)
+    body = {'batch': batch, 'rounds': service.store.stress_rounds(batch_id, limit=2000)['items']}
+    return Response(json.dumps(body, ensure_ascii=False), media_type='application/json',
+                    headers={'Content-Disposition': f'attachment; filename="ui-stress-{batch_id}.json"'})
+
+
+@router.get('/stress/{batch_id}/rounds/{number}/screenshot')
+def stress_screenshot(batch_id: str, number: int, request: Request, step: int | None = None):
+    service = manager(request)
+    batch = get_stress(service, batch_id)
+    if (not 1 <= number <= batch['completed'] or not re.fullmatch(r'[a-f0-9]{32}', batch_id)
+            or step is not None and not 1 <= step <= MAX_FAILURE_STEPS):
+        raise HTTPException(404, '未找到此轮故障截图')
+    filename = f'{number}.jpg' if step is None else f'{number}-{step}.jpg'
+    path = service.stress.evidence_dir(batch_id) / filename
+    if not path.is_file():
+        raise HTTPException(404, '未找到此轮故障截图')
+    return FileResponse(path, media_type='image/jpeg', headers={'X-Content-Type-Options': 'nosniff'})
+
+
+@router.post('/stress/{batch_id}/stop')
+async def stress_stop(batch_id: str, request: Request):
+    service = manager(request)
+    get_stress(service, batch_id)
+    return await service.stress.stop(batch_id)
+
+
+@router.post('/stress/{batch_id}/delete')
+async def stress_delete(batch_id: str, request: Request):
+    service = manager(request)
+    async with service.lock:
+        get_stress(service, batch_id)
+        if batch_id in service.stress.tasks:
+            raise HTTPException(409, '压测仍在运行，请先停止')
+        staged = None
+        try:
+            staged = stage_directory(service.stress.evidence_dir(batch_id))
+            with service.store.connect() as conn:
+                conn.execute('DELETE FROM stress_rounds WHERE batch_id=?', (batch_id,))
+                conn.execute('DELETE FROM stress_batches WHERE id=?', (batch_id,))
+        except (OSError, ValueError, sqlite3.Error) as error:
+            restore_directory(staged)
+            raise HTTPException(409, f'删除压测记录失败：{error}') from error
+        return {'deleted': True, 'cleanupErrors': finish_directory(staged)}
 
 
 @router.get('/runs/{run_id}')

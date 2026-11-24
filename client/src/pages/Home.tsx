@@ -409,6 +409,7 @@ export default function Home() {
   const [layers, setLayers] = useState<string[]>([]);
   const [frameCapability, setFrameCapability] = useState<FrameCapabilities | null>(null);
   const [logPaths, setLogPaths] = useState(() => loadJsonStorage(LOG_PATHS_STORAGE_KEY, DEFAULT_LOG_PATHS));
+  const [deleteDeviceLogs, setDeleteDeviceLogs] = useState(false);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>(() => loadJsonStorage(COLLAPSED_STORAGE_KEY, {}));
   const prevSessionState = useRef<string | null>(null);
   const activeSessionIdRef = useRef<string | null>(null);
@@ -632,6 +633,7 @@ export default function Home() {
           crash_path: logPaths.crash.trim() || null,
           tombstone_path: logPaths.tombstone.trim() || null,
           log_export_root: logPaths.exportRoot.trim() || null,
+          delete_device_logs: deleteDeviceLogs,
         }),
       });
       activateSession(started);
@@ -772,6 +774,11 @@ export default function Home() {
                 <input aria-label="Crash 日志路径" value={logPaths.crash} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, crash: event.target.value }))} placeholder="Crash 留空默认 /data/system/dropbox" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.tombstone} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, tombstone: event.target.value }))} placeholder="Tombstone 路径，如 /data/tombstones" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
                 <input value={logPaths.exportRoot} disabled={running} onChange={(event) => setLogPaths((current) => ({ ...current, exportRoot: event.target.value }))} placeholder="导出根目录（留空 = 项目根/DevicesLogs）" className="h-8 w-full rounded-sm border border-slate-700 bg-slate-950/35 px-2 text-[11px] text-slate-300 outline-none focus:border-emerald-300/60 disabled:cursor-not-allowed disabled:opacity-60" />
+                <label className="flex items-center gap-2 text-xs text-slate-300">
+                  <input type="checkbox" checked={deleteDeviceLogs} disabled={running || loading} onChange={(event) => setDeleteDeviceLogs(event.target.checked)} />
+                  导出后删除车机源日志
+                </label>
+                <p className="text-[11px] text-slate-400">只删除已成功导出且核验通过的文件。</p>
               </div>
               </>}
             </section>

@@ -5,11 +5,13 @@ import {
   Images,
   Layers,
   ListChecks,
+  Repeat2,
 } from "lucide-react";
 
 export const uiSections = [
   { id: "projects", label: "项目管理", icon: FolderKanban },
   { id: "execute", label: "执行与编辑", icon: ListChecks },
+  { id: "stress", label: "压测执行", icon: Repeat2 },
   { id: "cases", label: "用例库", icon: BookOpen },
   { id: "images", label: "图片库", icon: Images },
   { id: "reports", label: "测试报告", icon: FileText },

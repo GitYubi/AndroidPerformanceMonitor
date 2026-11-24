@@ -7,6 +7,7 @@ import { currentProjectId, rememberProject } from "@/lib/workspaceProjects";
 import { UiStepFields } from "@/components/UiStepFields";
 import { UiCaseLibrary } from "@/components/UiCaseLibrary";
 import { UiProjectManagement } from "@/components/UiProjectManagement";
+import { UiStressPanel } from "@/components/UiStressPanel";
 import { UiImageLibrary, UiProjectOptions } from "@/components/UiImageLibrary";
 import {
   defaultProject,
@@ -920,10 +921,13 @@ export default function UITesting({ visible }: { visible: boolean }) {
               ? "项目管理"
               : section === "images"
                 ? "图片库"
-                : "UI 自动化测试"}
+                : section === "stress"
+                  ? "用例压测"
+                  : "UI 自动化测试"}
           </h1>
           {section !== "execute" &&
             section !== "images" &&
+            section !== "stress" &&
             section !== "projects" && (
               <p className="mt-2 text-sm text-muted-foreground">
                 用自然语言描述操作，用独立断言检查结果。脚本可逐步编辑和复跑。
@@ -972,6 +976,10 @@ export default function UITesting({ visible }: { visible: boolean }) {
           onCreate={createProject}
           onDelete={deleteProject}
         />
+      )}
+      {visible && section === "stress" && (
+        <UiStressPanel projects={projects} projectId={projectId}
+          onProjectChange={setProjectId} cases={cases} devices={devices} />
       )}
       {(mapVisible || visitedMap) && (
         <div hidden={!mapVisible}>

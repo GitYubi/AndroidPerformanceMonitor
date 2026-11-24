@@ -84,10 +84,13 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/api/devices")
-async def devices() -> list[dict[str, object]]:
+async def devices(request: Request) -> list[dict[str, object]]:
     try:
         found = await list_devices()
-        enriched = await __import__("asyncio").gather(*(enrich_device(device) for device in found))
+        _, *enriched = await asyncio.gather(
+            request.app.state.monkey.clean_connected_devices(found),
+            *(enrich_device(device) for device in found),
+        )
         return [asdict(device) for device in enriched]
     except AdbError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -119,6 +122,8 @@ async def start_session(payload: StartSessionRequest, request: Request) -> dict[
         async with ui.lock, ui.device_lock(payload.serial):
             ui.store.images.require_project(payload.project_id)
             project = next(item for item in ui.store.images.projects() if item['id'] == payload.project_id)
+            if not ui.has_active_device(payload.serial):
+                await request.app.state.monkey.clean_stale_temp(payload.serial)
             session_id = await manager.start(payload.model_copy(update={'project_name': project['name']}))
             if ui.has_active_device(payload.serial):
                 manager.active[session_id].preserve_device_logs = True

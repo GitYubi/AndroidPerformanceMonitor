@@ -31,6 +31,9 @@ let currentStep;
 let navigation;
 let terminal = false;
 let watchdog;
+let failureEvidence = 0;
+const evidenceLimit = 128 * 1024;
+const failureStepLimit = 5;
 const ipc =
   process.argv[2] === "--ipc"
     ? createInterface({ input: process.stdin })
@@ -106,6 +109,29 @@ try {
   const sensitive = Boolean(
     job.sensitive || job.testCase.parameters?.some(p => p.secret)
   );
+  const saveArtifacts = !sensitive && job.compactReport !== true;
+  async function captureFailure(image, fatal = false) {
+    // Keep a slot for a terminal exception after recoverable assertion failures.
+    if (sensitive || !job.compactReport || !treeDevice ||
+        failureEvidence >= failureStepLimit + Number(fatal)) return;
+    const index = ++failureEvidence;
+    try {
+      const source = image ?? await treeDevice.screenshot();
+      const { default: sharp } = await import("sharp");
+      for (const width of [1024, 720, 480]) {
+        const jpeg = await sharp(source)
+          .resize({ width, height: width, fit: "inside", withoutEnlargement: true })
+          .jpeg({ quality: 65 })
+          .toBuffer();
+        if (jpeg.length <= evidenceLimit) {
+          writeFileSync(resolve(root, `failure-${index}.jpg`), jpeg);
+          return index;
+        }
+      }
+    } catch {
+      // Failure evidence is optional; do not change the test result.
+    }
+  }
   if (needsModel) {
     const { AndroidAgent, AndroidDevice } = await import("@midscene/android");
     const device = new AndroidDevice(job.serial);
@@ -121,7 +147,7 @@ try {
       attachNavigationObserver(device, navigation);
     }
     agent = new AndroidAgent(device, {
-      generateReport: !sensitive,
+      generateReport: saveArtifacts,
       autoPrintReportMsg: false,
       reportFileName: "execution",
       cache: false,
@@ -129,7 +155,7 @@ try {
     let actionCount = 0;
     agent.addProgressListener(event => {
       if (
-        sensitive ||
+        !saveArtifacts ||
         event.scope !== "aiAct" ||
         event.phase !== "action_done" ||
         !currentStep ||
@@ -170,6 +196,7 @@ try {
         emitStep({
           state: "error",
           message: "步骤超时，执行进程已终止",
+          ...(job.compactReport ? { timedOut: true } : {}),
         });
         finish("error");
         process.exit(124);
@@ -192,9 +219,12 @@ try {
           const response = done ? null : JSON.parse(value);
           if (response?.stepId !== step.id) throw new Error("CAN 步骤响应无效");
           const state = response.ok ? "passed" : "error";
+          if (job.compactReport) clearTimeout(deadline);
+          const failureImage = state === "error" ? await captureFailure(undefined, true) : undefined;
           emitStep({
             state,
             message: response.message,
+            failureImage,
           });
           return state;
         }
@@ -243,7 +273,7 @@ try {
         const result = ["explore", "scan"].includes(step.type)
           ? await exploreTree(agent, treeDevice, step, event => {
               const { tree, ...summary } = event;
-              if (tree && !sensitive) {
+              if (tree && saveArtifacts) {
                 summary.artifact = `tree-${tree.fingerprint}.json`;
                 writeFileSync(
                   resolve(root, summary.artifact),
@@ -264,7 +294,7 @@ try {
             : await execute();
         let screenshot;
         if (
-          !sensitive &&
+          saveArtifacts &&
           !["delay", "assign", "screenshot_assert", "variable_assert"].includes(
             operation.type
           ) &&
@@ -284,6 +314,10 @@ try {
             step.id,
             screenshot ? resolve(root, screenshot) : capturedImage
           );
+        if (job.compactReport) clearTimeout(deadline);
+        const failureImage = (result === "failed" && step.type !== "if") || result === "error"
+          ? await captureFailure(capturedImage, result === "error")
+          : undefined;
         let branchMessage;
         if (step.type === "if" && result === "passed") {
           branchMessage = "进入 If 分支";
@@ -297,6 +331,7 @@ try {
         emitStep({
           state: branchMessage ? "passed" : result,
           screenshot,
+          failureImage,
           message: branchMessage
             ? [branchMessage, message].filter(Boolean).join(" · ")
             : message,
@@ -304,8 +339,11 @@ try {
         return result;
       } catch {
         // Never echo SDK errors, which can include raw input or authorization headers.
+        if (job.compactReport) clearTimeout(deadline);
+        const failureImage = await captureFailure(undefined, true);
         emitStep({
           state: "error",
+          failureImage,
           message: "执行异常：请检查设备、模型配置及页面状态",
         });
         return "error";
@@ -317,7 +355,7 @@ try {
       emit({ type: "step", stepId: step.id, state: "skipped", iterations })
   );
   await agent?.destroy();
-  finish(state, { report: sensitive ? null : agent?.reportFile || null });
+  finish(state, { report: saveArtifacts ? agent?.reportFile || null : null });
   process.exitCode = ["passed", "needs_review"].includes(state) ? 0 : 1;
 } catch (error) {
   if (agent) {

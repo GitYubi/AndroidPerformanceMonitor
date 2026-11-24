@@ -19,7 +19,7 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .adb import AdbError, list_devices, run_adb
+from .adb import AdbDevice, AdbError, list_devices, run_adb
 from .device_logs import export_device_logs_zip
 from .models import MetricsConfig, StartSessionRequest
 from .monkey_records import MonkeyRecords, MonkeyReportStore, connect
@@ -77,6 +77,7 @@ class MonkeyRequest(BaseModel):
     ignore_crashes: bool = True
     ignore_timeouts: bool = True
     crash_path: str | None = Field(default=None, max_length=256)
+    delete_device_logs: bool = Field(default=False, strict=True)
     multi_screen: screens.MultiScreen | None = None
 
     @field_validator("serial")
@@ -115,6 +116,47 @@ def remote_paths(run_id: str) -> dict[str, str]:
     base = "/data/local/tmp/acpm-monkey-" + run_id
     return {"script": base + ".sh", "packages": base + ".packages", "pid": base + ".pid",
             "lease": base + ".lease", "runner": base + ".jar", "gate": base + ".start", "halt": base + ".halt"}
+
+
+STALE_TEMP_SCRIPT = r"""
+directory=$1
+status=0
+for file in "$directory"/acpm-monkey-* "$directory"/acpm-displays-*; do
+    [ -f "$file" ] && [ ! -L "$file" ] || continue
+    name=${file##*/}
+    case "$name" in
+        acpm-monkey-*)
+            token=${name#acpm-monkey-}
+            case "$token" in
+                *.tar.gz) token=${token%.tar.gz} ;;
+                *.sh|*.packages|*.pid|*.lease|*.jar|*.start|*.halt|*.tar) token=${token%.*} ;;
+                *) continue ;;
+            esac
+            pid_file="$directory/acpm-monkey-$token.pid"
+            ;;
+        acpm-displays-*.jar)
+            token=${name#acpm-displays-}
+            token=${token%.jar}
+            pid_file=
+            ;;
+        *) continue ;;
+    esac
+    [ "${#token}" -eq 32 ] || continue
+    case "$token" in *[!a-f0-9]*) continue ;; esac
+    if [ -n "$pid_file" ] && [ -f "$pid_file" ] && [ ! -L "$pid_file" ]; then
+        read -r pid stamp < "$pid_file"
+        case "$pid" in
+            ''|0|*[!0-9]*) ;;
+            *)
+                current=$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null)
+                [ -n "$current" ] && [ "$current" = "$stamp" ] && continue
+                ;;
+        esac
+    fi
+    rm -f "$file" || status=1
+done
+exit "$status"
+"""
 
 
 def monkey_arguments(config: MonkeyRequest, paths: dict[str, str]) -> list[str]:
@@ -168,6 +210,7 @@ echo __ACPM_MONKEY_PID__=$child
 watcher=$!
 cleanup() {{
   kill "$watcher" 2>/dev/null || true
+  wait "$watcher" 2>/dev/null || true
   current=$(awk '{{print $22}}' /proc/$child/stat 2>/dev/null)
   if [ -n "$stamp" ] && [ "$current" = "$stamp" ]; then
     kill "$child" 2>/dev/null || true
@@ -205,6 +248,8 @@ class Runtime:
     expired: bool = False
     timer: asyncio.Task | None = None
     cleanup_task: asyncio.Task | None = None
+    gate_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    remote_staged: bool = False
     evidence: screens.ScreenEvidence | None = None
     screen_plan: str = ""
     anomaly_watcher: asyncio.Task | None = None
@@ -218,6 +263,29 @@ class MonkeyManager:
         self.interactions = interactions
         self.active: dict[str, Runtime] = {}
         self.lock = asyncio.Lock()
+
+    async def clean_stale_temp(self, serial: str) -> None:
+        # One physical device can be connected over USB and TCP at the same time.
+        if self.active:
+            return
+        script = shlex.join(["sh", "-c", STALE_TEMP_SCRIPT, "acpm-cleanup", "/data/local/tmp"])
+        try:
+            await run_adb("shell", script, serial=serial)
+        except AdbError:
+            logging.getLogger(__name__).debug("Could not clean temporary files on %s", serial, exc_info=True)
+
+    async def clean_connected_devices(self, devices: list[AdbDevice]) -> None:
+        async def clean(serial: str) -> None:
+            lock = self.ui.device_lock(serial)
+            if lock.locked() or self.ui.has_active_device(serial):
+                return
+            async with lock:
+                await self.clean_stale_temp(serial)
+
+        if self.lock.locked() or self.active:
+            return
+        async with self.lock:
+            await asyncio.gather(*(clean(device.serial) for device in devices if device.state == "device"))
 
     async def start(self, config: MonkeyRequest, project_name: str = "默认项目") -> dict:
         if self.ui.device_lock(config.serial).locked():
@@ -235,6 +303,7 @@ class MonkeyManager:
                 devices = await list_devices()
                 if not any(d.serial == config.serial and d.state == "device" for d in devices):
                     raise ValueError("设备未连接或未授权")
+                await self.clean_stale_temp(config.serial)
                 existing = await run_adb("shell", "pidof com.android.commands.monkey com.android.commands.monkey.Monkey || true", serial=config.serial)
                 if existing.strip():
                     raise ValueError("设备已有其他 Monkey 进程，请先结束该进程")
@@ -280,6 +349,7 @@ class MonkeyManager:
         if not runtime.evidence:
             prerequisite = "test -r /system/framework/monkey.jar && " + prerequisite
         await run_adb("shell", prerequisite, serial=runtime.config.serial)
+        runtime.remote_staged = True
         await run_adb("push", str(script), paths["script"], serial=runtime.config.serial, timeout_seconds=15)
         if runtime.config.mode != "none" or runtime.evidence:
             await run_adb("push", str(packages), paths["packages"], serial=runtime.config.serial, timeout_seconds=15)
@@ -364,8 +434,12 @@ class MonkeyManager:
             runtime.ready.set()
 
     def stop_input(self, runtime: Runtime) -> None:
-        if runtime.cleanup_task is None:
-            runtime.cleanup_task = asyncio.create_task(self.cleanup(runtime.id, runtime.config.serial, runtime.process))
+        if runtime.remote_staged and runtime.cleanup_task is None:
+            runtime.cleanup_task = asyncio.create_task(self.cleanup_runtime(runtime))
+
+    async def cleanup_runtime(self, runtime: Runtime) -> None:
+        async with runtime.gate_lock:
+            await self.cleanup(runtime.id, runtime.config.serial, runtime.process)
 
     async def deadline(self, runtime: Runtime, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -378,7 +452,8 @@ class MonkeyManager:
             try:
                 if shutil.disk_usage(self.store.root).free < MIN_FREE:
                     raise ValueError("磁盘剩余不足 128 MiB，已停止以保护已采集记录")
-                await run_adb("shell", "touch", remote_paths(runtime.id)["lease"], serial=runtime.config.serial)
+                # The runner owns this file. A heartbeat must never recreate it after the exit trap.
+                await run_adb("shell", "touch", "-c", remote_paths(runtime.id)["lease"], serial=runtime.config.serial)
                 await asyncio.wait_for(runtime.stop.wait(), HEARTBEAT_SECONDS)
             except TimeoutError:
                 continue
@@ -446,8 +521,10 @@ class MonkeyManager:
             waiters = {wait_process, stop_wait}
             if collecting:
                 current = await self.start_segment(runtime, min(HOUR_SECONDS, deadline - time.monotonic()))
-            if runtime.evidence and not runtime.stop.is_set():
-                await run_adb("shell", "touch", remote_paths(runtime.id)["gate"], serial=runtime.config.serial)
+            if runtime.evidence:
+                async with runtime.gate_lock:
+                    if not runtime.stop.is_set():
+                        await run_adb("shell", "touch", remote_paths(runtime.id)["gate"], serial=runtime.config.serial)
             while True:
                 task = runtime.sampling_task
                 remaining = deadline - time.monotonic()
@@ -500,9 +577,12 @@ class MonkeyManager:
                 warnings.append(f"停止状态写入失败：{exc}")
                 logging.getLogger(__name__).exception("Could not record Monkey stop for %s", runtime.id)
             try:
-                await runtime.cleanup_task
+                if runtime.cleanup_task is not None:
+                    await runtime.cleanup_task
+            except AdbError:
+                logging.getLogger(__name__).debug("Could not clean Monkey temporary files for %s", runtime.id, exc_info=True)
             except Exception as exc:
-                warnings.append(f"设备端清理未确认：{exc}；租约守护会在约{LEASE_SECONDS}秒内停止输入")
+                warnings.append(f"停止 Monkey 执行器异常：{exc}")
             finally:
                 tasks = [task for task in (runtime.heartbeat, runtime.timer, runtime.anomaly_watcher, *waiters) if task is not None]
                 for pending in tasks:
@@ -522,6 +602,7 @@ class MonkeyManager:
                 try:
                     logs = await export_device_logs_zip(
                         runtime.config.serial, self.store.directory(runtime.id) / "device-logs.zip",
+                        preserve=not runtime.config.delete_device_logs,
                         crash_path=runtime.config.crash_path,
                     )
                 except Exception as exc:
@@ -563,7 +644,10 @@ rm -f {shlex.join(list(paths.values()))}"""
             await run_adb("shell", shlex.join(["sh", "-c", script]), serial=serial, timeout_seconds=8)
         finally:
             if process and process.returncode is None:
-                process.kill()
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
                 await process.wait()
             runtime = self.active.get(run_id)
             if runtime and runtime.reader:
@@ -608,8 +692,10 @@ rm -f {shlex.join(list(paths.values()))}"""
             if active:
                 try:
                     await self.cleanup(run["id"], run["serial"])
+                except AdbError:
+                    logging.getLogger(__name__).debug("Could not clean interrupted Monkey %s", run["id"], exc_info=True)
                 except Exception as exc:
-                    messages.append(f"重启后设备端清理未确认：{exc}；租约将自动到期")
+                    messages.append(f"重启后停止 Monkey 执行器异常：{exc}")
             summary = None
             try:
                 await self._archive_remaining(run)

@@ -36,6 +36,7 @@ class StartSessionRequest(BaseModel):
     crash_path: str | None = Field(default=None, max_length=256)
     tombstone_path: str | None = Field(default=None, max_length=256)
     log_export_root: str | None = Field(default=None, max_length=512)
+    delete_device_logs: bool = Field(default=False, strict=True)
 
     @field_validator("serial")
     @classmethod

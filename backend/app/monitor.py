@@ -254,15 +254,20 @@ class MonitorManager:
             await self.stop(session_id, owner=self.reserved_by)
 
     async def _export_device_logs(self, runtime: RuntimeSession) -> None:
-        """会话结束（停止/自然到期）后拉取并清理车机日志。"""
+        """会话结束后拉取日志，并按会话配置决定能否清理。"""
         if self.ui_manager:
             async with self.ui_manager.device_lock(runtime.request.serial):
-                preserve = runtime.preserve_device_logs or self.ui_manager.has_active_device(runtime.request.serial)
-                await self._export_device_logs_impl(runtime, preserve)
+                ui_active = self.ui_manager.has_active_device(runtime.request.serial)
+                await self._export_device_logs_impl(runtime, ui_active)
         else:
             await self._export_device_logs_impl(runtime, False)
 
-    async def _export_device_logs_impl(self, runtime: RuntimeSession, preserve: bool) -> None:
+    async def _export_device_logs_impl(self, runtime: RuntimeSession, ui_active: bool) -> None:
+        preserve = not runtime.request.delete_device_logs or runtime.preserve_device_logs or ui_active
+        runtime.writer.add_event(
+            "info", "log_cleanup_policy",
+            "本次导出保留车机源日志。" if preserve else "本次导出后清理已核验的车机源日志。",
+        )
         config = DeviceLogConfig(
             anr=runtime.request.anr_path,
             crash=runtime.request.crash_path,

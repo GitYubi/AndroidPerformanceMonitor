@@ -14,14 +14,18 @@ def test_start_endpoints_validate_project_and_persist_server_name(tmp_path):
     ui = UIManager(tmp_path / 'ui')
     project = ui.store.images.create_project('车型测试')
     calls = []
+    cleanup_calls = []
+    async def clean_stale_temp(serial):
+        cleanup_calls.append(serial)
     async def performance_start(value):
+        assert cleanup_calls == [value.serial]
         calls.append(('performance', value))
         return 'session'
     async def monkey_start(config, project_name='默认项目'):
         calls.append(('monkey', config, project_name))
         return {'id': 'monkey'}
     monitor = SimpleNamespace(start=performance_start, active={}, store=SimpleNamespace(get_session=lambda _: None))
-    monkey_manager = SimpleNamespace(start=monkey_start)
+    monkey_manager = SimpleNamespace(start=monkey_start, clean_stale_temp=clean_stale_temp)
     request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(ui=ui, manager=monitor, monkey=monkey_manager)))
 
     async def scenario():
@@ -37,6 +41,7 @@ def test_start_endpoints_validate_project_and_persist_server_name(tmp_path):
         with pytest.raises(HTTPException):
             await monkey.start(monkey.MonkeyRequest(serial='device', mode='none', project_id='a' * 32), request)
         assert len(calls) == 2
+        assert cleanup_calls == ['device']
     asyncio.run(scenario())
 
 

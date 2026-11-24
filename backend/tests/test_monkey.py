@@ -3,7 +3,9 @@ import asyncio
 import csv
 import json
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
 import sys
 import time
 from types import SimpleNamespace
@@ -130,13 +132,30 @@ def test_missing_samples_and_large_time_gaps_do_not_become_zeroes(tmp_path):
 
 
 FAKE_ADB = r'''
-import json, os, sys, time
+import json, os, shlex, sys, time
 from pathlib import Path
 root = Path(__file__).parent
 args=sys.argv[1:]
 with (root/'calls.jsonl').open('a') as file: file.write(json.dumps(args)+'\n')
+remote = root/'device-tmp'
+remote.mkdir(exist_ok=True)
 if 'devices' in args:
- print('List of devices attached\ntest-device device model:Fake')
+ state = 'offline' if (root/'cleanup-offline').exists() else 'device'
+ serial = (root/'transport').read_text() if (root/'transport').exists() else 'test-device'
+ print(f'List of devices attached\n{serial} {state} model:Fake')
+elif args[2:3]==['push'] and args[-1].startswith('/data/local/tmp/acpm-'):
+ (remote/Path(args[-1]).name).touch()
+ if (root/'partial-push').exists():
+  (root/'cleanup-offline').touch()
+  print('device offline',file=sys.stderr);sys.exit(1)
+elif len(args)>3 and args[2]=='shell' and args[3].startswith('sh -c') and '/data/local/tmp/acpm-monkey-' in args[3]:
+ if (root/'cleanup-offline').exists():
+  print('device offline',file=sys.stderr);sys.exit(1)
+ cleanup=shlex.split(args[3])[2]
+ for destination in shlex.split(cleanup.splitlines()[-1])[2:]:
+  (remote/Path(destination).name).unlink(missing_ok=True)
+elif args[2:5]==['shell','rm','-f'] and args[-1].startswith('/data/local/tmp/acpm-displays-'):
+ (remote/Path(args[-1]).name).unlink(missing_ok=True)
 elif 'list' in args and 'packages' in args:
  print('package:com.example')
 elif 'getprop' in args:
@@ -160,6 +179,7 @@ elif len(args)>4 and args[2]=='pull' and args[3] in ('/data/anr','/data/system/d
 elif len(args)>4 and args[3]=='sh' and args[4].startswith('/data/local/tmp/acpm-monkey-'):
  if (root/'reject-launch').exists():
   print('Unknown option --pct-rotation',flush=True);sys.exit(1)
+ (remote/Path(args[4]).with_suffix('.lease').name).touch()
  print('__ACPM_MONKEY_PID__=1234',flush=True)
  if (root/'multiscreen').exists():
   print('@ACPM\tREADY',flush=True)
@@ -171,6 +191,9 @@ elif len(args)>4 and args[3]=='sh' and args[4].startswith('/data/local/tmp/acpm-
  time.sleep(120)
 elif 'touch' in args and (root/'disconnect').exists():
  print('device offline',file=sys.stderr);sys.exit(1)
+elif args[2:4]==['shell','touch'] and args[-1].startswith('/data/local/tmp/acpm-monkey-'):
+ path=remote/Path(args[-1]).name
+ if '-c' not in args or path.exists(): path.touch()
 elif 'hang' in args:
  time.sleep(120)
 '''
@@ -248,9 +271,10 @@ def test_multi_hour_run_rolls_exports_and_merges_without_reports(fake_adb):
 
 
 @pytest.mark.parametrize("multiscreen,duration_hours", [(False, None), (True, 1)])
-def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatch, multiscreen, duration_hours):
+@pytest.mark.parametrize("delete_device_logs", [None, False, True])
+def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatch, multiscreen, duration_hours, delete_device_logs):
     tmp, children = fake_adb
-    settings = {}
+    settings = {} if delete_device_logs is None else {"delete_device_logs": delete_device_logs}
     crash_path = "/data/system/dropbox"
     if multiscreen:
         crash_path = "/data/vendor/crash"
@@ -284,8 +308,17 @@ def test_monkey_without_performance_keeps_logs_and_finishes(fake_adb, monkeypatc
         assert "__ACPM_MONKEY_PID__" in detail["log_tail"]
         assert detail["device_logs"]["ANR"]["status"] == "empty"
         assert detail["device_logs"]["Crash"]["source"] == crash_path
-        assert detail["device_logs"]["Crash"]["removed"] == 1
-        assert detail["device_logs"]["Tombstone"]["removed"] == 1
+        for kind in ("Crash", "Tombstone"):
+            log = detail["device_logs"][kind]
+            assert log["cleanup_requested"] is bool(delete_device_logs)
+            if delete_device_logs:
+                assert log["removed"] == 1
+            else:
+                assert "removed" not in log
+        calls = [json.loads(line) for line in (tmp / "calls.jsonl").read_text().splitlines()]
+        cleanup = [args for args in calls if args[2:4] == ["shell", "-T"] or
+                   (len(args) > 3 and "acpm-snapshot" in args[3])]
+        assert bool(cleanup) is bool(delete_device_logs)
         response = await m.download(run["id"], "device-logs.zip", request)
         with ZipFile(response.path) as archive:
             assert set(archive.namelist()) == {"Crash/fixture.log", "Tombstone/fixture.log", "manifest.json"}
@@ -346,6 +379,128 @@ def test_failure_paths_release_ownership_and_keep_records(fake_adb, failure):
         assert not monitor.active and monitor.reserved_by is None and not ui.external_busy
         assert children and all(child.returncode is not None for child in children)
     asyncio.run(scenario())
+
+
+def test_partial_push_is_cleaned_silently_after_reconnect_with_different_serial(fake_adb, monkeypatch):
+    tmp, _ = fake_adb
+    (tmp / "partial-push").touch()
+    sh = shutil.which("sh")
+    if sh is None:
+        pytest.skip("requires a local shell to simulate Android's cleanup command")
+    original = m.run_adb
+
+    async def simulate_stale_scan(*args, **kwargs):
+        if args[0] == "shell" and "acpm-cleanup /data/local/tmp" in args[1]:
+            remote = tmp / "device-tmp"
+            remote.mkdir(exist_ok=True)
+            subprocess.run([sh, "-c", m.STALE_TEMP_SCRIPT, "acpm-cleanup", str(remote)], check=True)
+            return ""
+        return await original(*args, **kwargs)
+
+    async def scenario():
+        monkeypatch.setattr(m, "run_adb", simulate_stale_scan)
+        remote = tmp / "device-tmp"
+        remote.mkdir()
+        old_gate = remote / Path(m.remote_paths("b" * 32)["gate"]).name
+        old_gate.touch()
+        manager, _, _ = managers(tmp)
+        run = await manager.start(config(collect_performance=False))
+        assert not old_gate.exists()
+        result = await settled(manager, run)
+        run_id = run["id"]
+        assert result["state"] == "failed"
+        assert result["cleanup_warning"] is None
+        script = remote / Path(m.remote_paths(run_id)["script"]).name
+        assert script.exists()
+        unrelated = remote / "acpm-unknown.tar"
+        unrelated.touch()
+        display_jar = remote / ("acpm-displays-" + "e" * 32 + ".jar")
+        display_jar.touch()
+        fresh, _, ui = managers(tmp)
+        await fresh.recover()
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(monkey=fresh)))
+        await main.devices(request)
+        assert script.exists()
+        (tmp / "cleanup-offline").unlink()
+        connected_serial = "192.0.2.8:5555"
+        (tmp / "transport").write_text(connected_serial)
+        async with ui.device_lock(connected_serial):
+            await main.devices(request)
+            assert script.exists()
+        assert (await main.devices(request))[0]["serial"] == connected_serial
+        assert fresh.store.get(run_id)["state"] == "failed"
+        assert list(remote.iterdir()) == [unrelated]
+
+    asyncio.run(scenario())
+
+
+def test_stop_waits_for_in_flight_start_marker_before_removing_it(fake_adb, monkeypatch):
+    tmp, _ = fake_adb
+    (tmp / "multiscreen").touch()
+    request = config(collect_performance=False, multi_screen=m.screens.MultiScreen(
+        targets=[{"display_id": 2, "fingerprint": "b" * 64, "packages": ["com.example"]}],
+    ))
+    monkeypatch.setattr(m.screens, "prepare", AsyncMock(return_value=("", [])))
+    monkeypatch.setattr(m.screens, "watch_anomalies", AsyncMock())
+    original = m.run_adb
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        cleanup_entered = asyncio.Event()
+
+        async def delayed_gate(*args, **kwargs):
+            if args[:2] == ("shell", "touch") and args[-1].endswith(".start"):
+                started.set()
+                await release.wait()
+            if args[0] == "shell" and "rm -f /data/local/tmp/acpm-monkey-" in args[1]:
+                cleanup_entered.set()
+            return await original(*args, **kwargs)
+
+        monkeypatch.setattr(m, "run_adb", delayed_gate)
+        manager, _, _ = managers(tmp)
+        run = await manager.start(request)
+        await asyncio.wait_for(started.wait(), 5)
+        manager.stop(run["id"])
+        await asyncio.sleep(0)
+        assert not cleanup_entered.is_set()
+        release.set()
+        result = await settled(manager, run)
+        assert result["state"] == "stopped", result
+        assert not list((tmp / "device-tmp").iterdir())
+        calls = [json.loads(line) for line in (tmp / "calls.jsonl").read_text().splitlines()]
+        gate_index = next(i for i, args in enumerate(calls) if args[-1].endswith(".start"))
+        cleanup_index = next(i for i, args in enumerate(calls) if len(args) == 4 and "rm -f /data/local/tmp/acpm-monkey-" in args[3])
+        assert gate_index < cleanup_index
+        lease_calls = [args for args in calls if args[2:4] == ["shell", "touch"] and args[-1].endswith(".lease")]
+        assert lease_calls and all(args[4] == "-c" for args in lease_calls)
+
+    asyncio.run(scenario())
+
+
+def test_stale_temp_scan_leaves_live_jobs_and_unrelated_paths(tmp_path):
+    sh = shutil.which("sh")
+    if sh is None:
+        pytest.skip("requires a local shell to simulate Android's cleanup command")
+    remote = tmp_path / "device-tmp"
+    remote.mkdir()
+    proc = tmp_path / "proc"
+    (proc / "123").mkdir(parents=True)
+    (proc / "123" / "stat").write_text("0 " * 21 + "99\n")
+    live = "acpm-monkey-" + "a" * 32
+    orphan = "acpm-monkey-" + "b" * 32
+    jar = "acpm-displays-" + "c" * 32 + ".jar"
+    keep = {live + ".pid", live + ".start", live + ".lease", orphan + ".other.sh",
+            "acpm-monkey-arbitrary.tar", "other-tool.tar"}
+    for name in keep | {orphan + ".pid", orphan + ".start", orphan + ".tar", orphan + ".tar.gz", jar}:
+        (remote / name).touch()
+    (remote / (live + ".pid")).write_text("123 99\n")
+    (remote / (orphan + ".pid")).write_text("123 98\n")
+    directory = "acpm-monkey-" + "d" * 32 + ".jar"
+    (remote / directory).mkdir()
+    script = m.STALE_TEMP_SCRIPT.replace("/proc/", str(proc) + "/")
+    subprocess.run([sh, "-c", script, "acpm-cleanup", str(remote)], check=True)
+    assert {file.name for file in remote.iterdir()} == keep | {directory}
 
 
 def test_stop_releases_device_after_stopping_state_write_fails(fake_adb, monkeypatch):

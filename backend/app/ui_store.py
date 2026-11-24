@@ -28,6 +28,9 @@ class UIStore:
             conn.execute('CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, body TEXT NOT NULL)')
             conn.execute('CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL, body TEXT NOT NULL)')
             conn.execute('CREATE INDEX IF NOT EXISTS events_run ON events(run_id, seq)')
+            conn.execute('CREATE TABLE IF NOT EXISTS stress_batches (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, body TEXT NOT NULL)')
+            conn.execute('CREATE INDEX IF NOT EXISTS stress_project ON stress_batches(project_id)')
+            conn.execute('CREATE TABLE IF NOT EXISTS stress_rounds (batch_id TEXT NOT NULL, number INTEGER NOT NULL, body TEXT NOT NULL, PRIMARY KEY(batch_id, number))')
 
     def connect(self):
         return sqlite3.connect(self.db, timeout=10)
@@ -70,6 +73,37 @@ class UIStore:
         with self.connect() as conn:
             return [{'seq': row[0], **json.loads(row[1])} for row in conn.execute(
                 'SELECT seq,body FROM events WHERE run_id=? AND seq>? ORDER BY seq LIMIT ?', (run_id, after, limit))]
+
+    def put_stress(self, batch, result=None):
+        with self.connect() as conn:
+            conn.execute('INSERT INTO stress_batches VALUES (?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
+                         (batch['id'], batch['projectId'], json.dumps(batch, ensure_ascii=False)))
+            if result is not None:
+                conn.execute('INSERT INTO stress_rounds VALUES (?,?,?)',
+                             (batch['id'], result['number'], json.dumps(result, ensure_ascii=False)))
+
+    def stress_batches(self, project_id, limit=100):
+        with self.connect() as conn:
+            return [json.loads(row[0]) for row in conn.execute(
+                'SELECT body FROM stress_batches WHERE project_id=? ORDER BY rowid DESC LIMIT ?', (project_id, limit))]
+
+    def stress_rounds(self, batch_id, offset=0, limit=50, failures=False):
+        where = " AND json_extract(body, '$.state') IN ('failed', 'error')" if failures else ''
+        with self.connect() as conn:
+            params = (batch_id,)
+            count = conn.execute('SELECT COUNT(*) FROM stress_rounds WHERE batch_id=?' + where, params).fetchone()[0]
+            rows = conn.execute('SELECT body FROM stress_rounds WHERE batch_id=?' + where +
+                                ' ORDER BY number LIMIT ? OFFSET ?', (*params, limit, offset))
+            return {'total': count, 'items': [json.loads(row[0]) for row in rows]}
+
+    def recover_stress(self):
+        with self.connect() as conn:
+            rows = conn.execute("SELECT body FROM stress_batches WHERE json_extract(body, '$.state') IN ('running','stopping')").fetchall()
+        for (body,) in rows:
+            batch = json.loads(body)
+            batch.update(state='interrupted', endedAt=int(time.time() * 1000),
+                         message='后端已重启，保留已记录轮次')
+            self.put_stress(batch)
 
     def recover(self):
         with self.connect() as conn:
